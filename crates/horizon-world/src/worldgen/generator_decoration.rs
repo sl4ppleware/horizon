@@ -10,7 +10,7 @@ use super::{
     biome_chunk::BiomeRegion,
     biome_predicate::BiomePredicateBindings,
     biome_source::ResolvedBiomeSource,
-    biome_temperature::BiomeTemperature,
+    biome_temperature::{BiomeTemperature, TemperatureModifier},
     biome_weather::BiomeWeatherBindings,
     block_feature::FeatureBlockBindings,
     decoration::{DecorationWorld, FeatureDecorationPlan},
@@ -427,37 +427,69 @@ impl Decoration {
             .filter(|chunk| chunk.is_full())
             .map(|chunk| chunk.position())
             .collect();
-        let mut chunks = Vec::with_capacity(9);
+        let (min_y, height, registry) = (
+            region[4].terrain.min_y(),
+            region[4].terrain.height(),
+            region[4].terrain.registry(),
+        );
+        // Validate every fallible TerrainRegion, BiomeRegion, binding, and
+        // stand-in precondition BEFORE moving caller terrain into stand-ins so
+        // an error can never leave recycled stand-ins (with unrelated chunk
+        // coordinates) inside caller chunks.
+        if region.iter().any(|c| {
+            c.terrain.min_y() != min_y
+                || c.terrain.height() != height
+                || !std::ptr::eq(c.terrain.registry(), registry)
+        }) {
+            return Err(resource(RegionError::InvalidChunks.to_string()));
+        }
+        if !std::ptr::eq(registry, self.bindings.registry()) {
+            return Err(resource(RegionError::InvalidBindings.to_string()));
+        }
         let mut biomes = Vec::with_capacity(9);
-        let (min_y, height) = (region[4].terrain.min_y(), region[4].terrain.height());
-        for chunk in region.iter_mut() {
+        for chunk in region.iter() {
+            biomes.push(chunk.biomes().clone());
+        }
+        let biomes =
+            BiomeRegion::new(biomes, obfuscate_seed(seed)).map_err(|e| resource(e.to_string()))?;
+        // The blocks' facts: `BlockState.isSolidRender` and the rest, the
+        // structure pieces ask them of the blocks around them.
+        let tree_blocks = self
+            .bindings
+            .tree_blocks()
+            .map_err(|e| resource(e.to_string()))?;
+        while worker.decor_standins.len() < 9 {
             // A one-section stand-in while the region holds the terrain: it
-            // is swapped back below, and allocating the full height for nine
-            // stand-ins per region cost more than some features.
+            // is swapped back below and recycled across chunks on this worker.
             let empty = super::terrain::TerrainChunk::new(
-                chunk.position(),
+                center,
                 min_y,
                 16,
                 data.registry(),
                 data.block_states().clone(),
             )
             .map_err(|e| resource(e.to_string()))?;
+            worker.decor_standins.push(empty);
+        }
+        let mut standins = std::mem::take(&mut worker.decor_standins);
+        let mut chunks = Vec::with_capacity(9);
+        for chunk in region.iter_mut() {
+            let empty = standins.pop().expect("pre-allocated 9 stand-ins");
             chunks.push(std::mem::replace(&mut chunk.terrain, empty));
-            biomes.push(chunk.biomes().clone());
         }
         let terrain = TerrainRegion::new(chunks, generation)
             .and_then(|region| region.with_block_bindings(&self.bindings))
-            .map(|region| region.with_world_seed(seed));
-        let terrain = match terrain {
-            Ok(terrain) => terrain,
-            Err(e) => return Err(resource(e.to_string())),
-        };
+            .map(|region| region.with_world_seed(seed))
+            .map_err(|e| resource(e.to_string()))?;
         let structures_only = worker.structures_only;
         let references = region[4].structure_starts.clone();
         let mut block_entities = Vec::new();
         for chunk in region.iter_mut() {
             block_entities.append(&mut chunk.block_entities);
         }
+        let mut uniform_biomes = std::mem::take(&mut worker.decor_uniform_biomes);
+        uniform_biomes.clear();
+        uniform_biomes.resize(9 * (height / 16).max(0) as usize, UNKNOWN_BIOME);
         let mut world = World {
             block_entities,
             entities: Vec::new(),
@@ -470,11 +502,10 @@ impl Decoration {
                 .as_ref()
                 .and_then(|r| r.blocks.as_ref()),
             region: terrain,
-            biomes: BiomeRegion::new(biomes, obfuscate_seed(seed))
-                .map_err(|e| resource(e.to_string()))?,
+            biomes,
             zone: GenerationWriteZone::new(center, 1),
             center,
-            uniform_biomes: vec![UNKNOWN_BIOME; 9 * (height / 16).max(0) as usize],
+            uniform_biomes,
             biome_quarts: region[4].biomes().quart_range(),
             decoration: self,
             temperatures: &mut worker.temperatures,
@@ -489,12 +520,6 @@ impl Decoration {
         };
         let mut stats = DecorateStats::default();
         let blocks = self.blocks;
-        // The blocks' facts: `BlockState.isSolidRender` and the rest, the
-        // structure pieces ask them of the blocks around them.
-        let tree_blocks = self
-            .bindings
-            .tree_blocks()
-            .map_err(|e| resource(e.to_string()))?;
         // ChunkGenerator.getWritableArea: the chunk's minimum Y + 1 to its maximum Y.
         let chunk_box = BoundingBox::new(
             [center.x * 16, min_y + 1, center.z * 16],
@@ -571,24 +596,46 @@ impl Decoration {
             },
         );
         // `FillLayerFeature.place` for the chunk: air at the layer's Y becomes the layer.
-        if result.is_ok() && !structures_only {
-            for &(y, state) in &self.top_layers {
-                for dz in 0..16 {
-                    for dx in 0..16 {
-                        let at = [center.x * 16 + dx, y, center.z * 16 + dz];
-                        let current = world
-                            .block(at)
-                            .map_err(|e| GeneratorError::Stage("features", e.to_string()))?;
-                        if data.block_states().get(current).is_air() {
-                            world
-                                .set_block(at, state, 2)
-                                .map_err(|e| GeneratorError::Stage("features", e.to_string()))?;
+        // Fold into `result` so any error still restores caller terrain, stand-ins,
+        // block entities, entities, and worker scratch before returning.
+        let result = result
+            .map_err(|e| GeneratorError::Stage("features", e.to_string()))
+            .and_then(|()| {
+                if !structures_only {
+                    for &(y, state) in &self.top_layers {
+                        for dz in 0..16 {
+                            for dx in 0..16 {
+                                let at = [center.x * 16 + dx, y, center.z * 16 + dz];
+                                let current = world.block(at).map_err(|e| {
+                                    GeneratorError::Stage("features", e.to_string())
+                                })?;
+                                if data.block_states().get(current).is_air() {
+                                    world.set_block(at, state, 2).map_err(|e| {
+                                        GeneratorError::Stage("features", e.to_string())
+                                    })?;
+                                }
+                            }
                         }
                     }
                 }
-            }
+                Ok(())
+            });
+        let World {
+            block_entities,
+            entities,
+            region: world_region,
+            uniform_biomes,
+            ..
+        } = world;
+        for terrain in world_region.into_chunks() {
+            let p = terrain.position();
+            let index = (p.z.wrapping_sub(center.z) + 1) * 3 + p.x.wrapping_sub(center.x) + 1;
+            let standin = std::mem::replace(&mut region[index as usize].terrain, terrain);
+            standins.push(standin);
         }
-        for (pos, nbt) in std::mem::take(&mut world.block_entities) {
+        worker.decor_standins = standins;
+        worker.decor_uniform_biomes = uniform_biomes;
+        for (pos, nbt) in block_entities {
             let index = ((pos[2] >> 4).wrapping_sub(center.z) + 1) * 3
                 + (pos[0] >> 4).wrapping_sub(center.x)
                 + 1;
@@ -597,7 +644,7 @@ impl Decoration {
             }
         }
         // WorldGenRegion.addFreshEntity: into the chunk holding the position.
-        for nbt in std::mem::take(&mut world.entities) {
+        for nbt in entities {
             let Some(at) = block_of(&nbt) else {
                 continue;
             };
@@ -608,12 +655,7 @@ impl Decoration {
                 chunk.entities.push(nbt);
             }
         }
-        for terrain in world.region.into_chunks() {
-            let p = terrain.position();
-            let index = (p.z.wrapping_sub(center.z) + 1) * 3 + p.x.wrapping_sub(center.x) + 1;
-            region[index as usize].terrain = terrain;
-        }
-        result.map_err(|e| GeneratorError::Stage("features", e.to_string()))?;
+        result?;
         stats.failed += structure_errors;
         region[4]
             .terrain
@@ -1029,17 +1071,17 @@ impl FeatureWorld for World<'_> {
         if self.is_full_chunk(position) {
             return Ok(true);
         }
-        let old = self.region.block(position)?;
-        self.region.set_block_worldgen(position, state)?;
+        let old = self.region.set_block_worldgen(position, state)?;
         self.raise_floor_bound(position);
         // ProtoChunk keeps a block entity that already exists when the same kind
         // of block is set again (a chest turning waterlogged); other changes drop it.
-        let registry = self.decoration.bindings.registry();
-        let same_block = old == state
-            || registry.state(old).map(|s| s.name.as_str())
+        if !self.block_entities.is_empty() && old != state {
+            let registry = self.decoration.bindings.registry();
+            let same_block = registry.state(old).map(|s| s.name.as_str())
                 == registry.state(state).map(|s| s.name.as_str());
-        if !same_block {
-            self.block_entities.retain(|(p, _)| *p != position);
+            if !same_block {
+                self.block_entities.retain(|(p, _)| *p != position);
+            }
         }
         // WorldGenRegion.setBlock: BlockState.getPostProcessPos unless UPDATE_KNOWN_SHAPE.
         if flags & 16 == 0 {
@@ -1166,7 +1208,7 @@ impl PlacementContext for World<'_> {
         state: BlockStateId,
         position: [i32; 3],
     ) -> Result<bool, PlacementQueryError> {
-        let collision = self.blocks()?.collision.clone();
+        let collision = &self.blocks()?.collision;
         collision
             .collision_shape(self, state, position)
             .map(|shape| shape.is_empty())
@@ -1279,7 +1321,7 @@ impl PlacementContext for World<'_> {
         if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
             return Ok(behaviours.is_face_sturdy(state, direction));
         }
-        let support = self.blocks()?.support.clone();
+        let support = &self.blocks()?.support;
         support
             .is_face_sturdy(self, state, position, direction, SupportType::Full)
             .map_err(query)
@@ -1293,7 +1335,7 @@ impl PlacementContext for World<'_> {
         if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
             return Ok(behaviours.is_face_sturdy_center(state, direction));
         }
-        let support = self.blocks()?.support.clone();
+        let support = &self.blocks()?.support;
         support
             .is_face_sturdy(self, state, position, direction, SupportType::Center)
             .map_err(query)
@@ -1316,7 +1358,7 @@ impl PlacementContext for World<'_> {
         state: BlockStateId,
         position: [i32; 3],
     ) -> Result<bool, PlacementQueryError> {
-        let collision = self.blocks()?.collision.clone();
+        let collision = &self.blocks()?.collision;
         let shape = collision
             .collision_shape(self, state, position)
             .map_err(query)?;
@@ -1562,9 +1604,18 @@ impl PlacementContext for World<'_> {
         let weather = self
             .decoration
             .weather
-            .clone()
+            .as_ref()
             .ok_or(PlacementQueryError::Unavailable)?;
         let settings = self.temperatures[biome.0 as usize].settings();
+        // Fast path: biomes with `TemperatureModifier::None` and base temperature
+        // >= 0.15 are always warm enough to rain at or below `sea_level + 17`, so
+        // `should_freeze` returns `false` without hashing into the temperature cache.
+        if settings.modifier == TemperatureModifier::None
+            && settings.base_temperature >= 0.15
+            && position[1] <= self.sea_level()?.wrapping_add(17)
+        {
+            return Ok(false);
+        }
         let mut temperature = std::mem::replace(
             &mut self.temperatures[biome.0 as usize],
             BiomeTemperature::new(settings),
@@ -1581,9 +1632,15 @@ impl PlacementContext for World<'_> {
         let weather = self
             .decoration
             .weather
-            .clone()
+            .as_ref()
             .ok_or(PlacementQueryError::Unavailable)?;
         let settings = self.temperatures[biome.0 as usize].settings();
+        if settings.modifier == TemperatureModifier::None
+            && settings.base_temperature >= 0.15
+            && position[1] <= self.sea_level()?.wrapping_add(17)
+        {
+            return Ok(false);
+        }
         let mut temperature = std::mem::replace(
             &mut self.temperatures[biome.0 as usize],
             BiomeTemperature::new(settings),

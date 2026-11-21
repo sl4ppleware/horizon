@@ -100,9 +100,13 @@ where
     if mask.is_empty() {
         return Ok(());
     }
-    // Restoring the dirt under a carved cell used to build a fresh material
-    // worker, compile the whole surface rule and allocate its bindings for every
-    // cell. One worker now serves the pass; only the 1x1x1 bindings move.
+    // Most carved columns never expose dirt below grass/mycelium. When `shared`
+    // is already compiled for this generation (steady-state after surface
+    // building), defer constructing the per-cell top-material worker and
+    // sampling ore-vein densities until an exposed dirt block actually needs
+    // repair. Otherwise validate and bind the surface rule before the first
+    // terrain write so invalid rules (such as unknown `NoiseThreshold` noises)
+    // still fail even when no dirt is exposed.
     let TopMaterialInputs {
         generation,
         root,
@@ -110,17 +114,27 @@ where
         preliminary_surface,
         density_context,
     } = inputs;
-    let volume =
-        DensityVolume::new([1; 3], [0; 3], [1; 3]).map_err(|_| SurfaceError::InvalidVolume)?;
-    let sources = MaterialDensitySources::new(
-        surface,
-        volume,
-        preliminary_surface,
-        SamplerContext::default(),
-    )?;
-    let mut worker =
-        MaterialConditions::<R, _>::with_possible_biomes(generation, root, sources, None);
-    let rule = worker.add_shared_rule(rule, shared)?;
+    let mut top_worker = None;
+    let mut top_inputs = if shared
+        .as_ref()
+        .is_some_and(|cached| cached.matches_generation(generation))
+    {
+        Some((generation, root, surface, preliminary_surface))
+    } else {
+        let volume =
+            DensityVolume::new([1; 3], [0; 3], [1; 3]).map_err(|_| SurfaceError::InvalidVolume)?;
+        let sources = MaterialDensitySources::new(
+            surface,
+            volume,
+            preliminary_surface,
+            SamplerContext::default(),
+        )?;
+        let mut worker =
+            MaterialConditions::<R, _>::with_possible_biomes(generation, root, sources, None);
+        let rule_id = worker.add_shared_rule(rule, shared)?;
+        top_worker = Some((worker, rule_id));
+        None
+    };
     let cx = chunk.position().x.wrapping_shl(4);
     let cz = chunk.position().z.wrapping_shl(4);
     for column in mask.columns() {
@@ -149,11 +163,34 @@ where
             let below = y.wrapping_sub(1);
             if found_surface && blocks.flags(chunk.block(x, below, z))? & 4 != 0 {
                 let submerged = chunk.block_properties(state).has_fluid();
-                worker.retarget_surface_densities([x, below, z])?;
+                let (worker, rule_id) = match &mut top_worker {
+                    Some((worker, rule_id)) => {
+                        worker.retarget_surface_densities([x, below, z])?;
+                        (worker, *rule_id)
+                    }
+                    None => {
+                        let (generation, root, surface, preliminary_surface) =
+                            top_inputs.take().expect("top material inputs");
+                        let volume = DensityVolume::new([1; 3], [x, below, z], [1; 3])
+                            .map_err(|_| SurfaceError::InvalidVolume)?;
+                        let sources = MaterialDensitySources::new(
+                            surface,
+                            volume,
+                            preliminary_surface,
+                            SamplerContext::default(),
+                        )?;
+                        let mut worker = MaterialConditions::<R, _>::with_possible_biomes(
+                            generation, root, sources, None,
+                        );
+                        let rule_id = worker.add_shared_rule(rule, shared)?;
+                        let (worker, rule_id) = top_worker.insert((worker, rule_id));
+                        (worker, *rule_id)
+                    }
+                };
                 let replacement = top_material_cell(
-                    &mut worker,
+                    worker,
                     chunk,
-                    rule,
+                    rule_id,
                     BlockPos::new(x, below, z),
                     submerged,
                 )?;
@@ -167,4 +204,153 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DATA_VERSION,
+        worldgen::{
+            anchor::WorldGenerationContext,
+            aquifer::{DisabledAquifer, GlobalFluidPicker},
+            material_condition::MaterialCondition,
+            terrain::TerrainChunk,
+        },
+    };
+    use horizon_core::{
+        density::{DensitySampler, SampleError},
+        nbt::Tag,
+        position::ChunkPos,
+        random::LegacyRandom,
+    };
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy)]
+    struct SimpleState {
+        air: bool,
+        fluid: bool,
+    }
+    impl HeightmapState for SimpleState {
+        fn is_air(self) -> bool {
+            self.air
+        }
+        fn is_air_block(self) -> bool {
+            self.air
+        }
+        fn has_fluid(self) -> bool {
+            self.fluid
+        }
+        fn blocks_motion_in_heightmap(self) -> bool {
+            !self.air && !self.fluid
+        }
+        fn blocks_motion_in_heightmap_no_leaves(self) -> bool {
+            !self.air && !self.fluid
+        }
+    }
+    struct SimpleStates {
+        air: BlockStateId,
+        water: BlockStateId,
+        lava: BlockStateId,
+    }
+    impl TerrainBlockStates for SimpleStates {
+        type State = SimpleState;
+        fn heightmap_state(&self, id: BlockStateId) -> SimpleState {
+            SimpleState {
+                air: id == self.air,
+                fluid: id == self.water || id == self.lava,
+            }
+        }
+    }
+    #[derive(Debug)]
+    struct ZeroSampler;
+    impl DensitySampler for ZeroSampler {
+        fn sample_value(&self, _: &mut SamplerContext, _: [i32; 3]) -> Result<f32, SampleError> {
+            Ok(0.0)
+        }
+    }
+    struct EmptySurface;
+    impl MaterialSurfaceQueries for EmptySurface {
+        fn surface_depth(&mut self, _: i32, _: i32) -> i32 {
+            0
+        }
+        fn surface_secondary(&mut self, _: i32, _: i32) -> f64 {
+            0.0
+        }
+    }
+
+    #[test]
+    fn invalid_noise_threshold_fails_before_carving_writes_any_block() {
+        let names = [
+            "minecraft:air",
+            "minecraft:void_air",
+            "minecraft:cave_air",
+            "minecraft:water",
+            "minecraft:lava",
+            "minecraft:stone",
+            "minecraft:grass_block",
+            "minecraft:mycelium",
+            "minecraft:dirt",
+        ];
+        let defaults: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, Tag::Int(i as i32)))
+            .collect();
+        let states: Vec<_> = names
+            .iter()
+            .map(|n| Tag::compound([("id", Tag::String((*n).into()))]))
+            .collect();
+        let registry = BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+            ("states", Tag::List(states)),
+            ("defaults", Tag::compound(defaults)),
+        ]))
+        .unwrap();
+        let air = registry.default_state("minecraft:air").unwrap();
+        let water = registry.default_state("minecraft:water").unwrap();
+        let lava = registry.default_state("minecraft:lava").unwrap();
+        let stone = registry.default_state("minecraft:stone").unwrap();
+        let blocks = CarvingBlocks::from_registry(&registry, &BTreeSet::new()).unwrap();
+        let mut chunk = TerrainChunk::new(
+            ChunkPos::new(0, 0),
+            0,
+            32,
+            &registry,
+            SimpleStates { air, water, lava },
+        )
+        .unwrap();
+        chunk.set_block_worldgen(2, 10, 3, stone).unwrap();
+        let mut mask = CarvingMask::new(0, 31).unwrap();
+        mask.carve(2, 10, 3).unwrap();
+        let mut aquifer = DisabledAquifer::new(GlobalFluidPicker::new(0, water, lava, air), air);
+        let invalid_rule = MaterialRule::Condition {
+            if_true: MaterialCondition::NoiseThreshold {
+                noise: "minecraft:no_such_noise".to_owned(),
+                min: 0.0,
+                max: 1.0,
+                is_3d: false,
+            },
+            then_run: Box::new(MaterialRule::Block(stone)),
+        };
+        let mut density_context = SamplerContext::default();
+        let root = LegacyRandom::new(1).fork_positional();
+        let err = apply_carving_mask::<LegacyRandom, _, _>(
+            &mut chunk,
+            &mask,
+            invalid_rule,
+            TopMaterialInputs {
+                generation: WorldGenerationContext::new(0, 32, 0),
+                root,
+                surface: EmptySurface,
+                preliminary_surface: Arc::new(ZeroSampler),
+                density_context: &mut density_context,
+            },
+            &mut aquifer,
+            &blocks,
+            |_| true,
+        );
+        assert!(matches!(err, Err(SurfaceError::Decode(_))));
+        assert_eq!(chunk.block(2, 10, 3), stone);
+    }
 }

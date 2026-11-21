@@ -39,7 +39,7 @@ use super::{
     settings::NoiseSettings,
     spawn_finder::{SpawnTargetPoint, find_spawn_position},
     tags::TagDefinitions,
-    terrain::{PreLightChunkStage, TerrainAquifer, TerrainBlockStates, TerrainChunk, fill_noise},
+    terrain::{PreLightChunkStage, TerrainBlockStates, TerrainChunk, fill_noise},
 };
 use crate::{
     heightmap::{HeightmapState, HeightmapType},
@@ -363,6 +363,9 @@ struct Pipeline<R: RandomSource> {
     noises: BTreeMap<String, Arc<dyn Noise>>,
     extensions: MaterialExtensions<R::Positional>,
     picker: GlobalFluidPicker,
+    aquifer_random: R::Positional,
+    aquifer_blocks: Option<RegistryAquiferBlockStates<'static>>,
+    air_state: BlockStateId,
     zoom: BiomeZoom,
     biome_cache: BiomeCache,
     /// The terrain density's cell lattice each biome chunk's climate volume
@@ -435,6 +438,17 @@ type BiomeCache = Mutex<BiomeChunks>;
 type LatticeCache = Mutex<HashMap<(i32, i32), Arc<Vec<LatticeSamples>>>>;
 /// ~33 KB a chunk in To The Max; misses only resample.
 const LATTICE_CACHE_LIMIT: usize = 1024;
+
+type ChunkNoiseAquifer<R> = NoiseBasedAquifer<
+    GlobalFluidPicker,
+    <R as RandomSource>::Positional,
+    RegistryAquiferBlockStates<'static>,
+>;
+
+enum ActiveAquifer<R: RandomSource> {
+    Noise(Box<ChunkNoiseAquifer<R>>),
+    Disabled(DisabledAquifer<GlobalFluidPicker>),
+}
 
 /// `NoiseGeneratorSettings`' `default_block` and `default_fluid`: a block state
 /// in 26.3's form, the id alone or `{"id", "properties"}`.
@@ -538,12 +552,15 @@ where
             },
             settings.sea_level,
         );
+        let air_state = default("minecraft:air")?;
         let picker = GlobalFluidPicker::new(
             settings.sea_level,
             settings.default_fluid,
             default("minecraft:lava")?,
-            default("minecraft:air")?,
+            air_state,
         );
+        let aquifer_random = root.from_hash_of("minecraft:aquifer").fork_positional();
+        let aquifer_blocks = RegistryAquiferBlockStates::new(data.registry).ok();
         let mut pipeline = Self {
             zoom: BiomeZoom::new(obfuscate_seed(seed)),
             data,
@@ -560,6 +577,9 @@ where
             noises,
             extensions,
             picker,
+            aquifer_random,
+            aquifer_blocks,
+            air_state,
             biome_cache: Mutex::new(BiomeChunks::default()),
             lattice_cache: Mutex::new(HashMap::new()),
             biome_work: ChunkWork::new(),
@@ -920,24 +940,30 @@ where
                 neighbors.push((*chunk).clone());
             }
         }
-        let possible =
-            seen.iter()
-                .chain(seen_spill.iter())
-                .enumerate()
-                .flat_map(|(word, &bits)| {
-                    let mut bits = bits;
-                    std::iter::from_fn(move || {
-                        (bits != 0).then(|| {
-                            let bit = bits.trailing_zeros();
-                            bits &= bits - 1;
-                            BiomeId(word as u32 * 64 + bit)
-                        })
-                    })
-                });
         let center = neighbors[4].clone();
         let biomes =
             BiomeRegion::new(neighbors, obfuscate_seed(self.seed)).map_err(stage("biomes"))?;
-        let possible = possible.map(|id| data.biome_name(id).to_owned()).collect();
+        let in_range = [pos.x, pos.z].into_iter().all(|c| {
+            c.checked_mul(16)
+                .is_some_and(|b| b.checked_sub(16).is_some() && b.checked_add(31).is_some())
+        });
+        let mut possible_spill = Vec::new();
+        let possible_ids: Option<&[u64]> = if !in_range {
+            None
+        } else if seen_spill.is_empty() {
+            let mut len = seen.len();
+            while len > 0 && seen[len - 1] == 0 {
+                len -= 1;
+            }
+            Some(&seen[..len])
+        } else {
+            possible_spill.extend_from_slice(&seen);
+            possible_spill.extend_from_slice(&seen_spill);
+            while possible_spill.last() == Some(&0) {
+                possible_spill.pop();
+            }
+            Some(&possible_spill)
+        };
         worker.timings.biomes += lap(&mut clock);
         let mut chunk = TerrainChunk::new(
             pos,
@@ -1048,24 +1074,37 @@ where
         }
         worker.timings.structures += lap(&mut clock);
         worker.timings.noise += lap(&mut clock);
-        let mut aquifer: Box<dyn TerrainAquifer> = match &self.aquifer {
-            Some(samplers) => Box::new(
-                NoiseBasedAquifer::new(
-                    AquiferSamplers::new(samplers.clone()),
-                    self.picker,
-                    self.root
-                        .from_hash_of("minecraft:aquifer")
-                        .fork_positional(),
-                    RegistryAquiferBlockStates::new(data.registry).map_err(stage("aquifer"))?,
-                    volume,
-                    context,
-                )
-                .map_err(stage("aquifer"))?,
-            ),
-            None => Box::new(DisabledAquifer::new(
-                self.picker,
-                data.registry.default_state("minecraft:air").unwrap(),
-            )),
+        let mut aquifer: ActiveAquifer<R> = match &self.aquifer {
+            Some(samplers) => {
+                let aq = match worker
+                    .chunk_aquifer
+                    .take()
+                    .and_then(|b| b.downcast::<ChunkNoiseAquifer<R>>().ok())
+                {
+                    Some(mut aq) => {
+                        aq.reset(volume, context).map_err(stage("aquifer"))?;
+                        aq
+                    }
+                    None => {
+                        let blocks = self.aquifer_blocks.ok_or_else(|| {
+                            stage("aquifer")(super::aquifer::AquiferError::MissingBlock)
+                        })?;
+                        Box::new(
+                            NoiseBasedAquifer::new(
+                                AquiferSamplers::new(samplers.clone()),
+                                self.picker,
+                                self.aquifer_random.clone(),
+                                blocks,
+                                volume,
+                                context,
+                            )
+                            .map_err(stage("aquifer"))?,
+                        )
+                    }
+                };
+                ActiveAquifer::Noise(aq)
+            }
+            None => ActiveAquifer::Disabled(DisabledAquifer::new(self.picker, self.air_state)),
         };
         worker.timings.noise += lap(&mut clock);
         // The density cells this fill needs are mostly in the climate volumes
@@ -1081,14 +1120,24 @@ where
         context.set_lattice(lattice);
         let filled = match &self.mod_terrain {
             Some(terrain) => terrain.fill(&mut chunk, data.registry, self.seed, [min, height]),
-            None => fill_noise(
-                &mut chunk,
-                volume,
-                self.router.get(RouterField::FinalDensity).as_ref(),
-                context,
-                aquifer.as_mut(),
-                self.settings.default_block,
-            ),
+            None => match &mut aquifer {
+                ActiveAquifer::Noise(aquifer) => fill_noise(
+                    &mut chunk,
+                    volume,
+                    self.router.get(RouterField::FinalDensity).as_ref(),
+                    context,
+                    &mut **aquifer,
+                    self.settings.default_block,
+                ),
+                ActiveAquifer::Disabled(aquifer) => fill_noise(
+                    &mut chunk,
+                    volume,
+                    self.router.get(RouterField::FinalDensity).as_ref(),
+                    context,
+                    aquifer,
+                    self.settings.default_block,
+                ),
+            },
         };
         context.clear_lattice();
         filled.map_err(stage("noise"))?;
@@ -1102,6 +1151,9 @@ where
             .map(|cache| *cache);
         let stages = self.mod_terrain.as_ref().map(|terrain| terrain.stages);
         if stages.is_none_or(|stages| stages.surface) && !self.identity_end_surface(pos) {
+            worker
+                .uniform_biomes
+                .reset(pos, self.settings.level_min_y, self.settings.level_height);
             build_surface_shared(
                 &mut chunk,
                 &self.rule,
@@ -1114,12 +1166,8 @@ where
                         pipeline: self,
                         temperatures: &mut worker.temperatures,
                         biome: Biomes::Region(&biomes),
-                        uniform_biomes: Some(UniformSurfaceBiomes::new(
-                            pos,
-                            self.settings.level_min_y,
-                            self.settings.level_height,
-                        )),
-                        possible: Some(possible),
+                        uniform_biomes: Some(&mut worker.uniform_biomes),
+                        possible_ids,
                     },
                     preliminary_surface: self.preliminary.clone(),
                     density_context: context,
@@ -1148,29 +1196,45 @@ where
                 self.router.get(RouterField::Erosion).as_ref(),
             );
             let mut biome_context = SamplerContext::default();
-            apply_carving_mask_shared(
-                &mut chunk,
-                &mask,
-                &self.rule,
-                &mut shared,
-                TopMaterialInputs::<R, _> {
-                    generation,
-                    root: self.root.clone(),
-                    surface: SurfaceQueries {
-                        pipeline: self,
-                        temperatures: &mut worker.temperatures,
-                        biome: Biomes::Resolver(&mut resolver, &mut biome_context),
-                        uniform_biomes: None,
-                        possible: None,
-                    },
-                    preliminary_surface: self.preliminary.clone(),
-                    density_context: context,
+            let top_inputs = TopMaterialInputs::<R, _> {
+                generation,
+                root: self.root.clone(),
+                surface: SurfaceQueries {
+                    pipeline: self,
+                    temperatures: &mut worker.temperatures,
+                    biome: Biomes::Resolver(&mut resolver, &mut biome_context),
+                    uniform_biomes: None,
+                    possible_ids: None,
                 },
-                aquifer.as_mut(),
-                &data.carving_blocks,
-                |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
-            )
+                preliminary_surface: self.preliminary.clone(),
+                density_context: context,
+            };
+            match &mut aquifer {
+                ActiveAquifer::Noise(aquifer) => apply_carving_mask_shared(
+                    &mut chunk,
+                    &mask,
+                    &self.rule,
+                    &mut shared,
+                    top_inputs,
+                    &mut **aquifer,
+                    &data.carving_blocks,
+                    |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
+                ),
+                ActiveAquifer::Disabled(aquifer) => apply_carving_mask_shared(
+                    &mut chunk,
+                    &mask,
+                    &self.rule,
+                    &mut shared,
+                    top_inputs,
+                    aquifer,
+                    &data.carving_blocks,
+                    |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
+                ),
+            }
             .map_err(stage("carvers"))?;
+        }
+        if let ActiveAquifer::Noise(aq) = aquifer {
+            worker.chunk_aquifer = Some(aq);
         }
         worker.surface_rule = shared.map(|rule| Box::new(rule) as Box<dyn Any + Send>);
         worker.timings.carvers += lap(&mut clock);
@@ -1199,7 +1263,7 @@ where
     }
 }
 
-impl<R: RandomSource> Pipeline<R>
+impl<R: RandomSource + 'static> Pipeline<R>
 where
     R::Positional: Clone + Send + Sync,
 {
@@ -1225,10 +1289,16 @@ where
     }
     /// ChunkGenerator.getBaseHeight: the first free Y above the noise column
     /// (with aquifers, without terrain adaptation) for a heightmap type.
-    fn base_height(&self, x: i32, z: i32, kind: HeightmapType) -> i32 {
+    fn base_height_with_worker(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        kind: HeightmapType,
+    ) -> i32 {
         let (min, _) = self.column_range();
         let mut found = min;
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(worker, x, z, &mut |y, state| {
             if kind.is_opaque(self.data.states.get(state)) {
                 found = y + 1;
                 return true;
@@ -1237,16 +1307,28 @@ where
         });
         found
     }
+    #[cfg(test)]
+    fn base_height(&self, x: i32, z: i32, kind: HeightmapType) -> i32 {
+        let mut worker = WorkerState::new(Vec::new());
+        self.base_height_with_worker(&mut worker, x, z, kind)
+    }
     /// ChunkGenerator.getBaseColumn: opacity of each noise-column state for
     /// a heightmap type, indexed from the minimum Y.
-    fn base_column(&self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.base_columns_by(x, z, 1, &|_| kind)
+    fn base_column(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        kind: HeightmapType,
+    ) -> Vec<bool> {
+        self.base_columns_by(worker, x, z, 1, &|_| kind)
             .pop()
             .unwrap_or_default()
     }
     /// One noise-column pass, as opacities for each heightmap kind.
     fn base_columns_by(
         &self,
+        worker: &mut WorkerState,
         x: i32,
         z: i32,
         count: usize,
@@ -1254,7 +1336,7 @@ where
     ) -> Vec<Vec<bool>> {
         let (min, height) = self.column_range();
         let mut columns = vec![vec![false; height as usize]; count];
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(worker, x, z, &mut |y, state| {
             let state = self.data.states.get(state);
             for (index, column) in columns.iter_mut().enumerate() {
                 column[(y - min) as usize] = kind(index).is_opaque(state);
@@ -1268,6 +1350,7 @@ where
     /// are never cobwebs or bamboo saplings).
     fn noise_blocks_into(
         &self,
+        worker: &mut WorkerState,
         x: i32,
         z: i32,
         column: &mut dyn super::structure::start::NoiseColumnTarget,
@@ -1276,7 +1359,7 @@ where
         let (min, height) = self.column_range();
         column.resize(min, height as usize);
         let registry = self.data.registry;
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(worker, x, z, &mut |y, state| {
             let props = self.data.states.get(state);
             let block = if props.is_air() {
                 NoiseBlock::Air
@@ -1293,19 +1376,21 @@ where
         });
     }
     /// iterateNoiseColumn from the top down until `visit` returns true.
-    fn noise_column(&self, x: i32, z: i32, visit: &mut dyn FnMut(i32, BlockStateId) -> bool) {
+    fn noise_column(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        visit: &mut dyn FnMut(i32, BlockStateId) -> bool,
+    ) {
         // `FlatLevelSource.getBaseHeight` and `getBaseColumn`: the layers, and air above them.
         if let Some(flat) = &self.flat {
-            let air = self.data.registry.default_state("minecraft:air");
             let top = self.settings.level_min_y + self.settings.level_height;
             for y in (self.settings.level_min_y..top).rev() {
                 let i = (y - flat.min_y) as usize;
                 let state = match flat.states.get(i) {
                     Some(&state) if !flat.null[i] => state,
-                    _ => match air {
-                        Some(air) => air,
-                        None => return,
-                    },
+                    _ => self.air_state,
                 };
                 if visit(y, state) {
                     return;
@@ -1317,54 +1402,88 @@ where
         let Ok(volume) = DensityVolume::new([1, height, 1], [x, min, z], [1; 3]) else {
             return;
         };
-        let mut context = SamplerContext::cached();
-        let mut aquifer: Box<dyn TerrainAquifer> = match &self.aquifer {
-            Some(samplers) => match RegistryAquiferBlockStates::new(self.data.registry)
-                .ok()
-                .and_then(|blocks| {
-                    NoiseBasedAquifer::new(
-                        AquiferSamplers::new(samplers.clone()),
-                        self.picker,
-                        self.root
-                            .from_hash_of("minecraft:aquifer")
-                            .fork_positional(),
-                        blocks,
-                        volume,
-                        &mut context,
-                    )
-                    .ok()
-                }) {
-                Some(aquifer) => Box::new(aquifer),
-                None => return,
-            },
-            None => Box::new(DisabledAquifer::new(
-                self.picker,
-                self.data.registry.default_state("minecraft:air").unwrap(),
-            )),
-        };
-        let mut density = vec![0.; height as usize];
-        if self
-            .router
-            .get(RouterField::FinalDensity)
-            .sample_volume(&mut context, &mut density, volume)
-            .is_err()
-        {
-            return;
-        }
-        for y in (0..height).rev() {
-            let state = aquifer
-                .compute_substance(
-                    &mut context,
-                    [x, min + y, z],
-                    f64::from(density[y as usize]),
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(self.settings.default_block);
-            if visit(min + y, state) {
-                return;
+        let context = &mut worker.column_context;
+        context.reset();
+        let density = &mut worker.column_density;
+        density.clear();
+        density.resize(height as usize, 0.);
+        match &self.aquifer {
+            Some(samplers) => {
+                let mut aquifer = match worker
+                    .column_aquifer
+                    .take()
+                    .and_then(|b| b.downcast::<ChunkNoiseAquifer<R>>().ok())
+                {
+                    Some(mut aq) => match aq.reset(volume, context) {
+                        Ok(()) => aq,
+                        Err(_) => {
+                            worker.column_aquifer = Some(aq);
+                            context.reset();
+                            return;
+                        }
+                    },
+                    None => {
+                        let Some(blocks) = self.aquifer_blocks else {
+                            context.reset();
+                            return;
+                        };
+                        let Ok(aq) = NoiseBasedAquifer::new(
+                            AquiferSamplers::new(samplers.clone()),
+                            self.picker,
+                            self.aquifer_random.clone(),
+                            blocks,
+                            volume,
+                            context,
+                        ) else {
+                            context.reset();
+                            return;
+                        };
+                        Box::new(aq)
+                    }
+                };
+                if self
+                    .router
+                    .get(RouterField::FinalDensity)
+                    .sample_volume(context, density, volume)
+                    .is_ok()
+                {
+                    for y in (0..height).rev() {
+                        let state = aquifer
+                            .compute_substance(
+                                context,
+                                [x, min + y, z],
+                                f64::from(density[y as usize]),
+                            )
+                            .ok()
+                            .flatten()
+                            .unwrap_or(self.settings.default_block);
+                        if visit(min + y, state) {
+                            break;
+                        }
+                    }
+                }
+                worker.column_aquifer = Some(aquifer);
+            }
+            None => {
+                let aquifer = DisabledAquifer::new(self.picker, self.air_state);
+                if self
+                    .router
+                    .get(RouterField::FinalDensity)
+                    .sample_volume(context, density, volume)
+                    .is_ok()
+                {
+                    for y in (0..height).rev() {
+                        let state = aquifer
+                            .compute_substance([x, min + y, z], f64::from(density[y as usize]))
+                            .unwrap_or(self.settings.default_block);
+                        if visit(min + y, state) {
+                            break;
+                        }
+                    }
+                }
             }
         }
+        context.reset();
     }
 }
 /// Biome and height queries for structure generation on one worker.
@@ -1373,7 +1492,7 @@ pub(super) struct StructureQueries<'a, R: RandomSource> {
     worker: &'a mut WorkerState,
     valid: BTreeSet<BiomeId>,
 }
-impl<R: RandomSource> super::structure::jigsaw::JigsawContext for StructureQueries<'_, R>
+impl<R: RandomSource + 'static> super::structure::jigsaw::JigsawContext for StructureQueries<'_, R>
 where
     R::Positional: Clone + Send + Sync,
 {
@@ -1388,7 +1507,9 @@ where
         if let Some(h) = self.worker.heights.get(&(x, z, kind as u8)) {
             return *h;
         }
-        let h = self.pipeline.base_height(x, z, kind);
+        let h = self
+            .pipeline
+            .base_height_with_worker(self.worker, x, z, kind);
         if self.worker.heights.len() > 65536 {
             self.worker.heights.clear();
         }
@@ -1457,7 +1578,7 @@ where
         }
     }
     fn base_column(&mut self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.pipeline.base_column(x, z, kind)
+        self.pipeline.base_column(self.worker, x, z, kind)
     }
     fn base_columns_by(
         &mut self,
@@ -1466,7 +1587,8 @@ where
         count: usize,
         kind: &dyn Fn(usize) -> HeightmapType,
     ) -> Vec<Vec<bool>> {
-        self.pipeline.base_columns_by(x, z, count, kind)
+        self.pipeline
+            .base_columns_by(self.worker, x, z, count, kind)
     }
     fn noise_column_into(
         &mut self,
@@ -1474,7 +1596,7 @@ where
         z: i32,
         column: &mut dyn super::structure::start::NoiseColumnTarget,
     ) {
-        self.pipeline.noise_blocks_into(x, z, column)
+        self.pipeline.noise_blocks_into(self.worker, x, z, column)
     }
     fn cold_enough_to_snow(&mut self, biome: BiomeId, pos: [i32; 3]) -> bool {
         let sea = self.pipeline.settings.sea_level;
@@ -1601,19 +1723,34 @@ struct UniformSurfaceBiomes {
     last: ([i32; 3], SurfaceCell),
 }
 impl UniformSurfaceBiomes {
-    fn new(pos: ChunkPos, min_y: i32, height: i32) -> Self {
-        let height = (height >> 2) + 1;
+    fn empty() -> Self {
         Self {
-            origin: [
-                pos.x.wrapping_shl(4).wrapping_sub(2) >> 2,
-                min_y.wrapping_sub(2) >> 2,
-                pos.z.wrapping_shl(4).wrapping_sub(2) >> 2,
-            ],
-            height,
-            cells: vec![SurfaceCell::Unknown; 25 * height as usize],
+            origin: [0; 3],
+            height: 0,
+            cells: Vec::new(),
             mixed: Vec::new(),
             last: ([0; 3], SurfaceCell::Unknown),
         }
+    }
+    #[cfg(test)]
+    fn new(pos: ChunkPos, min_y: i32, height: i32) -> Self {
+        let mut cache = Self::empty();
+        cache.reset(pos, min_y, height);
+        cache
+    }
+    fn reset(&mut self, pos: ChunkPos, min_y: i32, height: i32) {
+        let height = (height >> 2) + 1;
+        self.origin = [
+            pos.x.wrapping_shl(4).wrapping_sub(2) >> 2,
+            min_y.wrapping_sub(2) >> 2,
+            pos.z.wrapping_shl(4).wrapping_sub(2) >> 2,
+        ];
+        self.height = height;
+        self.cells.clear();
+        self.cells
+            .resize(25 * height as usize, SurfaceCell::Unknown);
+        self.mixed.clear();
+        self.last = ([0; 3], SurfaceCell::Unknown);
     }
     #[inline]
     fn get(&mut self, region: &BiomeRegion<BiomeId>, p: BlockPos) -> Option<BiomeId> {
@@ -1676,8 +1813,8 @@ struct SurfaceQueries<'a, 'b, R: RandomSource> {
     pipeline: &'a Pipeline<R>,
     temperatures: &'a mut [BiomeTemperature],
     biome: Biomes<'a, 'b>,
-    possible: Option<BTreeSet<String>>,
-    uniform_biomes: Option<UniformSurfaceBiomes>,
+    possible_ids: Option<&'a [u64]>,
+    uniform_biomes: Option<&'a mut UniformSurfaceBiomes>,
 }
 impl<R: RandomSource> SurfaceQueries<'_, '_, R> {
     fn temperature(&mut self, name: &str) -> Result<&mut BiomeTemperature, MaterialRuleError> {
@@ -1709,8 +1846,8 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
             .cloned()
             .ok_or(DecodeError::Field("unknown material noise"))
     }
-    fn possible_biomes(&self) -> Option<BTreeSet<String>> {
-        self.possible.clone()
+    fn possible_biome_ids(&self) -> Option<&[u64]> {
+        self.possible_ids
     }
     fn biome(&mut self, p: BlockPos) -> Result<Option<Arc<str>>, MaterialRuleError> {
         Ok(self
@@ -1795,6 +1932,13 @@ pub(super) struct WorkerState {
     terrain_context: SamplerContext,
     biome_context: SamplerContext,
     carver_context: SamplerContext,
+    column_context: SamplerContext,
+    column_density: Vec<f32>,
+    /// Type-erased `ChunkNoiseAquifer<R>` reused across chunks on this worker.
+    chunk_aquifer: Option<Box<dyn Any + Send>>,
+    /// Type-erased `ChunkNoiseAquifer<R>` reused across `noise_column` calls.
+    column_aquifer: Option<Box<dyn Any + Send>>,
+    uniform_biomes: UniformSurfaceBiomes,
     /// Seed/dimension-bound lookups avoid the shared mutex for overlapping
     /// carver neighborhoods. Bounded independently of the shared cache.
     carver_biomes: HashMap<(i32, i32), BiomeId>,
@@ -1810,6 +1954,35 @@ pub(super) struct WorkerState {
     /// The world's surface rule compiled once for this worker's chunks: a
     /// `CompiledSurfaceRule` of the pipeline's random.
     surface_rule: Option<Box<dyn Any + Send>>,
+    /// Empty stand-in chunks recycled across decorated chunks so decoration
+    /// does not allocate 9 throwaway `TerrainChunk`s per chunk.
+    pub(super) decor_standins: Vec<TerrainChunk<'static, GenBlockStates>>,
+    /// Uniform-biome section cache recycled across decorated chunks.
+    pub(super) decor_uniform_biomes: Vec<u32>,
+}
+impl WorkerState {
+    fn new(temperatures: Vec<BiomeTemperature>) -> Self {
+        Self {
+            temperatures,
+            terrain_context: SamplerContext::cached(),
+            biome_context: SamplerContext::cached(),
+            carver_context: SamplerContext::default(),
+            column_context: SamplerContext::cached(),
+            column_density: Vec::new(),
+            chunk_aquifer: None,
+            column_aquifer: None,
+            uniform_biomes: UniformSurfaceBiomes::empty(),
+            carver_biomes: HashMap::new(),
+            structure_biomes: HashMap::new(),
+            timings: StageTimings::default(),
+            heights: HashMap::new(),
+            structures_only: false,
+            structure_mobs: None,
+            surface_rule: None,
+            decor_standins: Vec::new(),
+            decor_uniform_biomes: Vec::new(),
+        }
+    }
 }
 /// `Mob.finalizeSpawn(level, difficulty, STRUCTURE, null)` of the entities a
 /// structure places with finalizeEntities, run by the game, which owns mobs.
@@ -2262,7 +2435,7 @@ where
             }
             false
         };
-        self.noise_column(x, z, &mut visit);
+        self.noise_column(worker, x, z, &mut visit);
         let (height, state) = top?;
         // A superflat surface is its top layer, with its one biome.
         if self.flat.is_some() {
@@ -2296,7 +2469,7 @@ where
             temperatures: &mut worker.temperatures,
             biome: Biomes::Resolver(&mut resolver, &mut biome_context),
             uniform_biomes: None,
-            possible: None,
+            possible_ids: None,
         };
         let sources = MaterialDensitySources::new(
             queries,
@@ -2569,7 +2742,7 @@ where
             temperatures: &mut worker.temperatures,
             biome: Biomes::Memo(&mut resolver, &mut biome_context, &mut biome_memo),
             uniform_biomes: None,
-            possible: None,
+            possible_ids: None,
         };
         let sources = MaterialDensitySources::new(
             queries,
@@ -2947,25 +3120,14 @@ impl OverworldGenerator {
     /// Create per-thread state. Workers are cheap; keep one per thread.
     pub fn worker(&self) -> GeneratorWorker {
         let data = self.pipeline.data();
+        let temperatures = data
+            .temperatures
+            .iter()
+            .map(|s| BiomeTemperature::for_generation(*s))
+            .collect();
         GeneratorWorker {
             pipeline: self.pipeline.clone(),
-            state: WorkerState {
-                temperatures: data
-                    .temperatures
-                    .iter()
-                    .map(|s| BiomeTemperature::for_generation(*s))
-                    .collect(),
-                terrain_context: SamplerContext::cached(),
-                biome_context: SamplerContext::cached(),
-                carver_context: SamplerContext::default(),
-                carver_biomes: HashMap::new(),
-                structure_biomes: HashMap::new(),
-                timings: StageTimings::default(),
-                structures_only: false,
-                structure_mobs: None,
-                heights: HashMap::new(),
-                surface_rule: None,
-            },
+            state: WorkerState::new(temperatures),
         }
     }
 }
@@ -3139,12 +3301,23 @@ impl GeneratorWorker {
             &mut state.terrain_context,
             &mut state.biome_context,
             &mut state.carver_context,
+            &mut state.column_context,
         ] {
             context.clear_scratch();
         }
+        state.column_density = Vec::new();
+        state.chunk_aquifer = None;
+        state.column_aquifer = None;
+        state.uniform_biomes = UniformSurfaceBiomes::empty();
+        state.surface_rule = None;
         state.carver_biomes = HashMap::new();
         state.structure_biomes = HashMap::new();
         state.heights = HashMap::new();
+        state.decor_standins = Vec::new();
+        state.decor_uniform_biomes = Vec::new();
+        super::terrain::release_scratch();
+        super::material_condition::release_density_scratch();
+        super::material_stage::release_scratch();
     }
 }
 
@@ -4096,8 +4269,10 @@ mod tests {
             .map(|&p| contents(&worker.generate_proto(p).unwrap()))
             .collect();
         assert!(generator.cache_census().biome_chunks > 0);
+        assert!(worker.state.surface_rule.is_some());
         generator.release_caches();
         worker.release();
+        assert!(worker.state.surface_rule.is_none());
         let census = generator.cache_census();
         assert_eq!((census.biome_chunks, census.carver_entries), (0, 0));
         // The other way round, so a neighbour's biomes come from the cache
