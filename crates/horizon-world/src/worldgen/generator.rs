@@ -15,7 +15,7 @@ use super::{
         NoiseBasedAquifer, RegistryAquiferBlockStates,
     },
     biome::BiomeId,
-    biome_chunk::{BiomeChunk, BiomeRegion},
+    biome_chunk::{BiomeChunk, BiomeRegionError},
     biome_chunks::BiomeChunks,
     biome_source::{
         BiomeSourceCatalog, BiomeSourceDefinition, ResolvedBiomeSource, regions::RegionLayout,
@@ -48,6 +48,7 @@ use crate::{
 use horizon_core::{
     biome::{BiomeZoom, obfuscate_seed},
     density::{DensitySampler, LatticeSamples, SamplerContext},
+    fast_hash::FxHashMap,
     noise::{DensityVolume, Noise},
     position::{BlockPos, ChunkPos},
     random::{LegacyRandom, PositionalRandom, RandomSource, XoroshiroRandom},
@@ -55,10 +56,10 @@ use horizon_core::{
 use serde_json::Value;
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
 #[derive(Debug)]
@@ -218,7 +219,7 @@ fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
 /// `terrain.postprocessing()`.
 pub struct ProtoChunk {
     pub terrain: TerrainChunk<'static, GenBlockStates>,
-    biomes: BiomeChunk<BiomeId>,
+    biomes: Arc<BiomeChunk<BiomeId>>,
     data: Arc<GeneratorData>,
     decorated: bool,
     /// Block-entity data placed by structures and template features, in
@@ -369,7 +370,7 @@ struct Pipeline<R: RandomSource> {
     /// sampled, for the noise fill of this chunk and its -X/-Z neighbours.
     lattice_cache: LatticeCache,
     biome_work: ChunkWork,
-    carver_cache: Mutex<HashMap<(i32, i32), BiomeId>>,
+    carver_cache: CarverCache,
     pub(super) decoration: Option<Arc<super::generator_decoration::Decoration>>,
     pub(super) structures: Option<super::generator_structures::StructureState>,
     /// Definitions for explicit placement when automatic structure starts are off.
@@ -404,7 +405,7 @@ pub struct CacheCensus {
 /// computed values across eviction or explicit invalidation. Only one work
 /// lock may be held at a time; finish shared prerequisites before acquiring it.
 /// Sharded by key: every worker asks for the locks of the same neighbourhoods.
-pub(super) struct ChunkWork(Box<[Mutex<HashMap<(i32, i32), std::sync::Weak<Mutex<()>>>>]>);
+pub(super) struct ChunkWork(Box<[Mutex<FxHashMap<(i32, i32), std::sync::Weak<Mutex<()>>>>]>);
 const WORK_SHARDS: usize = 64;
 /// The shard of `key` among `shards` (a power of two).
 pub(super) fn shard_of(key: (i32, i32), shards: usize) -> usize {
@@ -431,10 +432,206 @@ impl ChunkWork {
     }
 }
 
-type BiomeCache = Mutex<BiomeChunks>;
-type LatticeCache = Mutex<HashMap<(i32, i32), Arc<Vec<LatticeSamples>>>>;
+const CACHE_SHARDS: usize = 64;
 /// ~33 KB a chunk in To The Max; misses only resample.
 const LATTICE_CACHE_LIMIT: usize = 1024;
+
+struct BiomeCache(Box<[RwLock<BiomeChunks>]>);
+impl BiomeCache {
+    fn new() -> Self {
+        let per = (super::biome_chunks::CACHE_LIMIT / CACHE_SHARDS).max(2);
+        Self(
+            (0..CACHE_SHARDS)
+                .map(|_| RwLock::new(BiomeChunks::with_limit(per)))
+                .collect(),
+        )
+    }
+    fn get(&self, key: &(i32, i32)) -> Option<Arc<BiomeChunk<BiomeId>>> {
+        let shard = &self.0[shard_of(*key, CACHE_SHARDS)];
+        {
+            let read = shard.read().unwrap();
+            if let Some(chunk) = read.get_now(key) {
+                return Some(chunk.clone());
+            }
+            if !read.has_old(key) {
+                return None;
+            }
+        }
+        shard.write().unwrap().get(key).cloned()
+    }
+    fn insert(&self, key: (i32, i32), chunk: Arc<BiomeChunk<BiomeId>>) {
+        self.0[shard_of(key, CACHE_SHARDS)]
+            .write()
+            .unwrap()
+            .insert(key, chunk);
+    }
+    fn clear(&self) {
+        let mut dropped = Vec::with_capacity(CACHE_SHARDS);
+        for shard in &self.0 {
+            let mut guard = shard.write().unwrap();
+            let old = std::mem::replace(
+                &mut *guard,
+                BiomeChunks::with_limit((super::biome_chunks::CACHE_LIMIT / CACHE_SHARDS).max(2)),
+            );
+            dropped.push(old);
+        }
+        drop(dropped);
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.iter().map(|shard| shard.read().unwrap().len()).sum()
+    }
+    fn census(&self) -> (usize, usize) {
+        let mut chunks = 0;
+        let mut bytes = 0;
+        for shard in &self.0 {
+            let guard = shard.read().unwrap();
+            chunks += guard.len();
+            bytes += guard
+                .values()
+                .map(|b| std::mem::size_of::<BiomeChunk<BiomeId>>() + b.heap_bytes())
+                .sum::<usize>()
+                + guard.capacity() * std::mem::size_of::<((i32, i32), usize)>();
+        }
+        (chunks, bytes)
+    }
+}
+
+struct LatticeCache(Box<[RwLock<FxHashMap<(i32, i32), Arc<Vec<LatticeSamples>>>>]>);
+impl LatticeCache {
+    fn new() -> Self {
+        Self((0..CACHE_SHARDS).map(|_| RwLock::default()).collect())
+    }
+    fn get(&self, key: &(i32, i32)) -> Option<Arc<Vec<LatticeSamples>>> {
+        self.0[shard_of(*key, CACHE_SHARDS)]
+            .read()
+            .unwrap()
+            .get(key)
+            .cloned()
+    }
+    fn insert(&self, key: (i32, i32), value: Arc<Vec<LatticeSamples>>) {
+        let mut shard = self.0[shard_of(key, CACHE_SHARDS)].write().unwrap();
+        if shard.len() >= (LATTICE_CACHE_LIMIT / CACHE_SHARDS).max(1) {
+            shard.clear();
+        }
+        shard.insert(key, value);
+    }
+    fn clear(&self) {
+        let mut dropped = Vec::with_capacity(CACHE_SHARDS);
+        for shard in &self.0 {
+            let old = std::mem::take(&mut *shard.write().unwrap());
+            dropped.push(old);
+        }
+        drop(dropped);
+    }
+}
+
+struct CarverCache(Box<[RwLock<FxHashMap<(i32, i32), BiomeId>>]>);
+impl CarverCache {
+    fn new() -> Self {
+        Self((0..CACHE_SHARDS).map(|_| RwLock::default()).collect())
+    }
+    fn get(&self, key: &(i32, i32)) -> Option<BiomeId> {
+        self.0[shard_of(*key, CACHE_SHARDS)]
+            .read()
+            .unwrap()
+            .get(key)
+            .copied()
+    }
+    fn insert(&self, key: (i32, i32), value: BiomeId) {
+        let mut shard = self.0[shard_of(key, CACHE_SHARDS)].write().unwrap();
+        if shard.len() >= (CARVER_CACHE_LIMIT / CACHE_SHARDS).max(1) {
+            shard.clear();
+        }
+        shard.insert(key, value);
+    }
+    fn clear(&self) {
+        let mut dropped = Vec::with_capacity(CACHE_SHARDS);
+        for shard in &self.0 {
+            let old = std::mem::take(&mut *shard.write().unwrap());
+            dropped.push(old);
+        }
+        drop(dropped);
+    }
+    fn len(&self) -> usize {
+        self.0.iter().map(|shard| shard.read().unwrap().len()).sum()
+    }
+}
+
+/// Zero-copy 3x3 chunk biome neighborhood backed directly by shared `Arc<BiomeChunk>`.
+pub(super) struct SurfaceBiomeRegion {
+    center: ChunkPos,
+    chunks: [Arc<BiomeChunk<BiomeId>>; 9],
+    zoom: BiomeZoom,
+}
+impl SurfaceBiomeRegion {
+    pub(super) fn new(
+        center: ChunkPos,
+        chunks: [Arc<BiomeChunk<BiomeId>>; 9],
+        zoom: BiomeZoom,
+    ) -> Result<Self, BiomeRegionError> {
+        let min_y = chunks[4].min_y();
+        let height = chunks[4].height();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let expected = ChunkPos::new(
+                center.x.wrapping_add((i % 3) as i32 - 1),
+                center.z.wrapping_add((i / 3) as i32 - 1),
+            );
+            if chunk.position() != expected || chunk.min_y() != min_y || chunk.height() != height {
+                return Err(BiomeRegionError::InvalidChunks);
+            }
+        }
+        Ok(Self {
+            center,
+            chunks,
+            zoom,
+        })
+    }
+    #[inline]
+    pub(super) fn chunk(&self, pos: ChunkPos) -> Option<&BiomeChunk<BiomeId>> {
+        let dx = pos.x.wrapping_sub(self.center.x).wrapping_add(1) as u32;
+        let dz = pos.z.wrapping_sub(self.center.z).wrapping_add(1) as u32;
+        if dx >= 3 || dz >= 3 {
+            return None;
+        }
+        let chunk = &self.chunks[(dz * 3 + dx) as usize];
+        (chunk.position() == pos).then_some(chunk.as_ref())
+    }
+    #[inline]
+    pub(super) fn noise_biome(&self, quart: [i32; 3]) -> Option<BiomeId> {
+        let chunk = self.chunk(ChunkPos::new(quart[0] >> 2, quart[2] >> 2))?;
+        Some(*chunk.noise_biome(quart))
+    }
+    #[inline]
+    pub(super) fn biome(&self, pos: BlockPos) -> Option<BiomeId> {
+        self.noise_biome(self.zoom.quart_at_block(pos))
+    }
+    #[inline]
+    pub(super) fn zoom(&self) -> BiomeZoom {
+        self.zoom
+    }
+}
+
+/// Sample one noise biome at `quart` using per-point caching when coordinates
+/// fit `BlockPos::pack` without aliasing, clearing caches between points so
+/// shared climate nodes (`shift_x`, `shift_z`, `continents`, `erosion`,
+/// `ridges`) are computed once instead of 5-8x per point.
+fn sample_point_biome<'a>(
+    resolver: &mut super::biome_source::BiomeSourceResolver<'a>,
+    context: &mut SamplerContext,
+    quart: [i32; 3],
+) -> Result<&'a str, super::biome_source::BiomeSourceError> {
+    let fits_pack = (-8_388_608..=8_388_607).contains(&quart[0])
+        && (-512..=511).contains(&quart[1])
+        && (-8_388_608..=8_388_607).contains(&quart[2]);
+    if fits_pack {
+        context.clear_caches();
+        resolver.sample(context, quart)
+    } else {
+        let mut uncached = SamplerContext::default();
+        resolver.sample(&mut uncached, quart)
+    }
+}
 
 /// `NoiseGeneratorSettings`' `default_block` and `default_fluid`: a block state
 /// in 26.3's form, the id alone or `{"id", "properties"}`.
@@ -560,10 +757,10 @@ where
             noises,
             extensions,
             picker,
-            biome_cache: Mutex::new(BiomeChunks::default()),
-            lattice_cache: Mutex::new(HashMap::new()),
+            biome_cache: BiomeCache::new(),
+            lattice_cache: LatticeCache::new(),
             biome_work: ChunkWork::new(),
-            carver_cache: Mutex::new(HashMap::new()),
+            carver_cache: CarverCache::new(),
             decoration: None,
             structures: None,
             manual_structures: std::sync::OnceLock::new(),
@@ -695,8 +892,8 @@ where
         pos: ChunkPos,
         wait: bool,
     ) -> Result<Option<Arc<BiomeChunk<BiomeId>>>, GeneratorError> {
-        if let Some(chunk) = self.biome_cache.lock().unwrap().get(&(pos.x, pos.z)) {
-            return Ok(Some(chunk.clone()));
+        if let Some(chunk) = self.biome_cache.get(&(pos.x, pos.z)) {
+            return Ok(Some(chunk));
         }
         // An old chunk keeps the biomes it was saved with.
         if let Some(old) = self
@@ -716,8 +913,8 @@ where
                 Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
             }
         };
-        if let Some(chunk) = self.biome_cache.lock().unwrap().get(&(pos.x, pos.z)) {
-            return Ok(Some(chunk.clone()));
+        if let Some(chunk) = self.biome_cache.get(&(pos.x, pos.z)) {
+            return Ok(Some(chunk));
         }
         let (min, height) = (self.settings.level_min_y, self.settings.level_height);
         let mut chunk = BiomeChunk::new(pos, min, height, BiomeId(0)).map_err(stage("biomes"))?;
@@ -726,8 +923,9 @@ where
             self.router.get(RouterField::Erosion).as_ref(),
         );
         let context = &mut worker.biome_context;
+        let climate_buffers = &mut worker.climate_buffers;
         context.capture_lattice();
-        let volume = resolver.prepare_volume(
+        let volume = resolver.prepare_volume_with_buffers(
             context,
             [
                 pos.x.wrapping_shl(4) >> 2,
@@ -735,45 +933,43 @@ where
                 pos.z.wrapping_shl(4) >> 2,
             ],
             [4, height >> 2, 4],
+            climate_buffers,
         );
         let lattice = context.take_lattice_capture();
         let volume = volume.map_err(stage("biomes"))?;
         if !lattice.is_empty() {
-            let mut cache = self.lattice_cache.lock().unwrap();
-            if cache.len() >= LATTICE_CACHE_LIMIT {
-                cache.clear();
-            }
-            cache.insert((pos.x, pos.z), Arc::new(lattice));
+            self.lattice_cache.insert((pos.x, pos.z), Arc::new(lattice));
         }
         let ids = &self.data.biome_ids;
         let blender = self.blender_at(pos);
         // Names point into the source's parameter list: neighbouring quarts
         // mostly resolve to the same entry, so skip the map lookup for it.
         let mut last: Option<(*const str, BiomeId)> = None;
-        chunk
-            .fill(min, min + height - 1, |quart| -> Result<BiomeId, String> {
-                // `Blender.getBiomeResolver`: an old chunk's biome near it.
-                if !blender.is_empty()
-                    && let Some(old) = blender.blend_biome(quart[0], quart[1], quart[2])
-                {
-                    return Ok(old);
-                }
-                let name = resolver
-                    .sample_prepared(context, volume.as_ref(), quart)
-                    .map_err(|e| e.to_string())?;
-                if let Some((pointer, id)) = last
-                    && std::ptr::eq(pointer, name)
-                {
-                    return Ok(id);
-                }
-                let id = ids.get(name).copied().ok_or_else(|| name.to_owned())?;
-                last = Some((name as *const str, id));
-                Ok(id)
-            })
-            .map_err(stage("biomes"))?;
+        let fill_result = chunk.fill(min, min + height - 1, |quart| -> Result<BiomeId, String> {
+            // `Blender.getBiomeResolver`: an old chunk's biome near it.
+            if !blender.is_empty()
+                && let Some(old) = blender.blend_biome(quart[0], quart[1], quart[2])
+            {
+                return Ok(old);
+            }
+            let name = resolver
+                .sample_prepared(context, volume.as_ref(), quart)
+                .map_err(|e| e.to_string())?;
+            if let Some((pointer, id)) = last
+                && std::ptr::eq(pointer, name)
+            {
+                return Ok(id);
+            }
+            let id = ids.get(name).copied().ok_or_else(|| name.to_owned())?;
+            last = Some((name as *const str, id));
+            Ok(id)
+        });
+        if let Some(volume) = volume {
+            volume.recycle(climate_buffers);
+        }
+        fill_result.map_err(stage("biomes"))?;
         let chunk = Arc::new(chunk);
-        let mut cache = self.biome_cache.lock().unwrap();
-        cache.insert((pos.x, pos.z), chunk.clone());
+        self.biome_cache.insert((pos.x, pos.z), chunk.clone());
         Ok(Some(chunk))
     }
     fn carver_biome(&self, worker: &mut WorkerState, origin: ChunkPos) -> Result<BiomeId, String> {
@@ -784,9 +980,9 @@ where
         if worker.carver_biomes.len() >= 4096 {
             worker.carver_biomes.clear();
         }
-        if let Some(id) = self.carver_cache.lock().unwrap().get(&key) {
-            worker.carver_biomes.insert(key, *id);
-            return Ok(*id);
+        if let Some(id) = self.carver_cache.get(&key) {
+            worker.carver_biomes.insert(key, id);
+            return Ok(id);
         }
         let mut resolver = self.source.resolver(
             &self.climate,
@@ -797,15 +993,10 @@ where
             0,
             origin.z.wrapping_shl(4) >> 2,
         ];
-        let name = resolver
-            .sample(&mut worker.carver_context, quart)
+        let name = sample_point_biome(&mut resolver, &mut worker.carver_context, quart)
             .map_err(|e| e.to_string())?;
         let id = self.data.biome_id(name).ok_or_else(|| name.to_owned())?;
-        let mut cache = self.carver_cache.lock().unwrap();
-        if cache.len() >= CARVER_CACHE_LIMIT {
-            cache.clear();
-        }
-        cache.insert(key, id);
+        self.carver_cache.insert(key, id);
         worker.carver_biomes.insert(key, id);
         Ok(id)
     }
@@ -876,7 +1067,6 @@ where
             self.settings.sea_level,
         );
         let mut clock = std::time::Instant::now();
-        let mut neighbors = Vec::with_capacity(9);
         // The biome ids present, as a bitset: ascending like a sorted set. The
         // registry's ordinary ids fit in the stack array; retain a spill only
         // for unusually large modded registries.
@@ -890,35 +1080,34 @@ where
         for (i, slot) in ready.iter_mut().enumerate() {
             *slot = self.biome_chunk_or_busy(worker, around(i as i32), false)?;
         }
+        let mut neighbors_opt: [Option<Arc<BiomeChunk<BiomeId>>>; 9] = Default::default();
         for (i, slot) in ready.iter_mut().enumerate() {
             let chunk = match slot.take() {
                 Some(chunk) => chunk,
                 None => self.biome_chunk(worker, around(i as i32))?,
             };
-            {
-                let mut section = 0;
-                let mut last = None;
-                while let Some(biomes) = chunk.section(section) {
-                    for &id in biomes {
-                        if last == Some(id) {
-                            continue;
-                        }
-                        last = Some(id);
-                        let word = id.0 as usize / 64;
-                        if let Some(bits) = seen.get_mut(word) {
-                            *bits |= 1 << (id.0 % 64);
-                        } else {
-                            let spill_word = word - seen.len();
-                            if seen_spill.len() <= spill_word {
-                                seen_spill.resize(spill_word + 1, 0);
-                            }
-                            seen_spill[spill_word] |= 1 << (id.0 % 64);
-                        }
+            let mut section = 0;
+            let mut last = None;
+            while let Some(biomes) = chunk.section(section) {
+                for &id in biomes {
+                    if last == Some(id) {
+                        continue;
                     }
-                    section += 1;
+                    last = Some(id);
+                    let word = id.0 as usize / 64;
+                    if let Some(bits) = seen.get_mut(word) {
+                        *bits |= 1 << (id.0 % 64);
+                    } else {
+                        let spill_word = word - seen.len();
+                        if seen_spill.len() <= spill_word {
+                            seen_spill.resize(spill_word + 1, 0);
+                        }
+                        seen_spill[spill_word] |= 1 << (id.0 % 64);
+                    }
                 }
-                neighbors.push((*chunk).clone());
+                section += 1;
             }
+            neighbors_opt[i] = Some(chunk);
         }
         let possible =
             seen.iter()
@@ -934,9 +1123,9 @@ where
                         })
                     })
                 });
-        let center = neighbors[4].clone();
-        let biomes =
-            BiomeRegion::new(neighbors, obfuscate_seed(self.seed)).map_err(stage("biomes"))?;
+        let neighbors = neighbors_opt.map(Option::unwrap);
+        let center = Arc::clone(&neighbors[4]);
+        let biomes = SurfaceBiomeRegion::new(pos, neighbors, self.zoom).map_err(stage("biomes"))?;
         let possible = possible.map(|id| data.biome_name(id).to_owned()).collect();
         worker.timings.biomes += lap(&mut clock);
         let mut chunk = TerrainChunk::new(
@@ -1070,14 +1259,15 @@ where
         worker.timings.noise += lap(&mut clock);
         // The density cells this fill needs are mostly in the climate volumes
         // of this chunk and its +X/+Z neighbours, sampled for their biomes.
-        let lattice = {
-            let cache = self.lattice_cache.lock().unwrap();
-            [(0, 0), (1, 0), (0, 1), (1, 1)]
-                .into_iter()
-                .filter_map(|(dx, dz)| cache.get(&(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz))))
-                .flat_map(|samples| samples.iter().cloned())
-                .collect()
-        };
+        let mut lattice = Vec::new();
+        for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            if let Some(samples) = self
+                .lattice_cache
+                .get(&(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz)))
+            {
+                lattice.extend(samples.iter().cloned());
+            }
+        }
         context.set_lattice(lattice);
         let filled = match &self.mod_terrain {
             Some(terrain) => terrain.fill(&mut chunk, data.registry, self.seed, [min, height]),
@@ -1102,6 +1292,9 @@ where
             .map(|cache| *cache);
         let stages = self.mod_terrain.as_ref().map(|terrain| terrain.stages);
         if stages.is_none_or(|stages| stages.surface) && !self.identity_end_surface(pos) {
+            worker
+                .uniform_biomes
+                .reset(pos, self.settings.level_min_y, self.settings.level_height);
             build_surface_shared(
                 &mut chunk,
                 &self.rule,
@@ -1114,11 +1307,7 @@ where
                         pipeline: self,
                         temperatures: &mut worker.temperatures,
                         biome: Biomes::Region(&biomes),
-                        uniform_biomes: Some(UniformSurfaceBiomes::new(
-                            pos,
-                            self.settings.level_min_y,
-                            self.settings.level_height,
-                        )),
+                        uniform_biomes: Some(&mut worker.uniform_biomes),
                         possible: Some(possible),
                     },
                     preliminary_surface: self.preliminary.clone(),
@@ -1147,7 +1336,7 @@ where
                 &self.climate,
                 self.router.get(RouterField::Erosion).as_ref(),
             );
-            let mut biome_context = SamplerContext::default();
+            let mut biome_context = SamplerContext::cached();
             apply_carving_mask_shared(
                 &mut chunk,
                 &mask,
@@ -1225,10 +1414,10 @@ where
     }
     /// ChunkGenerator.getBaseHeight: the first free Y above the noise column
     /// (with aquifers, without terrain adaptation) for a heightmap type.
-    fn base_height(&self, x: i32, z: i32, kind: HeightmapType) -> i32 {
+    fn base_height(&self, worker: &mut WorkerState, x: i32, z: i32, kind: HeightmapType) -> i32 {
         let (min, _) = self.column_range();
         let mut found = min;
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(worker, x, z, &mut |y, state| {
             if kind.is_opaque(self.data.states.get(state)) {
                 found = y + 1;
                 return true;
@@ -1239,14 +1428,21 @@ where
     }
     /// ChunkGenerator.getBaseColumn: opacity of each noise-column state for
     /// a heightmap type, indexed from the minimum Y.
-    fn base_column(&self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.base_columns_by(x, z, 1, &|_| kind)
+    fn base_column(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        kind: HeightmapType,
+    ) -> Vec<bool> {
+        self.base_columns_by(worker, x, z, 1, &|_| kind)
             .pop()
             .unwrap_or_default()
     }
     /// One noise-column pass, as opacities for each heightmap kind.
     fn base_columns_by(
         &self,
+        worker: &mut WorkerState,
         x: i32,
         z: i32,
         count: usize,
@@ -1254,7 +1450,7 @@ where
     ) -> Vec<Vec<bool>> {
         let (min, height) = self.column_range();
         let mut columns = vec![vec![false; height as usize]; count];
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(worker, x, z, &mut |y, state| {
             let state = self.data.states.get(state);
             for (index, column) in columns.iter_mut().enumerate() {
                 column[(y - min) as usize] = kind(index).is_opaque(state);
@@ -1268,6 +1464,7 @@ where
     /// are never cobwebs or bamboo saplings).
     fn noise_blocks_into(
         &self,
+        worker: &mut WorkerState,
         x: i32,
         z: i32,
         column: &mut dyn super::structure::start::NoiseColumnTarget,
@@ -1276,7 +1473,7 @@ where
         let (min, height) = self.column_range();
         column.resize(min, height as usize);
         let registry = self.data.registry;
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(worker, x, z, &mut |y, state| {
             let props = self.data.states.get(state);
             let block = if props.is_air() {
                 NoiseBlock::Air
@@ -1293,7 +1490,13 @@ where
         });
     }
     /// iterateNoiseColumn from the top down until `visit` returns true.
-    fn noise_column(&self, x: i32, z: i32, visit: &mut dyn FnMut(i32, BlockStateId) -> bool) {
+    fn noise_column(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        visit: &mut dyn FnMut(i32, BlockStateId) -> bool,
+    ) {
         // `FlatLevelSource.getBaseHeight` and `getBaseColumn`: the layers, and air above them.
         if let Some(flat) = &self.flat {
             let air = self.data.registry.default_state("minecraft:air");
@@ -1317,7 +1520,8 @@ where
         let Ok(volume) = DensityVolume::new([1, height, 1], [x, min, z], [1; 3]) else {
             return;
         };
-        let mut context = SamplerContext::cached();
+        let context = &mut worker.column_context;
+        context.reset();
         let mut aquifer: Box<dyn TerrainAquifer> = match &self.aquifer {
             Some(samplers) => match RegistryAquiferBlockStates::new(self.data.registry)
                 .ok()
@@ -1330,41 +1534,42 @@ where
                             .fork_positional(),
                         blocks,
                         volume,
-                        &mut context,
+                        context,
                     )
                     .ok()
                 }) {
                 Some(aquifer) => Box::new(aquifer),
-                None => return,
+                None => {
+                    context.reset();
+                    return;
+                }
             },
             None => Box::new(DisabledAquifer::new(
                 self.picker,
                 self.data.registry.default_state("minecraft:air").unwrap(),
             )),
         };
-        let mut density = vec![0.; height as usize];
+        let density = &mut worker.column_density;
+        density.clear();
+        density.resize(height as usize, 0.0);
         if self
             .router
             .get(RouterField::FinalDensity)
-            .sample_volume(&mut context, &mut density, volume)
-            .is_err()
+            .sample_volume(context, density, volume)
+            .is_ok()
         {
-            return;
-        }
-        for y in (0..height).rev() {
-            let state = aquifer
-                .compute_substance(
-                    &mut context,
-                    [x, min + y, z],
-                    f64::from(density[y as usize]),
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(self.settings.default_block);
-            if visit(min + y, state) {
-                return;
+            for y in (0..height).rev() {
+                let state = aquifer
+                    .compute_substance(context, [x, min + y, z], f64::from(density[y as usize]))
+                    .ok()
+                    .flatten()
+                    .unwrap_or(self.settings.default_block);
+                if visit(min + y, state) {
+                    break;
+                }
             }
         }
+        context.reset();
     }
 }
 /// Biome and height queries for structure generation on one worker.
@@ -1388,7 +1593,7 @@ where
         if let Some(h) = self.worker.heights.get(&(x, z, kind as u8)) {
             return *h;
         }
-        let h = self.pipeline.base_height(x, z, kind);
+        let h = self.pipeline.base_height(self.worker, x, z, kind);
         if self.worker.heights.len() > 65536 {
             self.worker.heights.clear();
         }
@@ -1412,18 +1617,28 @@ where
             pipeline.router.get(RouterField::Erosion).as_ref(),
         );
         let context = &mut self.worker.biome_context;
+        let climate_buffers = &mut self.worker.climate_buffers;
         let volume = resolver
-            .prepare_volume(context, [qx, qmin, qz], [1, qmax - qmin + 1, 1])
+            .prepare_volume_with_buffers(
+                context,
+                [qx, qmin, qz],
+                [1, qmax - qmin + 1, 1],
+                climate_buffers,
+            )
             .ok()
             .flatten();
-        (qmin..=qmax).any(|qy| {
+        let found = (qmin..=qmax).any(|qy| {
             let id = resolver
                 .sample_prepared(context, volume.as_ref(), [qx, qy, qz])
                 .ok()
                 .and_then(|name| pipeline.data.biome_id(name))
                 .unwrap_or(BiomeId(0));
             self.valid.contains(&id)
-        })
+        });
+        if let Some(volume) = volume {
+            volume.recycle(climate_buffers);
+        }
+        found
     }
 }
 impl<R: RandomSource + 'static> super::structure::start::StartContext for StructureQueries<'_, R>
@@ -1457,7 +1672,7 @@ where
         }
     }
     fn base_column(&mut self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.pipeline.base_column(x, z, kind)
+        self.pipeline.base_column(self.worker, x, z, kind)
     }
     fn base_columns_by(
         &mut self,
@@ -1466,7 +1681,8 @@ where
         count: usize,
         kind: &dyn Fn(usize) -> HeightmapType,
     ) -> Vec<Vec<bool>> {
-        self.pipeline.base_columns_by(x, z, count, kind)
+        self.pipeline
+            .base_columns_by(self.worker, x, z, count, kind)
     }
     fn noise_column_into(
         &mut self,
@@ -1474,7 +1690,7 @@ where
         z: i32,
         column: &mut dyn super::structure::start::NoiseColumnTarget,
     ) {
-        self.pipeline.noise_blocks_into(x, z, column)
+        self.pipeline.noise_blocks_into(self.worker, x, z, column)
     }
     fn cold_enough_to_snow(&mut self, biome: BiomeId, pos: [i32; 3]) -> bool {
         let sea = self.pipeline.settings.sea_level;
@@ -1503,8 +1719,7 @@ where
         quarts
             .iter()
             .map(|&quart| {
-                resolver
-                    .sample(&mut self.worker.carver_context, quart)
+                sample_point_biome(&mut resolver, &mut self.worker.carver_context, quart)
                     .ok()
                     .and_then(|name| self.pipeline.data.biome_id(name))
                     .unwrap_or(BiomeId(0))
@@ -1524,7 +1739,7 @@ where
 }
 
 enum Biomes<'a, 'b> {
-    Region(&'a BiomeRegion<BiomeId>),
+    Region(&'a SurfaceBiomeRegion),
     Resolver(
         &'a mut super::biome_source::BiomeSourceResolver<'b>,
         &'a mut SamplerContext,
@@ -1540,7 +1755,7 @@ enum Biomes<'a, 'b> {
 }
 /// Resolved biomes by quart (`Biomes::Memo`).
 struct BiomeMemo {
-    biomes: HashMap<[i32; 3], BiomeId>,
+    biomes: FxHashMap<[i32; 3], BiomeId>,
     /// Quarts per side of the columns sharing one biome, the first one asked
     /// (its surface's); 0 for one per quart. Far cells wider than a quart
     /// don't show a biome change a few blocks down, and climate changes over
@@ -1592,6 +1807,30 @@ struct MixedCell {
     jitter: [[f64; 3]; 8],
     biomes: [BiomeId; 8],
 }
+trait BiomeGrid {
+    fn noise_biome_opt(&self, quart: [i32; 3]) -> Option<BiomeId>;
+    fn zoom(&self) -> BiomeZoom;
+}
+impl BiomeGrid for SurfaceBiomeRegion {
+    #[inline]
+    fn noise_biome_opt(&self, quart: [i32; 3]) -> Option<BiomeId> {
+        self.noise_biome(quart)
+    }
+    #[inline]
+    fn zoom(&self) -> BiomeZoom {
+        SurfaceBiomeRegion::zoom(self)
+    }
+}
+#[cfg(test)]
+impl BiomeGrid for super::biome_chunk::BiomeRegion<BiomeId> {
+    fn noise_biome_opt(&self, quart: [i32; 3]) -> Option<BiomeId> {
+        self.noise_biome(quart).ok().copied()
+    }
+    fn zoom(&self) -> BiomeZoom {
+        super::biome_chunk::BiomeRegion::zoom(self)
+    }
+}
+
 struct UniformSurfaceBiomes {
     origin: [i32; 3],
     height: i32,
@@ -1601,22 +1840,37 @@ struct UniformSurfaceBiomes {
     last: ([i32; 3], SurfaceCell),
 }
 impl UniformSurfaceBiomes {
-    fn new(pos: ChunkPos, min_y: i32, height: i32) -> Self {
-        let height = (height >> 2) + 1;
+    fn empty() -> Self {
         Self {
-            origin: [
-                pos.x.wrapping_shl(4).wrapping_sub(2) >> 2,
-                min_y.wrapping_sub(2) >> 2,
-                pos.z.wrapping_shl(4).wrapping_sub(2) >> 2,
-            ],
-            height,
-            cells: vec![SurfaceCell::Unknown; 25 * height as usize],
+            origin: [0; 3],
+            height: 0,
+            cells: Vec::new(),
             mixed: Vec::new(),
             last: ([0; 3], SurfaceCell::Unknown),
         }
     }
+    #[cfg(test)]
+    fn new(pos: ChunkPos, min_y: i32, height: i32) -> Self {
+        let mut cache = Self::empty();
+        cache.reset(pos, min_y, height);
+        cache
+    }
+    fn reset(&mut self, pos: ChunkPos, min_y: i32, height: i32) {
+        let height = (height >> 2) + 1;
+        self.origin = [
+            pos.x.wrapping_shl(4).wrapping_sub(2) >> 2,
+            min_y.wrapping_sub(2) >> 2,
+            pos.z.wrapping_shl(4).wrapping_sub(2) >> 2,
+        ];
+        self.height = height;
+        let needed = 25 * height as usize;
+        self.cells.clear();
+        self.cells.resize(needed, SurfaceCell::Unknown);
+        self.mixed.clear();
+        self.last = ([0; 3], SurfaceCell::Unknown);
+    }
     #[inline]
-    fn get(&mut self, region: &BiomeRegion<BiomeId>, p: BlockPos) -> Option<BiomeId> {
+    fn get(&mut self, region: &impl BiomeGrid, p: BlockPos) -> Option<BiomeId> {
         let base = [p.x, p.y, p.z].map(|v| v.wrapping_sub(2) >> 2);
         let cell = if self.last.0 == base && self.last.1 != SurfaceCell::Unknown {
             self.last.1
@@ -1634,7 +1888,7 @@ impl UniformSurfaceBiomes {
             SurfaceCell::Unknown | SurfaceCell::Lookup => None,
         }
     }
-    fn cell(&mut self, region: &BiomeRegion<BiomeId>, base: [i32; 3]) -> SurfaceCell {
+    fn cell(&mut self, region: &impl BiomeGrid, base: [i32; 3]) -> SurfaceCell {
         let d: [i32; 3] = std::array::from_fn(|i| base[i].wrapping_sub(self.origin[i]));
         if !(0..5).contains(&d[0]) || !(0..self.height).contains(&d[1]) || !(0..5).contains(&d[2]) {
             return SurfaceCell::Lookup;
@@ -1647,11 +1901,11 @@ impl UniformSurfaceBiomes {
         let mut biomes = [BiomeId(0); 8];
         for (corner, biome) in biomes.iter_mut().enumerate() {
             let offsets = [(corner >> 2) & 1, (corner >> 1) & 1, corner & 1];
-            match region.noise_biome(std::array::from_fn(|i| {
+            match region.noise_biome_opt(std::array::from_fn(|i| {
                 base[i].wrapping_add(offsets[i] as i32)
             })) {
-                Ok(id) => *biome = *id,
-                Err(_) => {
+                Some(id) => *biome = id,
+                None => {
                     *slot = SurfaceCell::Lookup;
                     return SurfaceCell::Lookup;
                 }
@@ -1677,7 +1931,7 @@ struct SurfaceQueries<'a, 'b, R: RandomSource> {
     temperatures: &'a mut [BiomeTemperature],
     biome: Biomes<'a, 'b>,
     possible: Option<BTreeSet<String>>,
-    uniform_biomes: Option<UniformSurfaceBiomes>,
+    uniform_biomes: Option<&'a mut UniformSurfaceBiomes>,
 }
 impl<R: RandomSource> SurfaceQueries<'_, '_, R> {
     fn temperature(&mut self, name: &str) -> Result<&mut BiomeTemperature, MaterialRuleError> {
@@ -1726,17 +1980,15 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
             Biomes::Region(region) => match self
                 .uniform_biomes
                 .as_mut()
-                .and_then(|cache| cache.get(region, p))
+                .and_then(|cache| cache.get(*region, p))
             {
                 Some(id) => id,
-                None => *region
-                    .biome(p)
-                    .map_err(|_| MaterialRuleError::MissingBiome)?,
+                None => region.biome(p).ok_or(MaterialRuleError::MissingBiome)?,
             },
             Biomes::Resolver(resolver, context) => {
-                let name = resolver
-                    .sample(context, self.pipeline.zoom.quart_at_block(p))
-                    .map_err(|_| MaterialRuleError::BiomeQueryFailed)?;
+                let name =
+                    sample_point_biome(resolver, context, self.pipeline.zoom.quart_at_block(p))
+                        .map_err(|_| MaterialRuleError::BiomeQueryFailed)?;
                 data.biome_id(name).ok_or(MaterialRuleError::MissingBiome)?
             }
             Biomes::Memo(resolver, context, memo) => memo_biome(
@@ -1795,15 +2047,21 @@ pub(super) struct WorkerState {
     terrain_context: SamplerContext,
     biome_context: SamplerContext,
     carver_context: SamplerContext,
+    column_context: SamplerContext,
+    column_density: Vec<f32>,
+    /// Reusable per-chunk uniform surface biome cache.
+    uniform_biomes: UniformSurfaceBiomes,
+    /// Reusable 6-field climate volume buffers.
+    climate_buffers: [Vec<f32>; 6],
     /// Seed/dimension-bound lookups avoid the shared mutex for overlapping
     /// carver neighborhoods. Bounded independently of the shared cache.
-    carver_biomes: HashMap<(i32, i32), BiomeId>,
+    carver_biomes: FxHashMap<(i32, i32), BiomeId>,
     /// Noise biomes asked one at a time by structure placement checks
     /// (`StartContext::noise_biome`): several structures test the same
     /// quarts, column checks whole columns, and each is a full climate sample.
-    structure_biomes: HashMap<[i32; 3], BiomeId>,
+    structure_biomes: FxHashMap<[i32; 3], BiomeId>,
     timings: StageTimings,
-    heights: HashMap<(i32, i32, u8), i32>,
+    heights: FxHashMap<(i32, i32, u8), i32>,
     /// Decorate with structure pieces only (for structure parity checks).
     pub(super) structures_only: bool,
     pub(super) structure_mobs: Option<Arc<dyn StructureMobs>>,
@@ -1983,25 +2241,20 @@ where
         &self.data
     }
     fn release_caches(&self) {
-        // Taken out under the lock, dropped after it.
-        let biomes = std::mem::take(&mut *self.biome_cache.lock().unwrap());
-        let carvers = std::mem::take(&mut *self.carver_cache.lock().unwrap());
-        drop((biomes, carvers));
+        self.biome_cache.clear();
+        self.lattice_cache.clear();
+        self.carver_cache.clear();
     }
     fn cache_census(&self) -> CacheCensus {
-        let biomes = self.biome_cache.lock().unwrap();
+        let (biome_chunks, biome_bytes) = self.biome_cache.census();
         let (start_chunks, start_lists) = self
             .structures
             .as_ref()
             .map_or((0, 0), |s| s.start_census());
         CacheCensus {
-            biome_chunks: biomes.len(),
-            biome_bytes: biomes
-                .values()
-                .map(|b| std::mem::size_of::<BiomeChunk<BiomeId>>() + b.heap_bytes())
-                .sum::<usize>()
-                + biomes.capacity() * std::mem::size_of::<((i32, i32), usize)>(),
-            carver_entries: self.carver_cache.lock().unwrap().len(),
+            biome_chunks,
+            biome_bytes,
+            carver_entries: self.carver_cache.len(),
             start_chunks,
             start_lists,
         }
@@ -2207,7 +2460,8 @@ where
             let z = search.origin[2].wrapping_add(sz.wrapping_mul(search.horizontal));
             for &y in &ys {
                 let quart = [x >> 2, y >> 2, z >> 2];
-                let Ok(name) = resolver.sample(&mut worker.carver_context, quart) else {
+                let Ok(name) = sample_point_biome(&mut resolver, &mut worker.carver_context, quart)
+                else {
                     continue;
                 };
                 if candidates.contains(name) {
@@ -2262,7 +2516,7 @@ where
             }
             false
         };
-        self.noise_column(x, z, &mut visit);
+        self.noise_column(worker, x, z, &mut visit);
         let (height, state) = top?;
         // A superflat surface is its top layer, with its one biome.
         if self.flat.is_some() {
@@ -2285,10 +2539,13 @@ where
             self.router.get(RouterField::Erosion).as_ref(),
         );
         // Use a fresh bounded context: far samples must not grow the chunk/structure caches.
-        let mut biome_context = SamplerContext::default();
-        let biome = resolver
-            .sample(&mut biome_context, self.zoom.quart_at_block(position))
-            .ok()?;
+        let mut biome_context = SamplerContext::cached();
+        let biome = sample_point_biome(
+            &mut resolver,
+            &mut biome_context,
+            self.zoom.quart_at_block(position),
+        )
+        .ok()?;
         let biome = self.data.biome_id(biome)?;
         let volume = DensityVolume::new([1; 3], [x, y, z], [1; 3]).ok()?;
         let queries = SurfaceQueries {
@@ -2476,7 +2733,7 @@ where
         );
         let mut biome_context = SamplerContext::cached();
         let mut biome_memo = BiomeMemo {
-            biomes: HashMap::new(),
+            biomes: FxHashMap::default(),
             // Columns `width` blocks apart are width / 4 quarts apart; cells
             // stop at 64 blocks (wider ones moved a third of level 6's biomes).
             cell: if approximate && width >= 4 {
@@ -2647,8 +2904,7 @@ where
         quarts
             .iter()
             .map(|&quart| {
-                resolver
-                    .sample(&mut worker.carver_context, quart)
+                sample_point_biome(&mut resolver, &mut worker.carver_context, quart)
                     .ok()
                     .map(str::to_owned)
             })
@@ -2957,13 +3213,17 @@ impl OverworldGenerator {
                     .collect(),
                 terrain_context: SamplerContext::cached(),
                 biome_context: SamplerContext::cached(),
-                carver_context: SamplerContext::default(),
-                carver_biomes: HashMap::new(),
-                structure_biomes: HashMap::new(),
+                carver_context: SamplerContext::cached(),
+                column_context: SamplerContext::cached(),
+                column_density: Vec::new(),
+                uniform_biomes: UniformSurfaceBiomes::empty(),
+                climate_buffers: Default::default(),
+                carver_biomes: FxHashMap::default(),
+                structure_biomes: FxHashMap::default(),
                 timings: StageTimings::default(),
                 structures_only: false,
                 structure_mobs: None,
-                heights: HashMap::new(),
+                heights: FxHashMap::default(),
                 surface_rule: None,
             },
         }
@@ -3139,12 +3399,17 @@ impl GeneratorWorker {
             &mut state.terrain_context,
             &mut state.biome_context,
             &mut state.carver_context,
+            &mut state.column_context,
         ] {
             context.clear_scratch();
         }
-        state.carver_biomes = HashMap::new();
-        state.structure_biomes = HashMap::new();
-        state.heights = HashMap::new();
+        state.column_density = Vec::new();
+        state.uniform_biomes = UniformSurfaceBiomes::empty();
+        state.climate_buffers = Default::default();
+        state.carver_biomes = FxHashMap::default();
+        state.structure_biomes = FxHashMap::default();
+        state.heights = FxHashMap::default();
+        state.surface_rule = None;
     }
 }
 
@@ -3154,8 +3419,10 @@ mod mod_density_tests;
 mod region_tests;
 #[cfg(test)]
 mod tests {
+    use super::super::biome_chunk::BiomeRegion;
     use super::super::biome_chunks::CACHE_LIMIT;
     use super::*;
+    use std::collections::HashMap;
     #[test]
     fn out_from_origin_preserves_order_and_handles_extreme_positive_steps() {
         assert_eq!(out_from_origin(4, 0, 8, 2), [4, 6, 2, 8, 0]);
@@ -3491,6 +3758,103 @@ mod tests {
             }
         }
         assert!(successes > 0 && failures > 0);
+    }
+
+    /// `SurfaceBiomeRegion::new` rejects neighbor chunks whose `(min_y, height)`
+    /// differs from the center chunk (as old-world `old_biomes` can produce) or
+    /// whose coordinates do not match their 3x3 slot, matching `BiomeRegion::new`.
+    /// For accepted neighborhoods, `SurfaceBiomeRegion` and `UniformSurfaceBiomes`
+    /// agree with `BiomeRegion` at every quart and block.
+    #[test]
+    fn surface_biome_region_rejects_mismatched_neighbor_ranges_and_matches_biome_region() {
+        use std::convert::Infallible;
+
+        let center = ChunkPos::new(-3, 5);
+        let zoom = BiomeZoom::new(obfuscate_seed(42));
+        let make_grid = |override_slot: Option<(usize, ChunkPos, i32, i32)>| {
+            let mut slots: [Option<Arc<BiomeChunk<BiomeId>>>; 9] = Default::default();
+            for (i, slot) in slots.iter_mut().enumerate() {
+                let (pos, min_y, height) = match override_slot {
+                    Some((target, p, min_y, height)) if target == i => (p, min_y, height),
+                    _ => (
+                        ChunkPos::new(center.x + (i % 3) as i32 - 1, center.z + (i / 3) as i32 - 1),
+                        -64,
+                        128,
+                    ),
+                };
+                let mut chunk = BiomeChunk::new(pos, min_y, height, BiomeId(0)).unwrap();
+                chunk
+                    .fill(min_y, min_y + height - 1, |[qx, qy, qz]| {
+                        Ok::<_, Infallible>(BiomeId(
+                            (qx.wrapping_mul(3) + qy.wrapping_mul(7) + qz.wrapping_mul(5))
+                                .rem_euclid(11) as u32,
+                        ))
+                    })
+                    .unwrap();
+                *slot = Some(Arc::new(chunk));
+            }
+            slots.map(Option::unwrap)
+        };
+
+        // Neighbor with different min_y (e.g. pre-1.18 old chunk starting at y = 0).
+        let diff_min = make_grid(Some((0, ChunkPos::new(center.x - 1, center.z - 1), 0, 128)));
+        assert_eq!(
+            SurfaceBiomeRegion::new(center, diff_min, zoom).err(),
+            Some(BiomeRegionError::InvalidChunks)
+        );
+
+        // Neighbor with different height (same min_y, taller or shorter build height).
+        let diff_height = make_grid(Some((5, ChunkPos::new(center.x + 1, center.z), -64, 64)));
+        assert_eq!(
+            SurfaceBiomeRegion::new(center, diff_height, zoom).err(),
+            Some(BiomeRegionError::InvalidChunks)
+        );
+
+        // Neighbor with both min_y and height differing (0..256 next to -64..64).
+        let old_range = make_grid(Some((8, ChunkPos::new(center.x + 1, center.z + 1), 0, 256)));
+        assert_eq!(
+            SurfaceBiomeRegion::new(center, old_range, zoom).err(),
+            Some(BiomeRegionError::InvalidChunks)
+        );
+
+        // Neighbor placed in the wrong slot (duplicate center position).
+        let misplaced = make_grid(Some((1, center, -64, 128)));
+        assert_eq!(
+            SurfaceBiomeRegion::new(center, misplaced, zoom).err(),
+            Some(BiomeRegionError::InvalidChunks)
+        );
+
+        // Matching 3x3 neighborhood agrees with BiomeRegion and UniformSurfaceBiomes
+        // across every quart (including neighbor chunks and clamped Y) and every block.
+        let valid = make_grid(None);
+        let reference = BiomeRegion::new(
+            valid.iter().map(|chunk| (**chunk).clone()).collect(),
+            obfuscate_seed(42),
+        )
+        .unwrap();
+        let region = SurfaceBiomeRegion::new(center, valid, zoom).unwrap();
+        let mut cache = UniformSurfaceBiomes::new(center, -64, 128);
+        for qx in (center.x - 1) * 4..(center.x + 2) * 4 {
+            for qz in (center.z - 1) * 4..(center.z + 2) * 4 {
+                for qy in -20..20 {
+                    assert_eq!(
+                        region.noise_biome([qx, qy, qz]),
+                        reference.noise_biome([qx, qy, qz]).ok().copied()
+                    );
+                }
+            }
+        }
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in (-70..70).rev() {
+                    let p = BlockPos::new(center.x * 16 + x, y, center.z * 16 + z);
+                    let expected = *reference.biome(p).unwrap();
+                    assert_eq!(region.biome(p), Some(expected));
+                    let cached = cache.get(&region, p).or_else(|| region.biome(p));
+                    assert_eq!(cached, Some(expected));
+                }
+            }
+        }
     }
 
     /// Reduced far detail paints only the top two blocks of a wide column
@@ -4179,18 +4543,26 @@ mod tests {
                 assert!(Arc::ptr_eq(first, other));
             }
         }
-        // Two generations of other chunks push this one out of the cache.
+        // Two generations of other chunks push this one out of its cache shard.
         {
-            let mut cache = pipeline.biome_cache.lock().unwrap();
-            for x in 0..CACHE_LIMIT as i32 {
-                cache.insert((x, 10000), biomes.clone());
+            let target_shard = shard_of((pos.x, pos.z), CACHE_SHARDS);
+            let per_shard = (CACHE_LIMIT / CACHE_SHARDS).max(2);
+            let mut inserted = 0usize;
+            for x in 0.. {
+                if shard_of((x, 10000), CACHE_SHARDS) == target_shard {
+                    pipeline.biome_cache.insert((x, 10000), biomes.clone());
+                    inserted += 1;
+                    if inserted >= per_shard {
+                        break;
+                    }
+                }
             }
-            assert!(cache.len() <= CACHE_LIMIT);
+            assert!(pipeline.biome_cache.len() <= CACHE_LIMIT);
         }
         let mut worker = generator.worker();
         let rebuilt = pipeline.biome_chunk(&mut worker.state, pos).unwrap();
         assert!(!Arc::ptr_eq(biomes, &rebuilt));
-        assert!(pipeline.biome_cache.lock().unwrap().len() <= CACHE_LIMIT);
+        assert!(pipeline.biome_cache.len() <= CACHE_LIMIT);
         for section in 0..24 {
             assert_eq!(biomes.section(section), rebuilt.section(section));
         }
