@@ -1372,6 +1372,301 @@ impl SolidPipeline {
     }
 }
 
+/// Pins a clip-space projection matrix to reversed-Z `z = 0.0` (the cleared
+/// far plane) while keeping `x`, `y` and `w` bit-identical so sky geometry
+/// drawn after solid terrain passes `CompareFunction::Equal` only on pixels
+/// untouched by opaque terrain.
+fn zero_z_row(m: Mat4) -> [[f32; 4]; 4] {
+    let mut cols = m.to_cols_array_2d();
+    for col in &mut cols {
+        col[2] = 0.0;
+    }
+    cols
+}
+
+/// Depth-equal (`z == 0.0` in reversed-Z) celestial pipelines and far-plane-pinned
+/// globals for drawing sun, moon and End sky after solid terrain.
+struct CelestialAfterSolid {
+    added: wgpu::RenderPipeline,
+    sun: Option<[wgpu::RenderPipeline; 2]>,
+    globals: wgpu::Buffer,
+    group: wgpu::BindGroup,
+}
+
+impl CelestialAfterSolid {
+    fn new(
+        kept: &reuse::On<'_>,
+        (layout, shader, vertex): (
+            &wgpu::PipelineLayout,
+            &wgpu::ShaderModule,
+            &[Option<wgpu::VertexBufferLayout<'_>>],
+        ),
+        (format, linear): (wgpu::TextureFormat, bool),
+        globals: wgpu::Buffer,
+        group: wgpu::BindGroup,
+    ) -> Self {
+        let pipeline = |label, entry, blend, write_mask| {
+            kept.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_entity"),
+                    compilation_options: Default::default(),
+                    buffers: vertex,
+                },
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Equal),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &linear_blend::frame_constants(format, linear),
+                        ..Default::default()
+                    },
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let component = |src_factor, dst_factor, operation| wgpu::BlendComponent {
+            src_factor,
+            dst_factor,
+            operation,
+        };
+        use wgpu::{BlendFactor as F, BlendOperation as Op};
+        let added = pipeline(
+            "Celestial bodies (after solid)",
+            "fs_sky_celestial",
+            wgpu::BlendState {
+                color: component(F::One, F::One, Op::Add),
+                alpha: component(F::Zero, F::OneMinusSrcAlpha, Op::Add),
+            },
+            wgpu::ColorWrites::ALL,
+        );
+        let sun = (format == LINEAR_FRAME).then(|| {
+            let affine = component(F::One, F::SrcAlpha, Op::Add);
+            let min = component(F::One, F::One, Op::Min);
+            [
+                pipeline(
+                    "The sun onto the sky (after solid)",
+                    "fs_sky_sun",
+                    wgpu::BlendState {
+                        color: affine,
+                        alpha: affine,
+                    },
+                    wgpu::ColorWrites::COLOR,
+                ),
+                pipeline(
+                    "The sun's clip (after solid)",
+                    "fs_sky_sun_clip",
+                    wgpu::BlendState {
+                        color: min,
+                        alpha: min,
+                    },
+                    wgpu::ColorWrites::COLOR,
+                ),
+            ]
+        });
+        Self {
+            added,
+            sun,
+            globals,
+            group,
+        }
+    }
+
+    fn draw_bodies(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lifted: bool,
+        mut range: std::ops::Range<u32>,
+    ) {
+        if let Some(sun) = self
+            .sun
+            .as_ref()
+            .filter(|_| lifted && range.start == 0 && range.end >= 6)
+        {
+            for pipeline in sun {
+                pass.set_pipeline(pipeline);
+                pass.draw_indexed(0..6, 0, 0..1);
+            }
+            pass.set_pipeline(&self.added);
+            range.start = 6;
+        }
+        if !range.is_empty() {
+            pass.draw_indexed(range, 0, 0..1);
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct StarsUniform {
+    clip_from_sky: [[f32; 4]; 4],
+    color: [f32; 4],
+    hdr_settings: [f32; 4],
+    hdr_light: [f32; 4],
+}
+
+/// Depth-equal (`z == 0.0` in reversed-Z) star field drawn after solid terrain.
+struct StarsAfterSolid {
+    pipeline: wgpu::RenderPipeline,
+    group: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+    vertices: wgpu::Buffer,
+    count: u32,
+}
+
+impl StarsAfterSolid {
+    fn new(
+        device: &wgpu::Device,
+        kept: &reuse::On<'_>,
+        (format, linear): (wgpu::TextureFormat, bool),
+    ) -> Self {
+        let triangles = stars::star_triangles();
+        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Stars vertex buffer (after solid)"),
+            contents: bytemuck::cast_slice(&triangles),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Stars rotation and brightness (after solid)"),
+            size: std::mem::size_of::<StarsUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let layout = kept.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Stars bindings (after solid)"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Stars resources (after solid)"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        let shader = kept.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Stars shader (after solid)"),
+            source: wgpu::ShaderSource::Wgsl(
+                (wgsl_prefix::HDR_LIGHT.to_owned() + include_str!("gfx/stars.wgsl")).into(),
+            ),
+        });
+        let pipeline_layout = kept.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Stars layout (after solid)"),
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
+        });
+        let attributes = wgpu::vertex_attr_array![0 => Float32x3];
+        let pipeline = kept.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Stars (after solid)"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_stars"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &attributes,
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Equal),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_stars"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &linear_blend::frame_constants(format, linear),
+                    ..Default::default()
+                },
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        Self {
+            pipeline,
+            group,
+            uniform,
+            vertices,
+            count: triangles.len() as u32,
+        }
+    }
+
+    fn prepare(
+        &self,
+        uploads: &mut upload::Uploads,
+        encoder: &mut wgpu::CommandEncoder,
+        clip_from_sky: Mat4,
+        brightness: f32,
+        globals: &Globals,
+    ) {
+        let b = brightness.clamp(0.0, 1.0);
+        let uniform = StarsUniform {
+            clip_from_sky: zero_z_row(clip_from_sky),
+            color: [b; 4],
+            hdr_settings: globals.hdr_settings,
+            hdr_light: globals.hdr_light,
+        };
+        uploads.buffer(encoder, &self.uniform, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.group, &[]);
+        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        pass.draw(0..self.count, 0..1);
+    }
+}
+
 pub struct Renderer {
     msaa: msaa::Msaa,
     instance: wgpu::Instance,
@@ -1487,9 +1782,14 @@ pub struct Renderer {
     /// geometry over it. The mirror keeps `sky`: its per-pixel fan is cheap at
     /// the reflection's size and needs no second projection.
     sky_base: wgpu::RenderPipeline,
+    /// Depth-tested (`CompareFunction::Equal` at reversed-Z `z = 0.0`) variants
+    /// drawn after solid terrain so occluded sky pixels are skipped by early-Z.
+    sky_base_after_solid: wgpu::RenderPipeline,
     sunrise_pipeline: wgpu::RenderPipeline,
+    sunrise_after_solid: wgpu::RenderPipeline,
     sunrise_buffer: wgpu::Buffer,
     dark_disc: wgpu::RenderPipeline,
+    dark_disc_after_solid: wgpu::RenderPipeline,
     /// Clears the world pass's depth to the far plane so the first-person hand draws in the
     /// same pass (`hand_in_world`), as the hand's own pass would clear it.
     depth_reset: wgpu::RenderPipeline,
@@ -1561,9 +1861,11 @@ pub struct Renderer {
     fluid_pipeline: wgpu::RenderPipeline,
     terrain_model_pipelines: [wgpu::RenderPipeline; 3],
     celestial: celestial::Celestial,
+    celestial_after_solid: CelestialAfterSolid,
     celestial_buffer: wgpu::Buffer,
     end_sky: end_sky::EndSky,
     stars: stars::Stars,
+    stars_after_solid: StarsAfterSolid,
     /// Custom sky layers (`crate::custom_sky`), and the frame's from the game.
     custom_sky: custom_sky::CustomSky,
     custom_sky_draws: Vec<crate::custom_sky::Draw>,
@@ -2851,6 +3153,57 @@ impl Renderer {
             false,
             None,
         );
+        // Depth-equal (`z == 0.0` in reversed-Z) sky pipelines for drawing after
+        // solid terrain: only pixels left untouched at the cleared far plane run
+        // the sky fragment shaders.
+        let sky_depth_equal = |label: &str,
+                               vertex: &str,
+                               fragment: &str,
+                               buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+                               blend: Option<wgpu::BlendState>| {
+            let mut constants = sprite_constants.to_vec();
+            constants.extend(linear_blend::frame_constants(frame_format, linear_light));
+            kept.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vertex),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: tri,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Equal),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fragment),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &constants,
+                        ..Default::default()
+                    },
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: frame_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let sky_base_after_solid =
+            sky_depth_equal("Sky base (after solid)", "vs_sky", "fs_sky_base", &[], None);
         let sunrise_attributes = wgpu::vertex_attr_array![0=>Float32x4, 1=>Float32];
         let sunrise_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: 20,
@@ -2881,6 +3234,13 @@ impl Renderer {
             false,
             Some(sunrise_blend),
         );
+        let sunrise_after_solid = sky_depth_equal(
+            "Sunrise fan (after solid)",
+            "vs_sunrise_depth",
+            "fs_sunrise",
+            &sunrise_buffers,
+            Some(sunrise_blend),
+        );
         let dark_disc = pipeline(
             "Dark disc",
             "vs_sky",
@@ -2890,6 +3250,13 @@ impl Renderer {
             None,
             false,
             false,
+            Some(alpha_blend),
+        );
+        let dark_disc_after_solid = sky_depth_equal(
+            "Dark disc (after solid)",
+            "vs_sky",
+            "fs_dark_disc",
+            &[],
             Some(alpha_blend),
         );
         let depth_reset = kept.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -3015,6 +3382,12 @@ impl Renderer {
         });
         let hand_globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("First-person hand globals"),
+            size: std::mem::size_of::<Globals>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let celestial_after_solid_globals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sky celestial globals"),
             size: std::mem::size_of::<Globals>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -3495,6 +3868,44 @@ impl Renderer {
                 },
             ],
         });
+        let celestial_after_solid_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Sky celestial resources"),
+            layout: &entity_bindings,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: celestial_after_solid_globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&lightmap_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&lightmap_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&glint_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&glint_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&glint_armor_view),
+                },
+            ],
+        });
         let entity_layout = kept.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Entity layout"),
             bind_group_layouts: &[Some(&entity_bindings)],
@@ -3893,6 +4304,13 @@ impl Renderer {
             &entity_shader,
             &entity_vertex,
             (frame_format, linear_light),
+        );
+        let celestial_after_solid = CelestialAfterSolid::new(
+            &kept,
+            (&entity_layout, &entity_shader, &entity_vertex),
+            (frame_format, linear_light),
+            celestial_after_solid_globals,
+            celestial_after_solid_group,
         );
         drop(entity_step);
         // WorldBorderRenderer: misc/forcefield.png as a MipmappedTexture
@@ -4402,6 +4820,7 @@ impl Renderer {
         let uploads = upload::Uploads::new(&device);
         let section_uploads = upload::Uploads::with_chunk(&device, SECTION_UPLOAD_CHUNK);
         let stars = stars::Stars::new(&device, (frame_format, linear_light));
+        let stars_after_solid = StarsAfterSolid::new(&device, &kept, (frame_format, linear_light));
         let custom_sky = custom_sky::CustomSky::new(&device, (frame_format, linear_light));
         let entity_outline = entity_outline::EntityOutline::new(
             &device,
@@ -4494,9 +4913,12 @@ impl Renderer {
             mesh_terrain,
             sky,
             sky_base,
+            sky_base_after_solid,
             sunrise_pipeline,
+            sunrise_after_solid,
             sunrise_buffer,
             dark_disc,
+            dark_disc_after_solid,
             depth_reset,
             lines,
             lines_secondary,
@@ -4545,9 +4967,11 @@ impl Renderer {
             fluid_pipeline,
             terrain_model_pipelines,
             celestial,
+            celestial_after_solid,
             celestial_buffer,
             end_sky: end_sky::EndSky::default(),
             stars,
+            stars_after_solid,
             custom_sky,
             custom_sky_draws: Vec::new(),
             entity_outline,
@@ -9440,15 +9864,6 @@ impl Renderer {
             (outline_base, outlined / 4),
             [self.config.width, self.config.height],
         );
-        if let Some((rotation, brightness)) = frame.stars {
-            self.stars.prepare(
-                &mut self.uploads,
-                &mut encoder,
-                jittered * rotation,
-                brightness,
-                &globals,
-            );
-        }
         self.custom_sky.prepare(
             &mut self.uploads,
             &mut encoder,
@@ -9457,6 +9872,45 @@ impl Renderer {
             &globals,
         );
         let celestial_vertices = frame.celestial.len().min(2048 * 4);
+        let sky_visible = sky_open(frame);
+        // In vanilla frames (no shader pack, custom sky, core/sky, visbuffer,
+        // world primitives, MSAA, or GL depth remapping), draw the sky after solid
+        // terrain at reversed-Z `z = 0.0` with `CompareFunction::Equal` so
+        // early-Z skips shading every sky pixel occluded by opaque terrain.
+        let defer_sky = !frame.title
+            && !msaa_on
+            && sky_visible
+            && (frame.skybox || frame.end_sky)
+            && !self.custom_sky.is_drawing()
+            && !pack_post
+            && self.external.is_none()
+            && self.executor.is_none()
+            && self.visbuf.is_none()
+            && !world_primitives
+            && self.info.backend != wgpu::Backend::Gl
+            && self
+                .core_sky
+                .as_ref()
+                .is_none_or(|c| !c.draws_disc() && !(frame.stars.is_some() && c.draws_stars()));
+        if let Some((rotation, brightness)) = frame.stars {
+            if defer_sky {
+                self.stars_after_solid.prepare(
+                    &mut self.uploads,
+                    &mut encoder,
+                    jittered * rotation,
+                    brightness,
+                    &globals,
+                );
+            } else {
+                self.stars.prepare(
+                    &mut self.uploads,
+                    &mut encoder,
+                    jittered * rotation,
+                    brightness,
+                    &globals,
+                );
+            }
+        }
         if frame.end_sky && !frame.title {
             self.end_sky.prepare(&self.device, frame.end_sky_sprite);
         }
@@ -9466,6 +9920,18 @@ impl Renderer {
                 &self.celestial_buffer,
                 0,
                 bytemuck::cast_slice(&frame.celestial[..celestial_vertices]),
+            );
+        }
+        if defer_sky && (celestial_vertices > 0 || frame.end_sky) {
+            let sky_celestial_globals = Globals {
+                view_proj: zero_z_row(jittered),
+                ..globals
+            };
+            self.uploads.buffer(
+                &mut encoder,
+                &self.celestial_after_solid.globals,
+                0,
+                bytemuck::bytes_of(&sky_celestial_globals),
             );
         }
         let max_quads =
@@ -9855,7 +10321,6 @@ impl Renderer {
             }
         };
         let clear = linear_blend::stored_clear(clear, self.output.frame.linear_light);
-        let sky_visible = sky_open(frame);
         laps.lap("r_world_pass");
         // One of Horizon's own packs: this frame's inputs; in a timed frame its sky draws in a
         // pass of its own, so that it has a time of its own.
@@ -10181,7 +10646,7 @@ impl Renderer {
             );
             pass.set_bind_group(0, &self.group, &[]);
             pack_frame(&mut pass);
-            if frame.title || (sky_visible && (frame.skybox || frame.end_sky)) {
+            if !defer_sky && (frame.title || (sky_visible && (frame.skybox || frame.end_sky))) {
                 pass.stage(self.own_timing.as_mut(), "sky");
                 let native_sky = !frame.title
                     && frame.skybox
@@ -10646,6 +11111,44 @@ impl Renderer {
             } else if surface.is_some() {
                 drop(pass);
                 pass = plain_pass(&mut encoder);
+            }
+            if defer_sky {
+                pass.stage(self.own_timing.as_mut(), "sky");
+                pass.set_bind_group(0, &self.group, &[]);
+                if frame.skybox {
+                    pass.set_pipeline(&self.sky_base_after_solid);
+                    pass.draw(0..3, 0..1);
+                    if frame.sky.sunrise_color[3] > 0.001 {
+                        pass.set_pipeline(&self.sunrise_after_solid);
+                        pass.set_vertex_buffer(0, self.sunrise_buffer.slice(..));
+                        pass.draw(0..sunrise_fan::VERTICES as u32, 0..1);
+                    }
+                }
+                if celestial_vertices > 0 || frame.end_sky {
+                    pass.set_pipeline(&self.celestial_after_solid.added);
+                    pass.set_bind_group(0, &self.celestial_after_solid.group, &[]);
+                    pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    if frame.end_sky {
+                        self.end_sky.draw(&mut pass);
+                    }
+                    if celestial_vertices > 0 {
+                        let lifted = hdr_gain && self.hdr.as_ref().is_some_and(|h| h.lighting);
+                        let quads = &frame.celestial[..celestial_vertices];
+                        let bodies = celestial::bodies(quads, false, false);
+                        pass.set_vertex_buffer(0, self.celestial_buffer.slice(..));
+                        self.celestial_after_solid
+                            .draw_bodies(&mut pass, lifted, bodies);
+                    }
+                    pass.set_bind_group(0, &self.group, &[]);
+                }
+                if frame.stars.is_some() {
+                    self.stars_after_solid.draw(&mut pass);
+                    pass.set_bind_group(0, &self.group, &[]);
+                }
+                if frame.dark_disc {
+                    pass.set_pipeline(&self.dark_disc_after_solid);
+                    pass.draw(0..3, 0..1);
+                }
             }
             // RenderLevelStageEvent.AfterOpaqueBlocks: after solid and cutout terrain, before
             // entities.
@@ -14080,6 +14583,24 @@ mod tests {
             ]]
         );
         assert!(super::outline_vertices(&[], glam::DVec3::ZERO).is_empty());
+    }
+    #[test]
+    fn zero_z_row_pins_clip_depth_to_zero_without_moving_xyw() {
+        let proj = super::world_projection(70.0, 16.0 / 9.0, 768.0)
+            * crate::camera::view_matrix(37.5, -18.0);
+        let pinned = glam::Mat4::from_cols_array_2d(&super::zero_z_row(proj));
+        for p in [
+            glam::Vec4::new(10.0, 100.0, -30.0, 1.0),
+            glam::Vec4::new(-80.0, 25.0, -100.0, 1.0),
+            glam::Vec4::new(100.0, -100.0, 100.0, 1.0),
+        ] {
+            let orig = proj * p;
+            let flat = pinned * p;
+            assert_eq!(flat.x.to_bits(), orig.x.to_bits());
+            assert_eq!(flat.y.to_bits(), orig.y.to_bits());
+            assert_eq!(flat.w.to_bits(), orig.w.to_bits());
+            assert_eq!(flat.z, 0.0);
+        }
     }
 }
 
