@@ -13,7 +13,12 @@ use crate::{
     zip::Zip,
 };
 use ab_glyph::{Font as _, ScaleFont as _};
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 /// `FontDescription.DEFAULT`.
 pub const DEFAULT: &str = "minecraft:default";
@@ -47,6 +52,84 @@ struct HexGlyph {
     left: u32,
     right: u32,
 }
+#[derive(Clone, Copy)]
+struct HexEntry {
+    codepoint: u32,
+    offset: u32,
+    left: u8,
+    right: u8,
+    bytes_per_row: u8,
+}
+/// Compact Unihex table: sorted codepoint index + tightly packed 1/2/3/4-byte rows (~2.6 MB
+/// for full GNU Unifont instead of ~10 MB in a `HashMap<u32, HexGlyph>`).
+struct HexTable {
+    entries: Vec<HexEntry>,
+    rows: Vec<u8>,
+}
+impl HexTable {
+    fn get(&self, codepoint: u32) -> Option<HexGlyph> {
+        let idx = self
+            .entries
+            .binary_search_by_key(&codepoint, |e| e.codepoint)
+            .ok()?;
+        let e = self.entries[idx];
+        let bpr = e.bytes_per_row as usize;
+        let start = e.offset as usize;
+        let mut rows = [0u32; 16];
+        for (r, row) in rows.iter_mut().enumerate() {
+            let mut bytes = [0u8; 4];
+            let src = start + r * bpr;
+            bytes[..bpr].copy_from_slice(&self.rows[src..src + bpr]);
+            *row = u32::from_be_bytes(bytes);
+        }
+        Some(HexGlyph {
+            rows,
+            left: u32::from(e.left),
+            right: u32::from(e.right),
+        })
+    }
+    fn advance(&self, codepoint: u32) -> Option<f32> {
+        let idx = self
+            .entries
+            .binary_search_by_key(&codepoint, |e| e.codepoint)
+            .ok()?;
+        let e = self.entries[idx];
+        let width = u32::from(e.right).saturating_sub(u32::from(e.left)) + 1;
+        Some((width / 2 + 1) as f32)
+    }
+}
+/// Cache key for shared parsed Unihex tables: only the resolved archive path and
+/// `size_overrides` affect glyph pixels/metrics (provider `filter` does not).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UnihexKey {
+    path: Option<String>,
+    overrides: Vec<(u32, u32, u8, u8)>,
+}
+impl UnihexKey {
+    fn of(p: &serde_json::Value) -> Self {
+        let path = p["hex_file"].as_str().map(unihex_resource_path);
+        let overrides = p["size_overrides"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|o| {
+                let bound = |k: &str| {
+                    o[k].as_str()
+                        .and_then(|s| s.chars().next())
+                        .map_or(0, u32::from)
+                };
+                let left = o["left"].as_u64().unwrap_or(0).min(u64::from(u8::MAX)) as u8;
+                let right = o["right"].as_u64().unwrap_or(15).min(u64::from(u8::MAX)) as u8;
+                (bound("from"), bound("to"), left, right)
+            })
+            .collect();
+        Self { path, overrides }
+    }
+}
+struct UnihexLazy {
+    source: ResourceSource,
+    key: UnihexKey,
+}
 /// A provider's `filter` (`FontOption.Filter`): the options it needs.
 #[derive(Clone, Copy, Default)]
 struct Filter {
@@ -65,9 +148,99 @@ impl Filter {
         self.uniform.is_none_or(|v| v == uniform) && self.jp.is_none_or(|v| v == japanese)
     }
 }
-/// A bitmap glyph whose sheet is not in the atlas: the cell to copy.
+/// Target raw byte ceiling and max cell count per off-atlas bitmap strip chunk:
+/// large cells (e.g. 64×64 = 16 KiB) sit in single-cell strips so cold lookups never
+/// decompress an entire row, while smaller cells batch up to 8 cells (<= 8 KiB) for
+/// LZ4 ratio and are reused through [`StripCache`].
+const SHEET_CHUNK_RAW_BYTES: usize = 8 * 1024;
+const SHEET_CHUNK_MAX_CELLS: usize = 8;
+fn next_strip_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+enum StripPixels {
+    Raw(Vec<u8>),
+    Lz4 { len: usize, compressed: Vec<u8> },
+}
+/// One horizontal cell chunk of an off-atlas bitmap font sheet, LZ4-compressed when
+/// worthwhile so custom HUD/font packs do not keep megabytes of raw RGBA sheets in RAM.
+struct SheetStrip {
+    id: u64,
+    stride: u32,
+    cacheable: bool,
+    pixels: StripPixels,
+    #[cfg(test)]
+    decompressions: std::sync::atomic::AtomicUsize,
+}
+impl SheetStrip {
+    fn new(stride: u32, raw: &[u8], cacheable: bool) -> Self {
+        let pixels = if raw.len() > 512 {
+            let mut compressed = lz4_flex::compress_prepend_size(raw);
+            if compressed.len() < raw.len() {
+                compressed.shrink_to_fit();
+                StripPixels::Lz4 {
+                    len: raw.len(),
+                    compressed,
+                }
+            } else {
+                StripPixels::Raw(raw.to_vec())
+            }
+        } else {
+            StripPixels::Raw(raw.to_vec())
+        };
+        Self {
+            id: next_strip_id(),
+            stride,
+            cacheable,
+            pixels,
+            #[cfg(test)]
+            decompressions: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn decompress(&self, len: usize) -> Vec<u8> {
+        match &self.pixels {
+            StripPixels::Raw(raw) => raw.clone(),
+            StripPixels::Lz4 { compressed, .. } => {
+                #[cfg(test)]
+                self.decompressions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                lz4_flex::decompress_size_prepended(compressed)
+                    .ok()
+                    .filter(|p| p.len() == len)
+                    .unwrap_or_else(|| vec![0; len])
+            }
+        }
+    }
+}
+/// Small bounded MRU cache of recently decompressed multi-cell strips (at most 4 × 8 KiB).
+struct StripCache {
+    entries: Vec<(u64, Vec<u8>)>,
+}
+impl StripCache {
+    const MAX_ENTRIES: usize = 4;
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+    fn get_or_decode(&mut self, strip: &SheetStrip, len: usize) -> &[u8] {
+        if let Some(pos) = self.entries.iter().position(|(id, _)| *id == strip.id) {
+            if pos != 0 {
+                self.entries[..=pos].rotate_right(1);
+            }
+            return &self.entries[0].1;
+        }
+        let raw = strip.decompress(len);
+        if self.entries.len() == Self::MAX_ENTRIES {
+            self.entries.pop();
+        }
+        self.entries.insert(0, (strip.id, raw));
+        &self.entries[0].1
+    }
+}
+/// A bitmap glyph whose sheet is not in the atlas: the cell to copy from its chunk strip.
 struct SheetCell {
-    sheet: Arc<(u32, Vec<u8>)>,
+    sheet: Arc<SheetStrip>,
     x: u32,
     y: u32,
     w: u32,
@@ -75,9 +248,8 @@ struct SheetCell {
     glyph: Glyph,
 }
 impl SheetCell {
-    /// The cell's RGBA rows, or `None` where the cell reaches past the sheet.
-    fn pixels(&self) -> Option<Vec<u8>> {
-        let (stride, pixels) = (self.sheet.0 as usize, &self.sheet.1);
+    fn extract_pixels(&self, pixels: &[u8]) -> Option<Vec<u8>> {
+        let stride = self.sheet.stride as usize;
         let (x, w) = (self.x as usize, self.w as usize);
         if x + w > stride {
             return None;
@@ -89,6 +261,32 @@ impl SheetCell {
         }
         Some(rgba)
     }
+    /// The cell's RGBA rows, or `None` where the cell reaches past the strip.
+    #[allow(dead_code)]
+    fn pixels(&self) -> Option<Vec<u8>> {
+        match &self.sheet.pixels {
+            StripPixels::Raw(raw) => self.extract_pixels(raw),
+            StripPixels::Lz4 { len, .. } => {
+                let raw = self.sheet.decompress(*len);
+                self.extract_pixels(&raw)
+            }
+        }
+    }
+    /// Like [`Self::pixels`], reusing recently decompressed multi-cell strips via `strips`.
+    fn pixels_cached(&self, strips: &mut StripCache) -> Option<Vec<u8>> {
+        match &self.sheet.pixels {
+            StripPixels::Raw(raw) => self.extract_pixels(raw),
+            StripPixels::Lz4 { len, .. } => {
+                if self.sheet.cacheable {
+                    let raw = strips.get_or_decode(&self.sheet, *len);
+                    self.extract_pixels(raw)
+                } else {
+                    let raw = self.sheet.decompress(*len);
+                    self.extract_pixels(&raw)
+                }
+            }
+        }
+    }
 }
 enum BitmapGlyph {
     Atlas(Glyph),
@@ -97,7 +295,11 @@ enum BitmapGlyph {
 /// `TrueTypeGlyphProvider`.
 struct TrueType {
     font: ab_glyph::FontVec,
+    /// Kept empty to preserve the internal layout without retaining a per-codepoint map.
+    #[allow(dead_code)]
     ids: HashMap<char, ab_glyph::GlyphId>,
+    /// Sorted skipped codepoints from the provider's `skip` list (usually empty).
+    skip: Vec<char>,
     /// FT_Set_Pixel_Sizes: `size * oversample` pixels to the em.
     scale: ab_glyph::PxScale,
     oversample: f32,
@@ -105,22 +307,76 @@ struct TrueType {
     shift: (f32, f32),
 }
 enum Provider {
-    Space(HashMap<char, f32>),
-    Bitmap(Filter, HashMap<char, BitmapGlyph>),
-    /// The definition, and its glyphs once read.
-    Unihex(Filter, serde_json::Value, Option<HashMap<u32, HexGlyph>>),
+    Space(crate::fast_hash::FxHashMap<char, f32>),
+    Bitmap(Filter, crate::fast_hash::FxHashMap<char, BitmapGlyph>),
+    /// The filter, lazy source/key while unloaded (cleared once read), and the shared
+    /// compact glyph table once read.
+    Unihex(Filter, Option<Box<UnihexLazy>>, Option<Arc<HexTable>>),
     TrueType(Filter, Box<TrueType>),
+}
+/// Direct O(1) cache for ASCII characters (`0..128`) in a [`FontSet`]: eliminates hashing
+/// on every HUD/F3/chat/hotbar glyph lookup and keeps advances packed in 512 bytes (8 cache
+/// lines) for fast width measurement.
+struct AsciiCache {
+    glyphs: [Option<Glyph>; 128],
+    /// Cached `Glyph::advance`; `f32::NAN` marks uncached slots.
+    advances: [f32; 128],
+}
+impl AsciiCache {
+    fn new() -> Self {
+        Self {
+            glyphs: [None; 128],
+            advances: [f32::NAN; 128],
+        }
+    }
+    fn clear(&mut self) {
+        self.glyphs.fill(None);
+        self.advances.fill(f32::NAN);
+    }
 }
 /// One font (`FontSet`): its providers and the glyphs resolved so far.
 struct FontSet {
     providers: Vec<Provider>,
-    /// Every char drawn looks up here, so the hasher is Fx, not SipHash.
+    /// Lazily allocated O(1) ASCII cache so unused font sets pay zero heap bytes.
+    ascii: Option<Box<AsciiCache>>,
+    /// Non-ASCII glyphs resolved so far (Fx hasher, not SipHash).
     glyphs: crate::fast_hash::FxHashMap<char, Glyph>,
     /// `SelectedGlyphs.nonFishy` of the characters whose first glyph has a fishy advance (the
-    /// others use `glyphs`): what obfuscated text draws.
+    /// others use `ascii`/`glyphs`): what obfuscated text draws.
     non_fishy: crate::fast_hash::FxHashMap<char, Glyph>,
     /// `glyphsByWidth` for obfuscated text (built on first use), by `ceil(advance)`.
-    by_width: Option<HashMap<i32, Vec<char>>>,
+    by_width: Option<crate::fast_hash::FxHashMap<i32, Vec<char>>>,
+}
+impl FontSet {
+    #[inline]
+    fn get_glyph(&self, c: char) -> Option<Glyph> {
+        if (c as u32) < 128 {
+            self.ascii.as_deref().and_then(|a| a.glyphs[c as usize])
+        } else {
+            self.glyphs.get(&c).copied()
+        }
+    }
+    #[inline]
+    fn insert_glyph(&mut self, c: char, glyph: Glyph) {
+        if (c as u32) < 128 {
+            let ascii = self
+                .ascii
+                .get_or_insert_with(|| Box::new(AsciiCache::new()));
+            let idx = c as usize;
+            ascii.glyphs[idx] = Some(glyph);
+            ascii.advances[idx] = glyph.advance;
+        } else {
+            self.glyphs.insert(c, glyph);
+        }
+    }
+    fn clear_cache(&mut self) {
+        if let Some(ascii) = &mut self.ascii {
+            ascii.clear();
+        }
+        self.glyphs.clear();
+        self.non_fishy.clear();
+        self.by_width = None;
+    }
 }
 /// The atlas region glyphs are rasterized into, filled in rows.
 struct Region {
@@ -134,20 +390,29 @@ struct Cache {
     /// Every font by id, the default one first (the common lookup).
     sets: Vec<(String, FontSet)>,
     region: Region,
+    /// Shared parsed Unihex tables keyed by archive path and size overrides so multiple
+    /// font sets or filter variants referencing the same archive never parse duplicates.
+    unihex: HashMap<UnihexKey, Arc<HexTable>>,
+    /// Bounded MRU cache of recently decompressed multi-cell off-atlas bitmap strips.
+    strips: StripCache,
     /// `Font.random`: picks obfuscated glyphs.
     random: horizon_core::random::LegacyRandom,
 }
 pub struct Font {
-    /// The atlas rects of every texture, by resource name: a bitmap provider's
-    /// `file` may name any texture, not only one under `textures/font`.
+    /// Kept empty to preserve the internal layout without duplicating the sprite atlas map.
+    #[allow(dead_code)]
     sheets: HashMap<String, Rect>,
     missing: Glyph,
     white: Rect,
+    /// Kept empty to preserve the internal layout without retaining the resource overlay.
+    #[allow(dead_code)]
     source: ResourceSource,
     /// Atlas size and the reserved dynamic region (y, height).
     atlas: (u32, u32),
     region: (u32, u32),
     metrics_only: bool,
+    /// Index of [`DEFAULT`] in `cache.sets`, if present.
+    default_set: Option<usize>,
     cache: RefCell<Cache>,
     /// Set anew for each font and each `reset_cache` (see `epoch`).
     generation: std::cell::Cell<u64>,
@@ -156,11 +421,29 @@ pub struct Font {
     /// "Japanese Glyph Variants": the `jp` filter option.
     pub japanese: bool,
 }
+#[inline]
 fn parse_hex_digit(b: u8) -> Option<u32> {
-    (b as char).to_digit(16)
+    match b {
+        b'0'..=b'9' => Some(u32::from(b - b'0')),
+        b'a'..=b'f' => Some(u32::from(b - b'a' + 10)),
+        b'A'..=b'F' => Some(u32::from(b - b'A' + 10)),
+        _ => None,
+    }
 }
-/// UnihexProvider.readFromStream over one `.hex` file.
-fn parse_hex(text: &[u8], out: &mut HashMap<u32, HexGlyph>) {
+#[inline]
+fn parse_hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    Some(((parse_hex_digit(hi)? << 4) | parse_hex_digit(lo)?) as u8)
+}
+/// Parse one `.hex` file into compact [`HexEntry`] + packed row bytes.
+/// Equal-width duplicates overwrite in place; width-changing duplicates set
+/// `*has_dead_rows = true` so the caller compacts unreachable bytes before sharing.
+fn parse_hex_into(
+    text: &[u8],
+    entries: &mut Vec<HexEntry>,
+    rows_buf: &mut Vec<u8>,
+    by_cp: &mut crate::fast_hash::FxHashMap<u32, usize>,
+    has_dead_rows: &mut bool,
+) {
     for line in text.split(|b| *b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let Some(colon) = line.iter().position(|b| *b == b':') else {
@@ -176,40 +459,103 @@ fn parse_hex(text: &[u8], out: &mut HashMap<u32, HexGlyph>) {
         else {
             continue;
         };
-        let digits_per_row = match data.len() {
-            32 => 2,
-            64 => 4,
-            96 => 6,
-            128 => 8,
+        let bpr = match data.len() {
+            32 => 1usize,
+            64 => 2,
+            96 => 3,
+            128 => 4,
             _ => continue,
         };
-        let bit_width = digits_per_row as u32 * 4;
-        let mut rows = [0u32; 16];
+        let bit_width = (bpr as u32) * 8;
+        let mut row_bytes = [0u8; 64];
         let mut mask = 0u32;
         let mut ok = true;
-        for (r, row) in rows.iter_mut().enumerate() {
-            let chunk = &data[r * digits_per_row..(r + 1) * digits_per_row];
-            match chunk
-                .iter()
-                .try_fold(0u32, |a, b| parse_hex_digit(*b).map(|d| a << 4 | d))
-            {
-                Some(v) => {
-                    *row = v << (32 - bit_width);
-                    mask |= *row;
+        for r in 0..16 {
+            let mut be = [0u8; 4];
+            for j in 0..bpr {
+                let pos = (r * bpr + j) * 2;
+                match parse_hex_byte(data[pos], data[pos + 1]) {
+                    Some(byte) => {
+                        row_bytes[r * bpr + j] = byte;
+                        be[j] = byte;
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
                 }
-                None => ok = false,
             }
+            if !ok {
+                break;
+            }
+            mask |= u32::from_be_bytes(be);
         }
         if !ok {
             continue;
         }
         // LineData.calculateWidth.
         let (left, right) = if mask == 0 {
-            (0, bit_width)
+            (0u8, bit_width as u8)
         } else {
-            (mask.leading_zeros(), 31 - mask.trailing_zeros())
+            (
+                mask.leading_zeros() as u8,
+                (31 - mask.trailing_zeros()) as u8,
+            )
         };
-        out.insert(codepoint, HexGlyph { rows, left, right });
+        let slice = &row_bytes[..16 * bpr];
+        match by_cp.entry(codepoint) {
+            std::collections::hash_map::Entry::Occupied(occ) => {
+                let existing = &mut entries[*occ.get()];
+                if existing.bytes_per_row as usize == bpr {
+                    let start = existing.offset as usize;
+                    rows_buf[start..start + slice.len()].copy_from_slice(slice);
+                } else {
+                    existing.offset = rows_buf.len() as u32;
+                    existing.bytes_per_row = bpr as u8;
+                    rows_buf.extend_from_slice(slice);
+                    *has_dead_rows = true;
+                }
+                existing.left = left;
+                existing.right = right;
+            }
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                let offset = rows_buf.len() as u32;
+                rows_buf.extend_from_slice(slice);
+                vac.insert(entries.len());
+                entries.push(HexEntry {
+                    codepoint,
+                    offset,
+                    left,
+                    right,
+                    bytes_per_row: bpr as u8,
+                });
+            }
+        }
+    }
+}
+/// UnihexProvider.readFromStream over one `.hex` file.
+#[allow(dead_code)]
+fn parse_hex(text: &[u8], out: &mut HashMap<u32, HexGlyph>) {
+    let mut entries = Vec::new();
+    let mut rows_buf = Vec::new();
+    let mut by_cp = crate::fast_hash::FxHashMap::default();
+    let mut has_dead_rows = false;
+    parse_hex_into(
+        text,
+        &mut entries,
+        &mut rows_buf,
+        &mut by_cp,
+        &mut has_dead_rows,
+    );
+    entries.sort_unstable_by_key(|e| e.codepoint);
+    let table = HexTable {
+        entries,
+        rows: rows_buf,
+    };
+    for e in &table.entries {
+        if let Some(g) = table.get(e.codepoint) {
+            out.insert(e.codepoint, g);
+        }
     }
 }
 fn read_json(source: &ResourceSource, path: &str) -> Option<serde_json::Value> {
@@ -218,6 +564,30 @@ fn read_json(source: &ResourceSource, path: &str) -> Option<serde_json::Value> {
 fn resource_path(id: &str, folder: &str, ext: &str) -> String {
     let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
     format!("assets/{ns}/{folder}/{}{ext}", path.trim_end_matches(ext))
+}
+fn unihex_resource_path(file: &str) -> String {
+    resource_path(file, "", "").replace("//", "/")
+}
+/// Resolved asset paths of every `unihex` provider's `hex_file` declared in `source`'s
+/// font definitions, regardless of filename extension.
+fn unihex_paths(source: &ResourceSource) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for file in source.list_under("assets", &["font"]) {
+        if !file.ends_with(".json") {
+            continue;
+        }
+        let Some(def) = read_json(source, &file) else {
+            continue;
+        };
+        for p in def["providers"].as_array().into_iter().flatten() {
+            if p["type"] == "unihex"
+                && let Some(hex_file) = p["hex_file"].as_str()
+            {
+                paths.insert(unihex_resource_path(hex_file));
+            }
+        }
+    }
+    paths
 }
 /// A bitmap provider's `height` (8 when missing or null) and `ascent`, as
 /// vanilla decodes them: any JSON number taken as an integer, a fraction
@@ -373,17 +743,17 @@ fn load_bitmap(
     pixels: &[u8],
     atlas: (u32, u32),
     metrics_only: bool,
-) -> HashMap<char, BitmapGlyph> {
-    let mut out = HashMap::new();
+) -> crate::fast_hash::FxHashMap<char, BitmapGlyph> {
+    let mut out = crate::fast_hash::FxHashMap::default();
     let file = p["file"].as_str().unwrap_or("");
     let (ns, name) = file.split_once(':').unwrap_or(("minecraft", file));
     let name = name.trim_end_matches(".png");
     // The atlas names the default namespace's textures by their path and every
     // other namespace's as `namespace:path` (HudAtlas::build).
     let atlas_name = if ns == "minecraft" {
-        name.to_owned()
+        Cow::Borrowed(name)
     } else {
-        format!("{ns}:{name}")
+        Cow::Owned(format!("{ns}:{name}"))
     };
     // Checked with the whole file (`font_file_error`): rows of one length, none empty.
     let rows: Vec<Vec<char>> = p["chars"]
@@ -395,7 +765,7 @@ fn load_bitmap(
     let Some(width) = rows.first().map(Vec::len).filter(|w| *w > 0) else {
         return out;
     };
-    let in_atlas = sheets.get(&atlas_name).copied();
+    let in_atlas = sheets.get(atlas_name.as_ref()).copied();
     // The sheet: its size, and its pixels when they are not in the atlas.
     let (sw, sh, sheet) = match in_atlas {
         Some(rect) => {
@@ -407,7 +777,7 @@ fn load_bitmap(
             .map_err(Into::into)
             .and_then(|bytes| crate::hud::decode_bytes(&bytes))
         {
-            Ok((w, h, rgba)) => (w, h, Some(Arc::new((w, rgba)))),
+            Ok((w, h, rgba)) => (w, h, Some((w, rgba))),
             Err(_) => {
                 log::warn!("font sheet {file} could not be read");
                 return out;
@@ -444,7 +814,11 @@ fn load_bitmap(
             (rect.v0 * atlas.1 as f32).round() as u32,
         )
     });
+    let cell_bytes = cell_w as usize * cell_h as usize * 4;
+    let cells_per_chunk =
+        (SHEET_CHUNK_RAW_BYTES / cell_bytes.max(1)).clamp(1, SHEET_CHUNK_MAX_CELLS);
     for (r, row) in rows.iter().enumerate() {
+        let mut active_chunk: Option<(usize, Arc<SheetStrip>)> = None;
         for (c, ch) in row.iter().enumerate() {
             // Character 0 pads the grid. A character listed twice keeps its
             // last cell, as vanilla's `Map.put` does.
@@ -453,7 +827,7 @@ fn load_bitmap(
             }
             let (x, y) = (c as u32 * cell_w, r as u32 * cell_h);
             let used = match &sheet {
-                Some(s) => used_width(&s.1, s.0, (x, y, cell_w, cell_h)),
+                Some((stride, rgba)) => used_width(rgba, *stride, (x, y, cell_w, cell_h)),
                 None => used_width(
                     pixels,
                     atlas.0,
@@ -484,18 +858,54 @@ fn load_bitmap(
                     )),
                     ..glyph
                 }),
-                Some(s) => BitmapGlyph::Sheet(SheetCell {
-                    sheet: s.clone(),
-                    x,
-                    y,
-                    w: cell_w,
-                    h: cell_h,
-                    glyph,
-                }),
+                Some((stride, rgba)) => {
+                    let chunk_idx = c / cells_per_chunk;
+                    let chunk_start_col = chunk_idx * cells_per_chunk;
+                    let strip = match &active_chunk {
+                        Some((idx, strip)) if *idx == chunk_idx => Arc::clone(strip),
+                        _ => {
+                            let chunk_end_col = (chunk_start_col + cells_per_chunk).min(width);
+                            let chunk_cells = (chunk_end_col - chunk_start_col) as u32;
+                            let chunk_stride = chunk_cells * cell_w;
+                            let chunk_x0 = chunk_start_col as u32 * cell_w;
+                            let cacheable = chunk_cells > 1;
+                            let stride_px = *stride as usize;
+                            let strip = if chunk_start_col == 0 && chunk_stride == *stride {
+                                let start = y as usize * stride_px * 4;
+                                let end = (y + cell_h) as usize * stride_px * 4;
+                                Arc::new(SheetStrip::new(
+                                    chunk_stride,
+                                    &rgba[start..end],
+                                    cacheable,
+                                ))
+                            } else {
+                                let row_bytes = chunk_stride as usize * 4;
+                                let mut raw = Vec::with_capacity(row_bytes * cell_h as usize);
+                                for dy in 0..cell_h {
+                                    let at =
+                                        ((y + dy) as usize * stride_px + chunk_x0 as usize) * 4;
+                                    raw.extend_from_slice(&rgba[at..at + row_bytes]);
+                                }
+                                Arc::new(SheetStrip::new(chunk_stride, &raw, cacheable))
+                            };
+                            active_chunk = Some((chunk_idx, Arc::clone(&strip)));
+                            strip
+                        }
+                    };
+                    BitmapGlyph::Sheet(SheetCell {
+                        sheet: strip,
+                        x: (c - chunk_start_col) as u32 * cell_w,
+                        y: 0,
+                        w: cell_w,
+                        h: cell_h,
+                        glyph,
+                    })
+                }
             };
             out.insert(*ch, glyph);
         }
     }
+    out.shrink_to_fit();
     out
 }
 /// `TrueTypeGlyphProviderDefinition.load`: a TrueType file (not CFF) under
@@ -520,7 +930,7 @@ fn load_true_type(source: &ResourceSource, p: &serde_json::Value) -> Option<True
         let f = |i: usize| s.get(i).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
         (f(0), f(1))
     });
-    let skip: Vec<char> = match &p["skip"] {
+    let mut skip: Vec<char> = match &p["skip"] {
         serde_json::Value::String(s) => s.chars().collect(),
         serde_json::Value::Array(a) => a
             .iter()
@@ -529,24 +939,31 @@ fn load_true_type(source: &ResourceSource, p: &serde_json::Value) -> Option<True
             .collect(),
         _ => Vec::new(),
     };
-    let ids = font
-        .codepoint_ids()
-        .filter(|(id, c)| id.0 != 0 && !skip.contains(c))
-        .map(|(id, c)| (c, id))
-        .collect();
+    skip.sort_unstable();
+    skip.dedup();
+    skip.shrink_to_fit();
     let pixels_per_em = (size * oversample).round();
     // ab_glyph scales by the font's height; FreeType by its em.
     let units = font.units_per_em().unwrap_or(1000.0);
     let scale = ab_glyph::PxScale::from(pixels_per_em * font.height_unscaled() / units);
     Some(TrueType {
         font,
-        ids,
+        ids: HashMap::new(),
+        skip,
         scale,
         oversample,
         shift: (shift.0 * oversample, shift.1 * oversample),
     })
 }
 impl TrueType {
+    #[inline]
+    fn glyph_id(&self, c: char) -> Option<ab_glyph::GlyphId> {
+        if !self.skip.is_empty() && self.skip.binary_search(&c).is_ok() {
+            return None;
+        }
+        let id = self.font.glyph_id(c);
+        (id.0 != 0).then_some(id)
+    }
     /// The advance in GUI pixels: hinted FreeType advances are whole
     /// oversampled pixels.
     fn advance(&self, id: ab_glyph::GlyphId) -> f32 {
@@ -614,43 +1031,78 @@ impl TrueType {
         ))
     }
 }
-fn load_hex(source: &ResourceSource, p: &serde_json::Value) -> HashMap<u32, HexGlyph> {
-    let mut glyphs = HashMap::new();
-    let Some(file) = p["hex_file"].as_str() else {
-        return glyphs;
+fn load_hex(source: &ResourceSource, key: &UnihexKey) -> HexTable {
+    let mut entries = Vec::new();
+    let mut rows = Vec::new();
+    let mut by_cp = crate::fast_hash::FxHashMap::default();
+    let Some(path) = key.path.as_deref() else {
+        return HexTable { entries, rows };
     };
-    let path = resource_path(file, "", "").replace("//", "/");
-    let Ok(zip) = source.read(&path).and_then(Zip::from_bytes) else {
-        return glyphs;
+    let Ok(zip) = source.read(path).and_then(Zip::from_bytes) else {
+        return HexTable { entries, rows };
     };
     let names: Vec<String> = zip
         .names()
         .filter(|n| n.ends_with(".hex"))
         .map(str::to_owned)
         .collect();
+    let mut has_dead_rows = false;
     for name in names {
         if let Ok(bytes) = zip.read(&name) {
-            parse_hex(&bytes, &mut glyphs);
+            parse_hex_into(
+                &bytes,
+                &mut entries,
+                &mut rows,
+                &mut by_cp,
+                &mut has_dead_rows,
+            );
         }
     }
-    for o in p["size_overrides"].as_array().into_iter().flatten() {
-        let bound = |k: &str| {
-            o[k].as_str()
-                .and_then(|s| s.chars().next())
-                .map_or(0, u32::from)
-        };
-        let (left, right) = (
-            o["left"].as_u64().unwrap_or(0) as u32,
-            o["right"].as_u64().unwrap_or(15) as u32,
-        );
-        for c in bound("from")..=bound("to") {
-            if let Some(g) = glyphs.get_mut(&c) {
-                g.left = left;
-                g.right = right;
+    for &(from, to, left, right) in &key.overrides {
+        for c in from..=to {
+            if let Some(&idx) = by_cp.get(&c) {
+                entries[idx].left = left;
+                entries[idx].right = right;
             }
         }
     }
-    glyphs
+    drop(by_cp);
+    entries.sort_unstable_by_key(|e| e.codepoint);
+    if has_dead_rows {
+        let total_bytes: usize = entries
+            .iter()
+            .map(|e| usize::from(e.bytes_per_row) * 16)
+            .sum();
+        let mut compacted = Vec::with_capacity(total_bytes);
+        for entry in &mut entries {
+            let old_start = entry.offset as usize;
+            let len = usize::from(entry.bytes_per_row) * 16;
+            entry.offset = compacted.len() as u32;
+            compacted.extend_from_slice(&rows[old_start..old_start + len]);
+        }
+        rows = compacted;
+    }
+    entries.shrink_to_fit();
+    rows.shrink_to_fit();
+    HexTable { entries, rows }
+}
+fn ensure_unihex<'a>(
+    lazy: &mut Option<Box<UnihexLazy>>,
+    loaded: &'a mut Option<Arc<HexTable>>,
+    unihex_cache: &mut HashMap<UnihexKey, Arc<HexTable>>,
+) -> &'a HexTable {
+    loaded.get_or_insert_with(|| {
+        let Some(pending) = lazy.take() else {
+            return Arc::new(HexTable {
+                entries: Vec::new(),
+                rows: Vec::new(),
+            });
+        };
+        unihex_cache
+            .entry(pending.key.clone())
+            .or_insert_with(|| Arc::new(load_hex(&pending.source, &pending.key)))
+            .clone()
+    })
 }
 /// The ids of every font definition (`font/**/*.json` of each namespace).
 fn font_ids(source: &ResourceSource) -> Vec<String> {
@@ -733,16 +1185,23 @@ impl Font {
             return Self::load(source, sprites, pixels, atlas, region, white);
         }
         use horizon_assets::resource_source::Resource;
+        let unihex_files = unihex_paths(source);
+        // Fonts only ever read definitions/TTFs under `/font/`, off-atlas bitmap sheets
+        // under `/textures/`, or Unihex archives at their referenced `hex_file` paths.
+        // Skip sounds, models, blockstates, lang files, etc. so the temporary index stays small.
+        let font_file =
+            |p: &str| p.contains("/font/") || p.contains("/textures/") || unihex_files.contains(p);
         let mut files: std::collections::BTreeMap<_, _> = defaults
             .list("assets/")
             .into_iter()
-            .filter(|p| !(p.contains("/font/") && p.ends_with(".json")))
+            .filter(|p| font_file(p) && !(p.contains("/font/") && p.ends_with(".json")))
             .map(|p| (p.clone(), Resource::file(defaults.clone(), p)))
             .collect();
         files.extend(
             source
                 .list("assets/")
                 .into_iter()
+                .filter(|p| font_file(p))
                 .map(|p| (p.clone(), Resource::file(source.clone(), p))),
         );
         Self::load(
@@ -777,9 +1236,8 @@ impl Font {
         white: Rect,
         metrics_only: bool,
     ) -> Self {
-        let sheets = sprites.clone();
-        let font = Self {
-            sheets,
+        let mut font = Self {
+            sheets: HashMap::new(),
             missing: Glyph {
                 rect: None,
                 left: 0.0,
@@ -790,10 +1248,11 @@ impl Font {
                 offset: 1.0,
             },
             white,
-            source: source.clone(),
+            source: ResourceSource::indexed(std::collections::BTreeMap::new()),
             atlas,
             region,
             metrics_only,
+            default_set: None,
             cache: RefCell::new(Cache {
                 sets: Vec::new(),
                 region: Region {
@@ -802,6 +1261,8 @@ impl Font {
                     pending: Vec::new(),
                     full: false,
                 },
+                unihex: HashMap::new(),
+                strips: StripCache::new(),
                 // `Font.random`: `RandomSource.create()`.
                 random: crate::random_source::create(),
             }),
@@ -812,25 +1273,32 @@ impl Font {
         // FontManager.prepare: every font definition of the resources.
         let mut ids = font_ids(source);
         ids.sort_by_key(|id| id != DEFAULT);
-        let sets = ids
+        let sets: Vec<(String, FontSet)> = ids
             .into_iter()
             .map(|id| {
-                let set = font.load_set(&id, pixels);
+                let set = font.load_set(source, &id, sprites, pixels);
                 (id, set)
             })
             .collect();
+        font.default_set = sets.iter().position(|(id, _)| id == DEFAULT);
         font.cache.borrow_mut().sets = sets;
         font
     }
     /// `FontManager`: a font's providers with references expanded.
-    fn load_set(&self, id: &str, pixels: &[u8]) -> FontSet {
+    fn load_set(
+        &self,
+        source: &ResourceSource,
+        id: &str,
+        sprites: &HashMap<String, Rect>,
+        pixels: &[u8],
+    ) -> FontSet {
         let mut all = Vec::new();
-        providers(&self.source, id, 0, &mut all);
+        providers(source, id, 0, &mut all);
         let providers = all
             .iter()
             .filter_map(|p| match p["type"].as_str()? {
-                "space" => Some(Provider::Space(
-                    p["advances"]
+                "space" => {
+                    let mut advances: crate::fast_hash::FxHashMap<char, f32> = p["advances"]
                         .as_object()
                         .into_iter()
                         .flatten()
@@ -840,29 +1308,32 @@ impl Font {
                             // line that holds the glyph.
                             advance.is_finite().then_some((k.chars().next()?, advance))
                         })
-                        .collect(),
-                )),
+                        .collect();
+                    advances.shrink_to_fit();
+                    Some(Provider::Space(advances))
+                }
                 "bitmap" => Some(Provider::Bitmap(
                     Filter::of(p),
-                    load_bitmap(
-                        &self.source,
-                        p,
-                        &self.sheets,
-                        pixels,
-                        self.atlas,
-                        self.metrics_only,
-                    ),
+                    load_bitmap(source, p, sprites, pixels, self.atlas, self.metrics_only),
                 )),
-                "unihex" => Some(Provider::Unihex(Filter::of(p), p.clone(), None)),
+                "unihex" => Some(Provider::Unihex(
+                    Filter::of(p),
+                    Some(Box::new(UnihexLazy {
+                        source: source.clone(),
+                        key: UnihexKey::of(p),
+                    })),
+                    None,
+                )),
                 "ttf" => Some(Provider::TrueType(
                     Filter::of(p),
-                    Box::new(load_true_type(&self.source, p)?),
+                    Box::new(load_true_type(source, p)?),
                 )),
                 _ => None,
             })
             .collect();
         FontSet {
             providers,
+            ascii: None,
             glyphs: Default::default(),
             non_fishy: Default::default(),
             by_width: None,
@@ -872,9 +1343,7 @@ impl Font {
     pub fn reset_cache(&self) {
         let mut cache = self.cache.borrow_mut();
         for (_, set) in &mut cache.sets {
-            set.glyphs.clear();
-            set.non_fishy.clear();
-            set.by_width = None;
+            set.clear_cache();
         }
         cache.region.cursor = (0, 0);
         cache.region.row = 0;
@@ -897,37 +1366,78 @@ impl Font {
     pub fn epoch(&self) -> u64 {
         self.generation.get() << 2 | u64::from(self.uniform) << 1 | u64::from(self.japanese)
     }
+    #[inline]
+    fn set_index(&self, cache: &Cache, id: &str) -> Option<usize> {
+        if id == DEFAULT {
+            return self.default_set;
+        }
+        cache.sets.iter().position(|(k, _)| k == id)
+    }
+    #[inline]
+    fn style_set_index(&self, cache: &Cache, style: &Style) -> Option<usize> {
+        match style.font.as_deref() {
+            None => self.default_set,
+            Some(id) => self.set_index(cache, id),
+        }
+    }
     /// The glyph for a character in the default font (FontSet.getGlyph).
     pub fn glyph(&self, c: char) -> Glyph {
-        self.glyph_of(DEFAULT, c)
+        let Some(idx) = self.default_set else {
+            return self.missing;
+        };
+        let mut cache = self.cache.borrow_mut();
+        self.glyph_at(&mut cache, idx, c)
     }
     /// The glyph for a character drawn in `style`'s font (its id is
     /// already complete, see `text::font_id`).
     pub fn glyph_styled(&self, c: char, style: &Style) -> Glyph {
-        self.glyph_of(style.font.as_deref().unwrap_or(DEFAULT), c)
+        let mut cache = self.cache.borrow_mut();
+        let Some(idx) = self.style_set_index(&cache, style) else {
+            return self.missing;
+        };
+        self.glyph_at(&mut cache, idx, c)
     }
     /// The glyph for a character in the font `id` (`alt` is `minecraft:alt`).
     pub fn glyph_in(&self, id: &str, c: char) -> Glyph {
-        if id.contains(':') {
-            self.glyph_of(id, c)
-        } else {
-            self.glyph_of(&format!("minecraft:{id}"), c)
-        }
-    }
-    /// The first active provider's glyph, else the missing glyph.
-    fn glyph_of(&self, id: &str, c: char) -> Glyph {
         let mut cache = self.cache.borrow_mut();
-        let Cache { sets, region, .. } = &mut *cache;
-        // FontManager.getFontSetRaw: a font that doesn't exist draws every
-        // character as the missing glyph.
-        let Some((_, set)) = sets.iter_mut().find(|(k, _)| k == id) else {
+        let idx = if id.contains(':') {
+            self.set_index(&cache, id)
+        } else {
+            cache
+                .sets
+                .iter()
+                .position(|(k, _)| k.strip_prefix("minecraft:") == Some(id))
+        };
+        let Some(idx) = idx else {
             return self.missing;
         };
-        if let Some(g) = set.glyphs.get(&c) {
-            return *g;
+        self.glyph_at(&mut cache, idx, c)
+    }
+    /// The first active provider's glyph, else the missing glyph.
+    #[allow(dead_code)]
+    fn glyph_of(&self, id: &str, c: char) -> Glyph {
+        let mut cache = self.cache.borrow_mut();
+        let Some(idx) = self.set_index(&cache, id) else {
+            return self.missing;
+        };
+        self.glyph_at(&mut cache, idx, c)
+    }
+    /// The first active provider's glyph in `sets[set_idx]`, else the missing glyph.
+    #[inline]
+    fn glyph_at(&self, cache: &mut Cache, set_idx: usize, c: char) -> Glyph {
+        let Cache {
+            sets,
+            region,
+            unihex,
+            strips,
+            ..
+        } = cache;
+        let set = &mut sets[set_idx].1;
+        if let Some(g) = set.get_glyph(c) {
+            return g;
         }
         let was_full = std::mem::replace(&mut region.full, false);
-        let found = self.resolve(set, region, c, false);
+        let found = self.resolve(set, region, unihex, strips, c, false);
         // No room: the missing glyph for now, not remembered, so the
         // character is tried again once `begin_frame` cleared the region.
         let overflowed = std::mem::replace(&mut region.full, was_full);
@@ -936,27 +1446,75 @@ impl Font {
             return self.missing;
         }
         let glyph = found.unwrap_or(self.missing);
-        set.glyphs.insert(c, glyph);
+        set.insert_glyph(c, glyph);
         glyph
+    }
+    #[inline]
+    fn advance_in(
+        &self,
+        cache: &mut Cache,
+        set_idx: Option<usize>,
+        c: char,
+        bold: bool,
+        has_inline: bool,
+    ) -> f32 {
+        if c == '\u{fffc}' && has_inline {
+            return 8.0;
+        }
+        let Some(idx) = set_idx else {
+            return self.missing.advance + if bold { self.missing.offset } else { 0.0 };
+        };
+        if !bold
+            && (c as u32) < 128
+            && let Some(ascii) = cache.sets[idx].1.ascii.as_deref()
+        {
+            let adv = ascii.advances[c as usize];
+            if !adv.is_nan() {
+                return adv;
+            }
+        }
+        let g = self.glyph_at(cache, idx, c);
+        g.advance + if bold { g.offset } else { 0.0 }
+    }
+    #[inline]
+    fn ascii_advance_at(&self, cache: &mut Cache, set_idx: usize, byte: u8) -> f32 {
+        if let Some(ascii) = cache.sets[set_idx].1.ascii.as_deref() {
+            let adv = ascii.advances[byte as usize];
+            if !adv.is_nan() {
+                return adv;
+            }
+        }
+        self.glyph_at(cache, set_idx, char::from(byte)).advance
     }
     /// `FontSet.getRandomGlyph`'s `SelectedGlyphs.nonFishy`: the glyph of the first provider whose
     /// advance is not fishy, else the missing glyph. A character whose first glyph is fine has
     /// the same one for both.
+    #[allow(dead_code)]
     fn glyph_non_fishy(&self, id: &str, c: char) -> Glyph {
-        let any = self.glyph_of(id, c);
+        let mut cache = self.cache.borrow_mut();
+        let Some(idx) = self.set_index(&cache, id) else {
+            return self.missing;
+        };
+        self.glyph_non_fishy_at(&mut cache, idx, c)
+    }
+    fn glyph_non_fishy_at(&self, cache: &mut Cache, set_idx: usize, c: char) -> Glyph {
+        let any = self.glyph_at(cache, set_idx, c);
         if !fishy_advance(any.advance) {
             return any;
         }
-        let mut cache = self.cache.borrow_mut();
-        let Cache { sets, region, .. } = &mut *cache;
-        let Some((_, set)) = sets.iter_mut().find(|(k, _)| k == id) else {
-            return self.missing;
-        };
+        let Cache {
+            sets,
+            region,
+            unihex,
+            strips,
+            ..
+        } = cache;
+        let set = &mut sets[set_idx].1;
         if let Some(g) = set.non_fishy.get(&c) {
             return *g;
         }
         let was_full = std::mem::replace(&mut region.full, false);
-        let found = self.resolve(set, region, c, true);
+        let found = self.resolve(set, region, unihex, strips, c, true);
         let overflowed = std::mem::replace(&mut region.full, was_full);
         region.full |= overflowed;
         if overflowed {
@@ -970,6 +1528,8 @@ impl Font {
         &self,
         set: &mut FontSet,
         region: &mut Region,
+        unihex_cache: &mut HashMap<UnihexKey, Arc<HexTable>>,
+        strips: &mut StripCache,
         c: char,
         non_fishy: bool,
     ) -> Option<Glyph> {
@@ -999,7 +1559,7 @@ impl Font {
                         Some(BitmapGlyph::Sheet(cell))
                             if !(non_fishy && fishy_advance(cell.glyph.advance)) =>
                         {
-                            let Some(rgba) = cell.pixels() else {
+                            let Some(rgba) = cell.pixels_cached(strips) else {
                                 continue;
                             };
                             let (x, y) =
@@ -1012,27 +1572,27 @@ impl Font {
                         _ => {}
                     }
                 }
-                Provider::Unihex(filter, def, glyphs) if filter.passes(uniform, japanese) => {
-                    let glyphs = glyphs.get_or_insert_with(|| load_hex(&self.source, def));
-                    if let Some(h) = glyphs.get(&u32::from(c)).copied()
+                Provider::Unihex(filter, lazy, loaded) if filter.passes(uniform, japanese) => {
+                    let table = ensure_unihex(lazy, loaded, unihex_cache);
+                    if let Some(h) = table.get(u32::from(c))
                         && !(non_fishy && fishy_advance(hex_advance(&h)))
                     {
                         return self.rasterize_hex(region, h);
                     }
                 }
                 Provider::TrueType(filter, ttf) if filter.passes(uniform, japanese) => {
-                    if let Some(id) = ttf.ids.get(&c)
-                        && !(non_fishy && fishy_advance(ttf.advance(*id)))
+                    if let Some(id) = ttf.glyph_id(c)
+                        && !(non_fishy && fishy_advance(ttf.advance(id)))
                     {
                         if self.metrics_only {
                             return Some(Glyph {
                                 rect: None,
-                                advance: ttf.advance(*id),
+                                advance: ttf.advance(id),
                                 offset: 1.0,
                                 ..self.missing
                             });
                         }
-                        let (glyph, bitmap) = ttf.glyph(*id, (self.atlas.0, self.region.1))?;
+                        let (glyph, bitmap) = ttf.glyph(id, (self.atlas.0, self.region.1))?;
                         return match bitmap {
                             Some((w, h, rgba)) => {
                                 let (x, y) = region.place(w, h, rgba, self.atlas, self.region)?;
@@ -1097,16 +1657,21 @@ impl Font {
     /// glyphs below U+0250.
     pub fn random_glyph(&self, style: &Style, advance: f32) -> Glyph {
         use horizon_core::random::RandomSource;
-        let id = style.font.as_deref().unwrap_or(DEFAULT);
         let width = advance.ceil() as i32;
+        let mut cache = self.cache.borrow_mut();
+        let Some(set_idx) = self.style_set_index(&cache, style) else {
+            return self.missing;
+        };
         let pick = {
-            let mut cache = self.cache.borrow_mut();
-            let Cache { sets, random, .. } = &mut *cache;
-            let Some((_, set)) = sets.iter_mut().find(|(k, _)| k == id) else {
-                return self.missing;
-            };
+            let Cache {
+                sets,
+                unihex,
+                random,
+                ..
+            } = &mut *cache;
+            let set = &mut sets[set_idx].1;
             if set.by_width.is_none() {
-                set.by_width = Some(self.glyphs_by_width(set));
+                set.by_width = Some(self.glyphs_by_width(set, unihex));
             }
             set.by_width
                 .as_ref()
@@ -1116,9 +1681,15 @@ impl Font {
                     chars.get(i as usize).copied()
                 })
         };
-        pick.map_or(self.missing, |c| self.glyph_non_fishy(id, c))
+        pick.map_or(self.missing, |c| {
+            self.glyph_non_fishy_at(&mut cache, set_idx, c)
+        })
     }
-    fn glyphs_by_width(&self, set: &mut FontSet) -> HashMap<i32, Vec<char>> {
+    fn glyphs_by_width(
+        &self,
+        set: &mut FontSet,
+        unihex_cache: &mut HashMap<UnihexKey, Arc<HexTable>>,
+    ) -> crate::fast_hash::FxHashMap<i32, Vec<char>> {
         let (uniform, japanese) = (self.uniform, self.japanese);
         let mut chars = std::collections::BTreeSet::new();
         let mut in_atlas = false;
@@ -1140,9 +1711,10 @@ impl Font {
             // Nothing in the atlas: the glyphs below U+0250, rasterized as used.
             chars.extend((0..0x250u32).filter_map(char::from_u32));
         }
-        let mut out: HashMap<i32, Vec<char>> = HashMap::new();
+        let mut out: crate::fast_hash::FxHashMap<i32, Vec<char>> =
+            crate::fast_hash::FxHashMap::default();
         for c in chars {
-            if let Some(advance) = self.provider_advance(set, c) {
+            if let Some(advance) = self.provider_advance(set, unihex_cache, c) {
                 out.entry(advance.ceil() as i32).or_default().push(c);
             }
         }
@@ -1150,7 +1722,12 @@ impl Font {
     }
     /// A character's advance in `set` (its first provider that has it, fishy or not, as the
     /// by-width table of `FontSet.reload` takes it), without rasterizing it.
-    fn provider_advance(&self, set: &mut FontSet, c: char) -> Option<f32> {
+    fn provider_advance(
+        &self,
+        set: &mut FontSet,
+        unihex_cache: &mut HashMap<UnihexKey, Arc<HexTable>>,
+        c: char,
+    ) -> Option<f32> {
         let (uniform, japanese) = (self.uniform, self.japanese);
         for provider in &mut set.providers {
             match provider {
@@ -1170,15 +1747,15 @@ impl Font {
                         _ => {}
                     }
                 }
-                Provider::Unihex(filter, def, glyphs) if filter.passes(uniform, japanese) => {
-                    let glyphs = glyphs.get_or_insert_with(|| load_hex(&self.source, def));
-                    if let Some(h) = glyphs.get(&u32::from(c)) {
-                        return Some(hex_advance(h));
+                Provider::Unihex(filter, lazy, loaded) if filter.passes(uniform, japanese) => {
+                    let table = ensure_unihex(lazy, loaded, unihex_cache);
+                    if let Some(adv) = table.advance(u32::from(c)) {
+                        return Some(adv);
                     }
                 }
                 Provider::TrueType(filter, ttf) if filter.passes(uniform, japanese) => {
-                    if let Some(id) = ttf.ids.get(&c) {
-                        return Some(ttf.advance(*id));
+                    if let Some(id) = ttf.glyph_id(c) {
+                        return Some(ttf.advance(id));
                     }
                 }
                 _ => {}
@@ -1195,39 +1772,104 @@ impl Font {
         if c == '\u{fffc}' && style.inline_object.is_some() {
             return 8.0;
         }
-        let g = self.glyph_styled(c, style);
-        g.advance + if style.is_bold() { g.offset } else { 0.0 }
+        let mut cache = self.cache.borrow_mut();
+        let set_idx = self.style_set_index(&cache, style);
+        self.advance_in(&mut cache, set_idx, c, style.is_bold(), false)
     }
     /// Font.width of plain text (legacy codes are formatting, not glyphs).
     pub fn width(&self, s: &str) -> f32 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let rtl = crate::lang::bidirectional();
+        if !rtl && s.is_ascii() {
+            let Some(idx) = self.default_set else {
+                return (self.missing.advance * s.len() as f32).ceil();
+            };
+            let mut cache = self.cache.borrow_mut();
+            let mut total = 0.0f32;
+            for b in s.bytes() {
+                total += self.ascii_advance_at(&mut cache, idx, b);
+            }
+            return total.ceil();
+        }
         if s.contains('§') {
+            if !rtl && !s.chars().any(|c| c as u32 >= 0x0590) {
+                let mut cache = self.cache.borrow_mut();
+                let set_idx = self.default_set;
+                let mut total = 0.0f32;
+                let mut bold = false;
+                let mut chars = s.chars();
+                while let Some(c) = chars.next() {
+                    if c == '§' {
+                        let Some(code) = chars.next() else { break };
+                        match code.to_ascii_lowercase() {
+                            '0'..='9' | 'a'..='f' | 'r' => bold = false,
+                            'l' => bold = true,
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    total += self.advance_in(&mut cache, set_idx, c, bold, false);
+                }
+                return total.ceil();
+            }
             return self.width_text(&Text::legacy(s));
         }
-        crate::bidi::visual_str(s)
-            .chars()
-            .map(|c| self.glyph(c).advance)
-            .sum::<f32>()
-            .ceil()
+        let visual = crate::bidi::visual_str(s);
+        let mut cache = self.cache.borrow_mut();
+        let set_idx = self.default_set;
+        let mut total = 0.0f32;
+        for c in visual.chars() {
+            total += self.advance_in(&mut cache, set_idx, c, false, false);
+        }
+        total.ceil()
+    }
+    fn measure_spans(&self, t: &Text) -> f32 {
+        let mut cache = self.cache.borrow_mut();
+        let mut total = 0.0f32;
+        for span in &t.spans {
+            if span.text.is_empty() {
+                continue;
+            }
+            let set_idx = self.style_set_index(&cache, &span.style);
+            let bold = span.style.is_bold();
+            let has_inline = span.style.inline_object.is_some();
+            if !bold
+                && !has_inline
+                && span.text.is_ascii()
+                && let Some(idx) = set_idx
+            {
+                for b in span.text.bytes() {
+                    total += self.ascii_advance_at(&mut cache, idx, b);
+                }
+            } else {
+                for c in span.text.chars() {
+                    total += self.advance_in(&mut cache, set_idx, c, bold, has_inline);
+                }
+            }
+        }
+        total.ceil()
     }
     /// Font.width of a component: `§` codes in the spans are formatting,
     /// not glyphs. Right-to-left text is measured as it is drawn, shaped.
     pub fn width_text(&self, t: &Text) -> f32 {
+        if !crate::lang::bidirectional() && t.spans.iter().all(|s| s.text.is_ascii()) {
+            return self.measure_spans(t);
+        }
         let t = t.resolved();
-        crate::bidi::visual(&t)
-            .chars()
-            .map(|(c, s)| self.advance(c, s))
-            .sum::<f32>()
-            .ceil()
+        let visual = crate::bidi::visual(&t);
+        self.measure_spans(&visual)
     }
     /// `Font.width(FormattedCharSequence)` of a sequence a component built
     /// with `FormattedCharSequence.forward`: every character is a glyph, a
     /// `§` included (`StringDecomposer.iterate`, not `iterateFormatted`).
     pub fn width_drawn(&self, t: &Text) -> f32 {
-        crate::bidi::visual(t)
-            .chars()
-            .map(|(c, s)| self.advance(c, s))
-            .sum::<f32>()
-            .ceil()
+        if !crate::lang::bidirectional() && t.spans.iter().all(|s| s.text.is_ascii()) {
+            return self.measure_spans(t);
+        }
+        let visual = crate::bidi::visual(t);
+        self.measure_spans(&visual)
     }
     /// `StringSplitter.splitLines`: each line and whether it continues a
     /// wrapped one. A line breaks at a `\n`, or once a character overflows
@@ -1235,41 +1877,65 @@ impl Font {
     /// before that character; the `\n` or space at the break is dropped.
     pub fn split_lines(&self, t: &Text, max_width: f32) -> Vec<(Text, bool)> {
         let max_width = max_width.max(1.0);
-        let chars: Vec<(char, &Style)> = t.chars().collect();
-        let n = chars.len();
+        let spans = &t.spans;
+        let end_pos = SpanPos {
+            span: spans.len(),
+            byte: 0,
+        };
         let mut out = Vec::new();
-        let (mut start, mut wrapped, mut force_new_line) = (0, false, false);
+        let mut start = next_non_empty_pos(spans, SpanPos { span: 0, byte: 0 });
+        let (mut wrapped, mut force_new_line) = (false, false);
+        let mut cache = self.cache.borrow_mut();
         loop {
             // LineBreakFinder over what is left.
-            let (mut width, mut had_visible, mut last_space) = (0.0f32, false, None);
-            let mut split = None;
-            for (i, &(c, style)) in chars.iter().enumerate().skip(start) {
-                if c == '\n' {
-                    split = Some(i);
-                    break;
+            let (mut width, mut had_visible) = (0.0f32, false);
+            let mut last_space: Option<(SpanPos, SpanPos)> = None;
+            let mut split: Option<(SpanPos, SpanPos, bool)> = None;
+            let (mut si, mut byte) = (start.span, start.byte);
+            'scan: while si < spans.len() {
+                let span = &spans[si];
+                let set_idx = self.style_set_index(&cache, &span.style);
+                let bold = span.style.is_bold();
+                let has_inline = span.style.inline_object.is_some();
+                for (rel, c) in span.text[byte..].char_indices() {
+                    let pos = SpanPos {
+                        span: si,
+                        byte: byte + rel,
+                    };
+                    let after = SpanPos {
+                        span: si,
+                        byte: byte + rel + c.len_utf8(),
+                    };
+                    if c == '\n' {
+                        split = Some((pos, after, true));
+                        break 'scan;
+                    }
+                    if c == ' ' {
+                        last_space = Some((pos, after));
+                    }
+                    let advance = self.advance_in(&mut cache, set_idx, c, bold, has_inline);
+                    width += advance;
+                    if !had_visible || width <= max_width {
+                        had_visible |= advance != 0.0;
+                    } else {
+                        let (at, next) = last_space.unwrap_or((pos, pos));
+                        split = Some((at, next, false));
+                        break 'scan;
+                    }
                 }
-                if c == ' ' {
-                    last_space = Some(i);
-                }
-                let advance = self.advance(c, style);
-                width += advance;
-                if !had_visible || width <= max_width {
-                    had_visible |= advance != 0.0;
-                } else {
-                    split = Some(last_space.unwrap_or(i));
-                    break;
-                }
+                si += 1;
+                byte = 0;
             }
-            let Some(at) = split else { break };
-            let new_line = chars[at].0 == '\n';
-            let skip = usize::from(new_line || chars[at].0 == ' ');
+            let Some((at, next, new_line)) = split else {
+                break;
+            };
             force_new_line = new_line;
-            out.push((t.slice(start, at), wrapped));
+            out.push((slice_spans(spans, start, at), wrapped));
             wrapped = !new_line;
-            start = at + skip;
+            start = next_non_empty_pos(spans, next);
         }
-        if start < n {
-            out.push((t.slice(start, n), wrapped));
+        if start < end_pos {
+            out.push((slice_spans(spans, start, end_pos), wrapped));
         } else if force_new_line {
             out.push((Text::empty(), false));
         }
@@ -1281,29 +1947,39 @@ impl Font {
     /// goes on in the style at the break. Lines keep their codes for drawing.
     pub fn split_formatted(&self, t: &Text, max_width: f32) -> Vec<Text> {
         let max_width = max_width.max(1.0);
-        let mut parts: Vec<(Vec<char>, Span)> = t
+        let mut parts: VecDeque<(&str, &Span, Option<Style>)> = t
             .spans
             .iter()
             .filter(|s| !s.text.is_empty())
-            .map(|s| (s.text.chars().collect(), s.with_text(String::new())))
+            .map(|s| (s.text.as_str(), s, None))
             .collect();
-        let mut flat: Vec<char> = parts.iter().flat_map(|p| p.0.iter().copied()).collect();
         let mut out = Vec::new();
         let mut force_new_line = false;
+        let mut cache = self.cache.borrow_mut();
         // One LineBreakFinder per line, over the parts left.
-        while let Some((at, split_style)) = self.line_break(&parts, max_width) {
-            let tail = flat[at];
-            let new_line = tail == '\n';
-            let skip = usize::from(new_line || tail == ' ');
+        while let Some((part_idx, byte_idx, new_line, skip_bytes, split_style)) =
+            self.line_break_formatted(&mut cache, &parts, max_width)
+        {
             force_new_line = new_line;
-            out.push(split_at(&mut parts, at, skip, &split_style));
-            flat.drain(..at + skip);
+            out.push(split_at_formatted(
+                &mut parts,
+                part_idx,
+                byte_idx,
+                skip_bytes,
+                split_style,
+            ));
         }
         if !parts.is_empty() {
             out.push(Text::from_spans(
                 parts
                     .into_iter()
-                    .map(|(text, span)| span.with_text(text.into_iter().collect::<String>()))
+                    .map(|(text, orig, style_override)| {
+                        let mut span = orig.with_text(text);
+                        if let Some(st) = style_override {
+                            span.style = st;
+                        }
+                        span
+                    })
                     .collect(),
             ));
         } else if force_new_line {
@@ -1313,6 +1989,7 @@ impl Font {
     }
     /// `StringSplitter.LineBreakFinder` fed by `StringDecomposer.iterateFormatted`:
     /// where the parts break (a character index) and the style there.
+    #[allow(dead_code)]
     fn line_break(&self, parts: &[(Vec<char>, Span)], max_width: f32) -> Option<(usize, Style)> {
         let (mut width, mut had_visible, mut last_space) = (0.0f32, false, None);
         let mut offset = 0;
@@ -1349,6 +2026,56 @@ impl Font {
         }
         None
     }
+    /// `StringSplitter.LineBreakFinder` fed by `StringDecomposer.iterateFormatted`:
+    /// where the parts break `(part_idx, byte_idx, new_line, skip_bytes, restyle)`.
+    fn line_break_formatted(
+        &self,
+        cache: &mut Cache,
+        parts: &VecDeque<(&str, &Span, Option<Style>)>,
+        max_width: f32,
+    ) -> Option<(usize, usize, bool, usize, Option<Style>)> {
+        let (mut width, mut had_visible) = (0.0f32, false);
+        let mut last_space: Option<(usize, usize, Option<Style>)> = None;
+        for (part_idx, (contents, orig_span, style_override)) in parts.iter().enumerate() {
+            let base_style = style_override.as_ref().unwrap_or(&orig_span.style);
+            let mut owned_style: Option<Style> = None;
+            let mut set_idx = self.style_set_index(cache, base_style);
+            let mut bold = base_style.is_bold();
+            let mut has_inline = base_style.inline_object.is_some();
+            let mut iter = contents.char_indices();
+            while let Some((byte_idx, c)) = iter.next() {
+                if c == '§' {
+                    // A `§` that ends its part ends only that part.
+                    let Some((_, code)) = iter.next() else {
+                        break;
+                    };
+                    let cur = owned_style.as_ref().unwrap_or(base_style);
+                    let next = legacy_format(cur, code, &Style::default());
+                    set_idx = self.style_set_index(cache, &next);
+                    bold = next.is_bold();
+                    has_inline = next.inline_object.is_some();
+                    owned_style = Some(next);
+                    continue;
+                }
+                if c == '\n' {
+                    return Some((part_idx, byte_idx, true, 1, owned_style));
+                }
+                if c == ' ' {
+                    last_space = Some((part_idx, byte_idx, owned_style.clone()));
+                }
+                let advance = self.advance_in(cache, set_idx, c, bold, has_inline);
+                width += advance;
+                if had_visible && width > max_width {
+                    return Some(match last_space {
+                        Some((pi, bi, st)) => (pi, bi, false, 1, st),
+                        None => (part_idx, byte_idx, false, 0, owned_style),
+                    });
+                }
+                had_visible |= advance != 0.0;
+            }
+        }
+        None
+    }
     /// `ComponentRenderUtils.wrapComponents`: the split lines, wrapped ones
     /// indented by an unstyled space; one empty line for empty text.
     pub fn wrap_components(&self, t: &Text, max_width: i32) -> Vec<Text> {
@@ -1374,41 +2101,65 @@ impl Font {
     /// StringSplitter.splitLines: wrap at the last space that fits (or
     /// mid-word when none does); `\n` always breaks. Styles are kept.
     pub fn split(&self, t: &Text, max_width: f32) -> Vec<Text> {
-        let chars: Vec<(char, Style)> = t.chars().map(|(c, s)| (c, s.clone())).collect();
+        let spans = &t.spans;
+        let end_pos = SpanPos {
+            span: spans.len(),
+            byte: 0,
+        };
         let mut lines = Vec::new();
-        let mut start = 0;
-        while start < chars.len() {
-            let mut width = 0.0;
-            let mut end = chars.len();
-            let mut next = chars.len();
-            let mut last_space = None;
-            for (i, (c, style)) in chars.iter().enumerate().skip(start) {
-                if *c == '\n' {
-                    end = i;
-                    next = i + 1;
-                    break;
-                }
-                if *c == ' ' {
-                    last_space = Some(i);
-                }
-                width += self.advance(*c, style);
-                if width > max_width {
-                    match last_space {
-                        Some(s) if s > start => {
-                            end = s;
-                            next = s + 1;
-                        }
-                        _ => {
-                            end = i.max(start + 1);
-                            next = end;
-                        }
+        let mut start = next_non_empty_pos(spans, SpanPos { span: 0, byte: 0 });
+        let mut cache = self.cache.borrow_mut();
+        while start < end_pos {
+            let mut width = 0.0f32;
+            let mut end = end_pos;
+            let mut next = end_pos;
+            let mut last_space: Option<(SpanPos, SpanPos)> = None;
+            let mut ended_with_newline = false;
+            let (mut si, mut byte) = (start.span, start.byte);
+            'scan: while si < spans.len() {
+                let span = &spans[si];
+                let set_idx = self.style_set_index(&cache, &span.style);
+                let bold = span.style.is_bold();
+                let has_inline = span.style.inline_object.is_some();
+                for (rel, c) in span.text[byte..].char_indices() {
+                    let pos = SpanPos {
+                        span: si,
+                        byte: byte + rel,
+                    };
+                    let after = SpanPos {
+                        span: si,
+                        byte: byte + rel + c.len_utf8(),
+                    };
+                    if c == '\n' {
+                        end = pos;
+                        next = after;
+                        ended_with_newline = true;
+                        break 'scan;
                     }
-                    break;
+                    if c == ' ' {
+                        last_space = Some((pos, after));
+                    }
+                    width += self.advance_in(&mut cache, set_idx, c, bold, has_inline);
+                    if width > max_width {
+                        match last_space {
+                            Some((s, s_after)) if s > start => {
+                                end = s;
+                                next = s_after;
+                            }
+                            _ => {
+                                end = if pos > start { pos } else { after };
+                                next = end;
+                            }
+                        }
+                        break 'scan;
+                    }
                 }
+                si += 1;
+                byte = 0;
             }
-            lines.push(t.slice(start, end));
-            start = next;
-            if start == chars.len() && chars.last().is_some_and(|c| c.0 == '\n') {
+            lines.push(slice_spans(spans, start, end));
+            start = next_non_empty_pos(spans, next);
+            if start == end_pos && ended_with_newline {
                 lines.push(Text::empty());
             }
         }
@@ -1419,33 +2170,96 @@ impl Font {
     }
     /// Characters of `s` that fit in `width` (Font.plainSubstrByWidth).
     pub fn fit(&self, s: &str, width: f32) -> usize {
-        let mut w = 0.0;
+        let mut cache = self.cache.borrow_mut();
+        let set_idx = self.default_set;
+        let mut w = 0.0f32;
+        if s.is_ascii()
+            && let Some(idx) = set_idx
+        {
+            for (i, b) in s.bytes().enumerate() {
+                w += self.ascii_advance_at(&mut cache, idx, b);
+                if w > width {
+                    return i;
+                }
+            }
+            return s.len();
+        }
+        let mut count = 0usize;
         for (i, c) in s.chars().enumerate() {
-            w += self.glyph(c).advance;
+            w += self.advance_in(&mut cache, set_idx, c, false, false);
             if w > width {
                 return i;
             }
+            count = i + 1;
         }
-        s.chars().count()
+        count
     }
     /// Characters of `s` that fit in `width`, measured from the end.
     pub fn fit_reverse(&self, s: &str, width: f32) -> usize {
-        let mut w = 0.0;
+        let mut cache = self.cache.borrow_mut();
+        let set_idx = self.default_set;
+        let mut w = 0.0f32;
+        if s.is_ascii()
+            && let Some(idx) = set_idx
+        {
+            for (i, b) in s.bytes().rev().enumerate() {
+                w += self.ascii_advance_at(&mut cache, idx, b);
+                if w > width {
+                    return i;
+                }
+            }
+            return s.len();
+        }
+        let mut count = 0usize;
         for (i, c) in s.chars().rev().enumerate() {
-            w += self.glyph(c).advance;
+            w += self.advance_in(&mut cache, set_idx, c, false, false);
             if w > width {
                 return i;
             }
+            count = i + 1;
         }
-        s.chars().count()
+        count
     }
     pub fn white(&self) -> Rect {
         self.white
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SpanPos {
+    span: usize,
+    byte: usize,
+}
+fn next_non_empty_pos(spans: &[Span], mut pos: SpanPos) -> SpanPos {
+    while pos.span < spans.len() && pos.byte >= spans[pos.span].text.len() {
+        pos.span += 1;
+        pos.byte = 0;
+    }
+    pos
+}
+fn slice_spans(spans: &[Span], from: SpanPos, to: SpanPos) -> Text {
+    if from >= to {
+        return Text::empty();
+    }
+    let last = to.span.min(spans.len().saturating_sub(1));
+    let mut out = Vec::new();
+    for si in from.span..=last {
+        let Some(span) = spans.get(si) else { break };
+        let lo = if si == from.span { from.byte } else { 0 };
+        let hi = if si == to.span {
+            to.byte
+        } else {
+            span.text.len()
+        };
+        if lo < hi {
+            out.push(span.with_text(&span.text[lo..hi]));
+        }
+    }
+    Text::from_spans(out)
+}
 /// `StringSplitter.FlatComponents.splitAt`: the parts before `at` as a line,
 /// `skip` characters dropped, and the part it ends in restyled as `style`.
+#[allow(dead_code)]
 fn split_at(parts: &mut Vec<(Vec<char>, Span)>, at: usize, skip: usize, style: &Style) -> Text {
     let mut line = Vec::new();
     let mut push = |text: &[char], span: &Span| {
@@ -1480,6 +2294,52 @@ fn split_at(parts: &mut Vec<(Vec<char>, Span)>, at: usize, skip: usize, style: &
         }
         parts.remove(0);
         position -= size;
+    }
+    Text::from_spans(line)
+}
+/// `StringSplitter.FlatComponents.splitAt`: the parts before `(part_idx, byte_idx)` as a line,
+/// `skip_bytes` dropped, and the part it ends in restyled with `style_override` when set.
+fn split_at_formatted(
+    parts: &mut VecDeque<(&str, &Span, Option<Style>)>,
+    part_idx: usize,
+    byte_idx: usize,
+    skip_bytes: usize,
+    style_override: Option<Style>,
+) -> Text {
+    let mut line = Vec::new();
+    for _ in 0..part_idx {
+        if let Some((text, orig, current_style)) = parts.pop_front() {
+            let mut span = orig.with_text(text);
+            if let Some(st) = current_style {
+                span.style = st;
+            }
+            line.push(span);
+        }
+    }
+    let pop_front = if let Some((text, orig, current_style)) = parts.front_mut() {
+        let s = *text;
+        if byte_idx > 0 {
+            let mut span = orig.with_text(&s[..byte_idx]);
+            if let Some(st) = current_style.as_ref() {
+                span.style = st.clone();
+            }
+            line.push(span);
+        }
+        let rest_start = byte_idx + skip_bytes;
+        if rest_start >= s.len() {
+            true
+        } else {
+            *text = &s[rest_start..];
+            if style_override.is_some() {
+                *current_style = style_override;
+            }
+            false
+        }
+    } else {
+        false
+    };
+    if pop_front {
+        parts.pop_front();
     }
     Text::from_spans(line)
 }
@@ -2209,5 +3069,337 @@ mod tests {
         assert!(font.glyph('z').rect.is_none());
         font.begin_frame();
         assert_eq!(font.epoch(), epoch);
+    }
+
+    fn zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            archive
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn ascii_cache_text_width_and_line_splitting_match_legacy_and_multi_span_rules() {
+        let sheet = png(16, 8, |x, _| x < 2 || (8..14).contains(&x));
+        let default = br#"{"providers":[{"type":"space","advances":{" ":4}},{"type":"bitmap","file":"minecraft:font/a.png","ascent":7,"chars":["ab"]}]}"#;
+        let root = root(
+            "ascii-split",
+            &[
+                ("assets/minecraft/font/default.json", default),
+                ("assets/minecraft/textures/font/a.png", &sheet),
+            ],
+        );
+        let font = load(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        // 'a' advance = 3, 'b' advance = 7, ' ' advance = 4.
+        assert_eq!(font.width("a b"), 14.0);
+        assert_eq!(font.width("§lab"), 12.0);
+        assert_eq!(font.width("§la§rb"), 11.0);
+        assert_eq!(font.width("a§"), 3.0);
+        assert_eq!(font.fit("aba", 10.0), 2);
+        assert_eq!(font.fit_reverse("aba", 10.0), 2);
+        assert_eq!(font.fit("aba", 100.0), 3);
+        assert_eq!(font.fit_reverse("aba", 100.0), 3);
+        // split_lines over multiple spans with trailing newline and wrap flags.
+        let text = Text::literal("aa ")
+            .append(Text::literal("bb\n"))
+            .append(Text::literal("a\n"));
+        let lines = font.split_lines(&text, 10.0);
+        let summary: Vec<(String, bool)> = lines
+            .iter()
+            .map(|(line, wrapped)| (line.plain(), *wrapped))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("aa".into(), false),
+                ("b".into(), true),
+                ("b".into(), true),
+                ("a".into(), false),
+                ("".into(), false),
+            ]
+        );
+        // split_formatted carries legacy bold across line break inside the same part.
+        let formatted = Text::literal("§laa aa");
+        let split = font.split_formatted(&formatted, 8.0);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].plain(), "§laa");
+        assert_eq!(split[1].plain(), "aa");
+        assert!(split[1].spans[0].style.is_bold());
+    }
+
+    #[test]
+    fn off_atlas_large_bitmap_sheet_compresses_strips_and_round_trips_pixels() {
+        // 128x16 sheet (1 row of 16x16 cells = 8192 raw RGBA bytes -> LZ4-compressed strip).
+        let sheet = png(128, 16, |x, y| x < 12 && y < 12);
+        let default = br#"{"providers":[{"type":"bitmap","file":"pack:font/big.png","height":8,"ascent":7,"chars":["abcdefgh"]}]}"#;
+        let root = root(
+            "lz4-strip",
+            &[
+                ("assets/minecraft/font/default.json", default),
+                ("assets/pack/textures/font/big.png", &sheet),
+            ],
+        );
+        let font = load(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let a = font.glyph('a');
+        assert!(a.rect.is_some());
+        assert_eq!(a.advance, 7.0);
+        let patches = font.take_patches();
+        assert_eq!(patches.len(), 1);
+        assert_eq!((patches[0].width, patches[0].height), (16, 16));
+        // Top-left pixel opaque white, bottom-right transparent.
+        assert_eq!(&patches[0].rgba[0..4], &[255, 255, 255, 255]);
+        let last = patches[0].rgba.len() - 4;
+        assert_eq!(&patches[0].rgba[last..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn off_atlas_bitmap_chunks_avoid_repeated_full_row_decompression() {
+        use std::sync::atomic::Ordering;
+        // 512x64 row of eight 64x64 cells (16 KiB/cell > 8 KiB ceiling -> single-cell chunks):
+        // resolving all 8 cells cold and again after an atlas reset decodes each 16 KiB cell
+        // once per pass instead of expanding the entire 128 KiB row 8 times.
+        let large_sheet = png(512, 64, |x, y| (x % 64) <= (x / 64) && y < 8);
+        let large_def = br#"{"providers":[{"type":"bitmap","file":"pack:font/large.png","height":8,"ascent":7,"chars":["ABCDEFGH"]}]}"#;
+        let large_root = root(
+            "chunk-large",
+            &[
+                ("assets/minecraft/font/default.json", large_def),
+                ("assets/pack/textures/font/large.png", &large_sheet),
+            ],
+        );
+        let font = Font::load(
+            &ResourceSource::directory(large_root.clone()),
+            &HashMap::new(),
+            &[],
+            (1024, 1024),
+            (0, 1024),
+            white(),
+        );
+        let _ = std::fs::remove_dir_all(&large_root);
+        for c in 'A'..='H' {
+            assert!(font.glyph(c).rect.is_some());
+        }
+        let patches = font.take_patches();
+        assert_eq!(patches.len(), 8);
+        for (i, patch) in patches.iter().enumerate() {
+            assert_eq!((patch.width, patch.height), (64, 64));
+            assert_eq!(&patch.rgba[i * 4..(i + 1) * 4], &[255, 255, 255, 255]);
+            assert_eq!(&patch.rgba[(i + 1) * 4..(i + 2) * 4], &[0, 0, 0, 0]);
+        }
+        {
+            let cache = font.cache.borrow();
+            assert!(cache.strips.entries.is_empty());
+            let Provider::Bitmap(_, glyphs) = &cache.sets[0].1.providers[0] else {
+                panic!("expected bitmap provider");
+            };
+            for c in 'A'..='H' {
+                let BitmapGlyph::Sheet(cell) = &glyphs[&c] else {
+                    panic!("expected off-atlas sheet cell");
+                };
+                assert_eq!(cell.sheet.stride, 64);
+                assert!(!cell.sheet.cacheable);
+                assert!(matches!(
+                    cell.sheet.pixels,
+                    StripPixels::Lz4 { len: 16384, .. }
+                ));
+                assert_eq!(cell.sheet.decompressions.load(Ordering::Relaxed), 1);
+            }
+        }
+        font.reset_cache();
+        for c in 'A'..='H' {
+            assert!(font.glyph(c).rect.is_some());
+        }
+        assert_eq!(font.take_patches().len(), 8);
+        {
+            let cache = font.cache.borrow();
+            let Provider::Bitmap(_, glyphs) = &cache.sets[0].1.providers[0] else {
+                panic!("expected bitmap provider");
+            };
+            for c in 'A'..='H' {
+                let BitmapGlyph::Sheet(cell) = &glyphs[&c] else {
+                    panic!("expected off-atlas sheet cell");
+                };
+                assert_eq!(cell.sheet.decompressions.load(Ordering::Relaxed), 2);
+            }
+        }
+
+        // 128x16 row of eight 16x16 cells (8 KiB total -> one cacheable 8-cell chunk):
+        // resolving all 8 cells cold and after reset decompresses the strip once via StripCache.
+        let small_sheet = png(128, 16, |x, y| (x % 16) <= (x / 16) && y < 8);
+        let small_def = br#"{"providers":[{"type":"bitmap","file":"pack:font/small.png","height":8,"ascent":7,"chars":["abcdefgh"]}]}"#;
+        let small_root = root(
+            "chunk-small",
+            &[
+                ("assets/minecraft/font/default.json", small_def),
+                ("assets/pack/textures/font/small.png", &small_sheet),
+            ],
+        );
+        let small_font = load(&small_root);
+        let _ = std::fs::remove_dir_all(&small_root);
+        for c in 'a'..='h' {
+            assert!(small_font.glyph(c).rect.is_some());
+        }
+        let patches = small_font.take_patches();
+        assert_eq!(patches.len(), 8);
+        assert_eq!(&patches[7].rgba[7 * 4..8 * 4], &[255, 255, 255, 255]);
+        assert_eq!(&patches[7].rgba[8 * 4..9 * 4], &[0, 0, 0, 0]);
+        small_font.reset_cache();
+        for c in 'a'..='h' {
+            assert!(small_font.glyph(c).rect.is_some());
+        }
+        assert_eq!(small_font.take_patches().len(), 8);
+        let cache = small_font.cache.borrow();
+        let Provider::Bitmap(_, glyphs) = &cache.sets[0].1.providers[0] else {
+            panic!("expected bitmap provider");
+        };
+        let BitmapGlyph::Sheet(cell_a) = &glyphs[&'a'] else {
+            panic!("expected sheet cell for 'a'");
+        };
+        let BitmapGlyph::Sheet(cell_h) = &glyphs[&'h'] else {
+            panic!("expected sheet cell for 'h'");
+        };
+        assert!(Arc::ptr_eq(&cell_a.sheet, &cell_h.sheet));
+        assert!(cell_a.sheet.cacheable);
+        assert_eq!(cell_a.sheet.decompressions.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unihex_duplicate_width_change_compacts_dead_row_bytes() {
+        let hex = format!(
+            "0041:{}\n0042:{}\n0043:{}\n0041:{}\n0042:{}\n0043:{}\n",
+            "80".repeat(16),
+            "8001".repeat(16),
+            "FF".repeat(16),
+            "7FFE".repeat(16),
+            "3C".repeat(16),
+            "18".repeat(16),
+        );
+        let archive = zip_with(&[("glyphs.hex", hex.as_bytes())]);
+        let root = root("unihex-compact", &[("assets/pack/dups.zip", &archive)]);
+        let source = ResourceSource::directory(root.clone());
+        let key = UnihexKey {
+            path: Some("assets/pack/dups.zip".into()),
+            overrides: Vec::new(),
+        };
+        let table = load_hex(&source, &key);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(table.entries.len(), 3);
+        // Winning widths: 0x41 -> 32 B (16-wide), 0x42 -> 16 B (8-wide), 0x43 -> 16 B (8-wide).
+        assert_eq!(table.rows.len(), 64);
+        let g41 = table.get(0x41).unwrap();
+        assert_eq!((g41.left, g41.right), (1, 14));
+        assert_eq!(g41.rows[0], 0x7FFE_0000);
+        let g42 = table.get(0x42).unwrap();
+        assert_eq!((g42.left, g42.right), (2, 5));
+        assert_eq!(g42.rows[0], 0x3C00_0000);
+        let g43 = table.get(0x43).unwrap();
+        assert_eq!((g43.left, g43.right), (3, 4));
+        assert_eq!(g43.rows[0], 0x1800_0000);
+    }
+
+    #[test]
+    fn load_over_retains_unihex_archives_without_zip_extension() {
+        let zip_a = zip_with(&[(
+            "glyphs.hex",
+            format!("0041:{}\n", "FF".repeat(16)).as_bytes(),
+        )]);
+        let zip_b = zip_with(&[(
+            "glyphs.hex",
+            format!("0042:{}\n", "F0".repeat(16)).as_bytes(),
+        )]);
+        let defaults_root = root(
+            "load-over-defaults",
+            &[
+                (
+                    "assets/minecraft/font/default.json",
+                    br#"{"providers":[{"type":"space","advances":{"A":11}}]}"#,
+                ),
+                (
+                    "assets/minecraft/font/only_default.json",
+                    br#"{"providers":[{"type":"space","advances":{"A":9}}]}"#,
+                ),
+                ("assets/pack/default_glyphs.dat", &zip_b),
+            ],
+        );
+        let overlay_root = root(
+            "load-over-overlay",
+            &[
+                (
+                    "assets/minecraft/font/default.json",
+                    br#"{"providers":[{"type":"unihex","hex_file":"pack:glyphs.bin"}]}"#,
+                ),
+                (
+                    "assets/minecraft/font/from_default.json",
+                    br#"{"providers":[{"type":"unihex","hex_file":"pack:default_glyphs.dat"}]}"#,
+                ),
+                ("assets/pack/glyphs.bin", &zip_a),
+            ],
+        );
+        let font = Font::load_over(
+            &ResourceSource::directory(overlay_root.clone()),
+            &ResourceSource::directory(defaults_root.clone()),
+            &HashMap::new(),
+            &[],
+            (256, 256),
+            (0, 256),
+            white(),
+        );
+        assert_eq!(font.glyph('A').advance, 5.0);
+        assert_eq!(font.glyph_in("minecraft:from_default", 'B').advance, 3.0);
+        // Default font JSON definitions stay excluded when an overlay is active.
+        assert_eq!(font.glyph_in("minecraft:only_default", 'A').advance, 6.0);
+        let _ = std::fs::remove_dir_all(&defaults_root);
+        let _ = std::fs::remove_dir_all(&overlay_root);
+    }
+
+    #[test]
+    fn unihex_cache_shares_table_across_different_provider_filters() {
+        let archive = zip_with(&[(
+            "glyphs.hex",
+            format!("0041:{}\n", "FF".repeat(16)).as_bytes(),
+        )]);
+        let default = br#"{"providers":[
+            {"type":"unihex","hex_file":"pack:font/unihex.zip","size_overrides":[{"from":"A","to":"A","left":0,"right":3}],"filter":{"uniform":false}},
+            {"type":"unihex","hex_file":"pack:font/unihex.zip","size_overrides":[{"from":"A","to":"A","left":0,"right":3}],"filter":{"uniform":true}}
+        ]}"#;
+        let other = br#"{"providers":[
+            {"type":"unihex","hex_file":"pack:font/unihex.zip","size_overrides":[{"from":"A","to":"A","left":0,"right":5}]}
+        ]}"#;
+        let root = root(
+            "unihex-filter-share",
+            &[
+                ("assets/minecraft/font/default.json", default),
+                ("assets/minecraft/font/other.json", other),
+                ("assets/pack/font/unihex.zip", &archive),
+            ],
+        );
+        let mut font = load(&root);
+        assert_eq!(font.glyph('A').advance, 3.0);
+        font.uniform = true;
+        font.reset_cache();
+        assert_eq!(font.glyph('A').advance, 3.0);
+        {
+            let cache = font.cache.borrow();
+            assert_eq!(cache.unihex.len(), 1);
+            let default_set = &cache.sets[font.default_set.unwrap()].1;
+            let [
+                Provider::Unihex(_, _, Some(a)),
+                Provider::Unihex(_, _, Some(b)),
+            ] = &default_set.providers[..]
+            else {
+                panic!("expected two loaded unihex providers");
+            };
+            assert!(Arc::ptr_eq(a, b));
+        }
+        assert_eq!(font.glyph_in("minecraft:other", 'A').advance, 4.0);
+        assert_eq!(font.cache.borrow().unihex.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
