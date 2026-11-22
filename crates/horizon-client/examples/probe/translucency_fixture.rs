@@ -23,18 +23,21 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     for line in fs::read_to_string(input)?.lines() {
         let case: Case = serde_json::from_str(line)?;
         let centers: Vec<_> = case.quads.iter().map(|q| quad_center(q[0], q[2])).collect();
-        let mut state = SortState::new(centers.clone());
+        let mut state = SortState::from_quads(&case.quads, |&p| p);
         let mut sorter = Sorter::default();
-        let mut cache_sorter = Sorter::default();
+        let mut last_indices = Vec::new();
         let frames: Vec<_> = case
             .cameras
             .iter()
             .map(|&camera| {
-                let update = state
-                    .update(camera, case.origin, &mut cache_sorter)
-                    .is_some();
-                let local = std::array::from_fn(|i| (camera[i] - f64::from(case.origin[i])) as f32);
-                json!({"indices": sorter.sort(&centers, local), "update": update})
+                let update = if let Some(indices) = state.update(camera, case.origin, &mut sorter) {
+                    last_indices.clear();
+                    last_indices.extend_from_slice(indices);
+                    true
+                } else {
+                    false
+                };
+                json!({"indices": &last_indices, "update": update})
             })
             .collect();
         let bits: Vec<_> = centers

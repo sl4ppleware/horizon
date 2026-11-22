@@ -5768,14 +5768,9 @@ impl Renderer {
                 Sides::unsorted(solid)
             },
             translucent,
-            sort: translucency::SortState::new(
-                mesh.translucent
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|q| translucency::quad_center(q[0].pos, q[2].pos))
-                    .collect(),
-            ),
+            sort: translucency::SortState::from_quads(mesh.translucent.as_chunks::<4>().0, |v| {
+                v.pos
+            }),
             sorted_indices,
             flat_id,
             gpu_id: None,
