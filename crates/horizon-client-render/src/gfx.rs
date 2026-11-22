@@ -1839,6 +1839,9 @@ pub struct Renderer {
     lod_leaving: Vec<(SectionKey, std::time::Instant)>,
     /// Finished tile meshes `upload_lods` has yet to upload.
     lod_pending: Option<lod::Pending>,
+    /// Tracks dying, stand-in, and unshown far tiles so calm frames
+    /// (`upload_lods`) avoid scanning `lods`.
+    lod_tracker: lod::LodTracker,
     detail_columns: FxHashMap<(i32, i32), SectionMask>,
     /// Bumped whenever a column becomes or stops being complete.
     detail_revision: u64,
@@ -4798,6 +4801,7 @@ impl Renderer {
             lod_retiring: Default::default(),
             lod_leaving: Vec::new(),
             lod_pending: None,
+            lod_tracker: lod::LodTracker::default(),
             detail_columns: Default::default(),
             detail_revision: 0,
             upload_retries: UploadRetries::default(),
@@ -6185,6 +6189,7 @@ impl Renderer {
         self.lod_retiring.clear();
         self.lod_leaving.clear();
         self.lod_pending = None;
+        self.lod_tracker.clear();
         self.detail_columns.clear();
         self.detail_revision += 1;
         self.upload_retries.clear();
