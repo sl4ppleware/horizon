@@ -239,6 +239,7 @@ impl LightTables {
         tables
     }
     /// `LightEngine.shapeOccludes(from, to, direction)`.
+    #[cfg(test)]
     #[inline]
     fn blocked(&self, from: usize, to: usize, direction: usize) -> bool {
         let (a, b) = (&self.cells[from], &self.cells[to]);
@@ -255,6 +256,7 @@ impl LightTables {
         self.block_masks[(a >> 4) as usize * self.types + (b >> 4) as usize] & (1 << direction) != 0
     }
     /// `ChunkSkyLightSources.isEdgeOccluded(top, bottom)`.
+    #[cfg(test)]
     #[inline]
     fn edge_occluded(&self, top: usize, bottom: usize) -> bool {
         self.cells[bottom].dampening != 0 || self.blocked(top, bottom, Direction::Down as usize)
@@ -328,23 +330,26 @@ impl LightTables {
         cells
     }
 }
-// Direction index order matches `Direction` (down, up, north, south, west, east);
-// `d ^ 1` is the opposite direction.
-const OFFSETS: [(i32, i32, i32); 6] = [
-    (0, -1, 0),
-    (0, 1, 0),
-    (0, 0, -1),
-    (0, 0, 1),
-    (-1, 0, 0),
-    (1, 0, 0),
-];
+// Bit-packed BFS coordinates for `light_chunk`: y in bits 12..32, z in bits 6..12, x in bits 0..6.
+// Avoids non-power-of-two divisions/modulos (/ 2304, % 2304, / 48, % 48) in `spread`.
+const Y_SHIFT: u32 = 12;
+const Z_SHIFT: u32 = 6;
+const Y_STEP: u32 = 1 << Y_SHIFT;
+const Z_STEP: u32 = 1 << Z_SHIFT;
+const X_STEP: u32 = 1;
+
+#[inline(always)]
+const fn pack_pos(x: usize, y: usize, z: usize) -> u32 {
+    ((y as u32) << Y_SHIFT) | ((z as u32) << Z_SHIFT) | (x as u32)
+}
 
 struct LightScratch {
     states: Vec<u16>,
     sky: Vec<u8>,
     block: Vec<u8>,
-    queue: Vec<u32>,
-    sky_queue: Vec<u32>,
+    /// 14 descending level buckets (index `level - 2` for `level` in `2..=15`), reused across
+    /// the independent block-light and sky-light passes.
+    buckets: [Vec<u32>; 14],
     present: Vec<bool>,
     lowest: Vec<i32>,
     /// What `states_of` keeps between sections.
@@ -357,24 +362,21 @@ impl LightScratch {
             states: Vec::new(),
             sky: Vec::new(),
             block: Vec::new(),
-            queue: Vec::new(),
-            sky_queue: Vec::new(),
+            buckets: std::array::from_fn(|_| Vec::new()),
             present: vec![false; W * W],
             lowest: vec![0; W * W],
             section: SectionScratch::new(),
         }
     }
 
-    /// Clear queues and shrink them if capacity exceeds the retention cap.
+    /// Clear buckets and shrink any bucket whose capacity exceeds the retention cap.
     fn clear_queues(&mut self) {
-        const MAX_QUEUE_CAPACITY: usize = 65_536;
-        self.queue.clear();
-        if self.queue.capacity() > MAX_QUEUE_CAPACITY {
-            self.queue.shrink_to(MAX_QUEUE_CAPACITY);
-        }
-        self.sky_queue.clear();
-        if self.sky_queue.capacity() > MAX_QUEUE_CAPACITY {
-            self.sky_queue.shrink_to(MAX_QUEUE_CAPACITY);
+        const MAX_BUCKET_CAPACITY: usize = 8_192;
+        for bucket in &mut self.buckets {
+            bucket.clear();
+            if bucket.capacity() > MAX_BUCKET_CAPACITY {
+                bucket.shrink_to(MAX_BUCKET_CAPACITY);
+            }
         }
     }
 }
@@ -440,31 +442,65 @@ pub fn release_scratch() {
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     drop(pool);
+    let _ = RELIGHT_SCRATCH.try_with(|cell| {
+        if let Ok(mut scratch) = cell.try_borrow_mut() {
+            *scratch = RelightScratch::new();
+        }
+    });
 }
 
 thread_local! {
     static RELIGHT_SCRATCH: RefCell<RelightScratch> = RefCell::new(RelightScratch::new());
 }
 
-struct RelightScratch {
+struct RegionScratch {
+    slots: Vec<Slot>,
+    index: FxHashMap<Pos, u32>,
+}
+
+impl RegionScratch {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            index: FxHashMap::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        const MAX_SLOTS_CAPACITY: usize = 256;
+        const MAX_INDEX_CAPACITY: usize = 512;
+        self.slots.clear();
+        if self.slots.capacity() > MAX_SLOTS_CAPACITY {
+            self.slots.shrink_to(MAX_SLOTS_CAPACITY);
+        }
+        self.index.clear();
+        if self.index.capacity() > MAX_INDEX_CAPACITY {
+            self.index.shrink_to(MAX_INDEX_CAPACITY);
+        }
+    }
+}
+
+struct RelightQueues {
     decrease: VecDeque<(Pos, u8)>,
     cleared: Vec<Pos>,
-    increase: VecDeque<Pos>,
+    /// 14 descending level buckets (index `level - 2` for `level` in `2..=15`).
+    increase: [Vec<Pos>; 14],
     sources: FxHashMap<(i32, i32), i32>,
 }
 
-impl RelightScratch {
+impl RelightQueues {
     fn new() -> Self {
         Self {
             decrease: VecDeque::new(),
             cleared: Vec::new(),
-            increase: VecDeque::new(),
+            increase: std::array::from_fn(|_| Vec::new()),
             sources: FxHashMap::default(),
         }
     }
 
     fn clear(&mut self) {
         const MAX_CAPACITY: usize = 16_384;
+        const MAX_BUCKET_CAPACITY: usize = 4_096;
         self.decrease.clear();
         if self.decrease.capacity() > MAX_CAPACITY {
             self.decrease.shrink_to(MAX_CAPACITY);
@@ -473,13 +509,41 @@ impl RelightScratch {
         if self.cleared.capacity() > MAX_CAPACITY {
             self.cleared.shrink_to(MAX_CAPACITY);
         }
-        self.increase.clear();
-        if self.increase.capacity() > MAX_CAPACITY {
-            self.increase.shrink_to(MAX_CAPACITY);
+        for bucket in &mut self.increase {
+            bucket.clear();
+            if bucket.capacity() > MAX_BUCKET_CAPACITY {
+                bucket.shrink_to(MAX_BUCKET_CAPACITY);
+            }
         }
         self.sources.clear();
         if self.sources.capacity() > MAX_CAPACITY {
             self.sources.shrink_to(MAX_CAPACITY);
+        }
+    }
+}
+
+struct RelightScratch {
+    region: RegionScratch,
+    queues: RelightQueues,
+    sky_seeds: Vec<Pos>,
+}
+
+impl RelightScratch {
+    fn new() -> Self {
+        Self {
+            region: RegionScratch::new(),
+            queues: RelightQueues::new(),
+            sky_seeds: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        const MAX_CAPACITY: usize = 16_384;
+        self.region.clear();
+        self.queues.clear();
+        self.sky_seeds.clear();
+        if self.sky_seeds.capacity() > MAX_CAPACITY {
+            self.sky_seeds.shrink_to(MAX_CAPACITY);
         }
     }
 }
@@ -513,7 +577,7 @@ impl At<'_> {
 }
 
 /// Copy one section's block states into the region's `states` as the packed
-/// light info `light_chunk` floods over, and seed `queue` (and `block`) with
+/// light info `light_chunk` floods over, and seed `buckets` (and `block`) with
 /// the cells that emit light. The values are mapped to that info in one pass
 /// over the section's packed storage into `stage` (index order), then copied a
 /// row of 16 along x at a time: the region's rows are 48 apart, so the two
@@ -524,7 +588,7 @@ fn states_of(
     at: At,
     states: &mut [u16],
     block: &mut [u8],
-    queue: &mut Vec<u32>,
+    buckets: &mut [Vec<u32>; 14],
     scratch: &mut SectionScratch,
 ) {
     if section.blocks.bits() == 0 {
@@ -533,12 +597,17 @@ fn states_of(
         let info = tables.info[section.blocks.get(0) as usize];
         for ly in 0..16 {
             let mut p = at.row(ly << 4);
+            let y = at.y + ly;
             for lz in 0..16 {
+                let z = at.z + lz;
                 states[p..p + 16].fill(info as u16);
                 if info > 0xFFFF {
                     for x in 0..16 {
-                        block[p + x] = at.emission(info, ly << 8 | lz << 4 | x);
-                        queue.push((p + x) as u32);
+                        let em = at.emission(info, ly << 8 | lz << 4 | x).min(15);
+                        block[p + x] = em;
+                        if em > 1 {
+                            buckets[(em - 2) as usize].push(pack_pos(at.x + x, y, z));
+                        }
                     }
                 }
                 p += W;
@@ -571,14 +640,19 @@ fn states_of(
             .unpack_ids_mapped(&mut scratch.stage32[..], info);
         for ly in 0..16 {
             let mut p = at.row(ly << 4);
+            let y = at.y + ly;
             for lz in 0..16 {
+                let z = at.z + lz;
                 let i = (ly << 8) | (lz << 4);
                 for x in 0..16 {
                     let info = scratch.stage32[i + x];
                     states[p + x] = info as u16;
                     if info > 0xFFFF {
-                        block[p + x] = at.emission(info, i + x);
-                        queue.push((p + x) as u32);
+                        let em = at.emission(info, i + x).min(15);
+                        block[p + x] = em;
+                        if em > 1 {
+                            buckets[(em - 2) as usize].push(pack_pos(at.x + x, y, z));
+                        }
                     }
                 }
                 p += W;
@@ -619,20 +693,32 @@ fn light_chunk_with_scratch(
     scratch: &mut LightScratch,
 ) -> Vec<Light> {
     let sections = region[1][1].expect("centre chunk").sections.len();
-    // Highest occupied section in the region bounds the work.
+    // Highest occupied section per chunk bounds both block unpack and sky raycast.
+    let mut chunk_top = [0usize; 9];
     let mut top_section = 0;
-    for chunk in region.iter().flatten().flatten() {
-        for (i, s) in chunk.sections.iter().enumerate().rev() {
-            if !s.is_uniform(0) {
-                top_section = top_section.max(i + 1);
-                break;
+    let mut all_present = true;
+    for (dz, row) in region.iter().enumerate() {
+        for (dx, chunk) in row.iter().enumerate() {
+            let Some(chunk) = chunk else {
+                all_present = false;
+                continue;
+            };
+            let mut ct = 0;
+            for (i, s) in chunk.sections.iter().enumerate().rev() {
+                if !s.is_uniform(0) {
+                    ct = i + 1;
+                    break;
+                }
             }
+            chunk_top[dz * 3 + dx] = ct;
+            top_section = top_section.max(ct);
         }
     }
     // One extra section above the highest occupied one: block light rises
     // up to 14 blocks into it (sky light there is always 15).
     let h = ((top_section + 1) * 16).min(sections * 16);
     let total = W * W * h;
+    debug_assert!(h <= (1 << (32 - Y_SHIFT)));
 
     scratch.states.clear();
     scratch.states.resize(total, 0);
@@ -642,29 +728,30 @@ fn light_chunk_with_scratch(
     scratch.block.resize(total, 0);
     scratch.clear_queues();
 
-    let states = &mut scratch.states[..total];
-    let sky = &mut scratch.sky[..total];
-    let block = &mut scratch.block[..total];
-    let queue = &mut scratch.queue;
-    let sky_queue = &mut scratch.sky_queue;
-    let section_scratch = &mut scratch.section;
+    {
+        let states = &mut scratch.states[..total];
+        let block = &mut scratch.block[..total];
+        let buckets = &mut scratch.buckets;
+        let section_scratch = &mut scratch.section;
 
-    for (dz, row) in region.iter().enumerate() {
-        let z_base = dz * 16;
-        for (dx, chunk) in row.iter().enumerate() {
-            let Some(chunk) = chunk else { continue };
-            let x_base = dx * 16;
-            for (si, section) in chunk.sections.iter().enumerate().take(top_section) {
-                if section.is_uniform(0) {
-                    continue;
+        for (dz, row) in region.iter().enumerate() {
+            let z_base = dz * 16;
+            for (dx, chunk) in row.iter().enumerate() {
+                let Some(chunk) = chunk else { continue };
+                let x_base = dx * 16;
+                let ct = chunk_top[dz * 3 + dx];
+                for (si, section) in chunk.sections.iter().enumerate().take(ct) {
+                    if section.is_uniform(0) {
+                        continue;
+                    }
+                    let at = At {
+                        x: x_base,
+                        y: si * 16,
+                        z: z_base,
+                        dynamic: &chunk.dynamic_emission,
+                    };
+                    states_of(section, tables, at, states, block, buckets, section_scratch);
                 }
-                let at = At {
-                    x: x_base,
-                    y: si * 16,
-                    z: z_base,
-                    dynamic: &chunk.dynamic_emission,
-                };
-                states_of(section, tables, at, states, block, queue, section_scratch);
             }
         }
     }
@@ -676,157 +763,197 @@ fn light_chunk_with_scratch(
             scratch.present[z * W + x] = region[z / 16][x / 16].is_some();
         }
     }
+
+    let states = &scratch.states[..total];
+    let sky = &mut scratch.sky[..total];
+    let block = &mut scratch.block[..total];
+    let buckets = &mut scratch.buckets;
     let present = &scratch.present[..W * W];
-
-    // Bit-packed BFS coordinates: y in bits 12..32, z in bits 6..12, x in bits 0..6.
-    // Avoids non-power-of-two divisions/modulos (/ 2304, % 2304, / 48, % 48) in `spread`.
-    const Y_SHIFT: u32 = 12;
-    const Z_SHIFT: u32 = 6;
-    const Y_STEP: u32 = 1 << Y_SHIFT;
-    const Z_STEP: u32 = 1 << Z_SHIFT;
-    const X_STEP: u32 = 1;
-    debug_assert!(h <= (1 << (32 - Y_SHIFT)));
-    let pack_pos = |x: usize, y: usize, z: usize| -> u32 {
-        ((y as u32) << Y_SHIFT) | ((z as u32) << Z_SHIFT) | (x as u32)
-    };
-
-    if sky_light {
-        scratch.lowest.resize(W * W, h as i32);
-        let lowest = &mut scratch.lowest[..W * W];
-
-        for z in 0..W {
-            for x in 0..W {
-                let col = z * W + x;
-                if !present[col] {
-                    lowest[col] = h as i32;
-                    continue;
-                }
-                // The top layer (above the occupied range) is always open sky.
-                let mut y = h as i32 - 1;
-                let mut p = (h - 1) * (W * W) + col;
-                sky[p] = 15;
-                while y > 0 {
-                    let next_p = p - (W * W);
-                    if tables.packed_edge_occluded(states[p], states[next_p]) {
-                        break;
-                    }
-                    y -= 1;
-                    p = next_p;
-                    sky[p] = 15;
-                }
-                lowest[col] = y;
-            }
-        }
-
-        for z in 0..W {
-            for x in 0..W {
-                let col = z * W + x;
-                if !present[col] {
-                    continue;
-                }
-                let own = lowest[col];
-                let mut deepest = own;
-                for (nx, nz) in [
-                    (x.wrapping_sub(1), z),
-                    (x + 1, z),
-                    (x, z.wrapping_sub(1)),
-                    (x, z + 1),
-                ] {
-                    if nx < W && nz < W && present[nz * W + nx] {
-                        deepest = deepest.max(lowest[nz * W + nx]);
-                    }
-                }
-                // Seed propagation from the source cells that border darker cells.
-                let from = own.max(0) as usize;
-                let to = (deepest as usize).min(h.saturating_sub(1));
-                if from <= to {
-                    let mut p = from * (W * W) + col;
-                    for y in from..=to {
-                        if sky[p] == 15 {
-                            sky_queue.push(pack_pos(x, y, z));
-                        }
-                        p += W * W;
-                    }
-                }
-            }
-        }
-    }
-
-    for entry in queue.iter_mut() {
-        let p = *entry as usize;
-        let y = p / (W * W);
-        let col = p % (W * W);
-        let z = col / W;
-        let x = col % W;
-        *entry = pack_pos(x, y, z);
-    }
-
     let block_masks = &tables.block_masks;
     let types = tables.types;
 
-    let spread = |light: &mut [u8], queue: &mut Vec<u32>| {
-        let mut head = 0;
-        while head < queue.len() {
-            let entry = queue[head];
-            head += 1;
-            let x = (entry & 63) as usize;
-            let z = ((entry >> Z_SHIFT) & 63) as usize;
-            let y = (entry >> Y_SHIFT) as usize;
-            let col = z * W + x;
-            let p = y * (W * W) + col;
-            let level = light[p];
-            if level <= 1 {
-                continue;
-            }
+    // 14-bucket descending BFS (levels 15 down to 2): every cell is expanded
+    // at most once at its final light level, eliminating FIFO re-visits.
+    let spread = |light: &mut [u8], buckets: &mut [Vec<u32>; 14]| {
+        for b in (0..14).rev() {
+            let level = (b + 2) as u8;
             let min_threshold = level - 1;
-            let from = states[p];
-            let from_row = (from >> 4) as usize * types;
+            let (lower, rest) = buckets.split_at_mut(b);
+            for &entry in &rest[0] {
+                let x = (entry & 63) as usize;
+                let z = ((entry >> Z_SHIFT) & 63) as usize;
+                let y = (entry >> Y_SHIFT) as usize;
+                let col = z * W + x;
+                let p = y * (W * W) + col;
+                if light[p] != level {
+                    continue;
+                }
+                let from = states[p];
+                let from_row = (from >> 4) as usize * types;
 
-            // Neighbours by linear offset; `present` only depends on the
-            // column, and the axis bounds rule out wrapping.
-            macro_rules! step_neighbour {
-                ($d:expr, $q:expr, $next_entry:expr) => {{
-                    let q = $q;
-                    let cur = light[q];
-                    if cur < min_threshold {
-                        let to = states[q];
-                        let damp = (to & 0xF).max(1) as u8;
-                        if level > cur + damp {
-                            let new_level = level - damp;
-                            if (from | to) < 16
-                                || block_masks[from_row + (to >> 4) as usize] & (1 << $d) == 0
-                            {
-                                light[q] = new_level;
-                                if new_level > 1 {
-                                    queue.push($next_entry);
+                // Neighbours by linear offset; `present` only depends on the
+                // column, and the axis bounds rule out wrapping.
+                macro_rules! step_neighbour {
+                    ($d:expr, $q:expr, $next_entry:expr) => {{
+                        let q = $q;
+                        let cur = light[q];
+                        if cur < min_threshold {
+                            let to = states[q];
+                            let damp = (to & 0xF).max(1) as u8;
+                            if level > cur + damp {
+                                let new_level = level - damp;
+                                if (from | to) < 16
+                                    || block_masks[from_row + (to >> 4) as usize] & (1 << $d) == 0
+                                {
+                                    light[q] = new_level;
+                                    if new_level > 1 {
+                                        lower[(new_level - 2) as usize].push($next_entry);
+                                    }
+                                }
+                            }
+                        }
+                    }};
+                }
+                if y > 0 {
+                    step_neighbour!(0, p - W * W, entry - Y_STEP);
+                }
+                if y + 1 < h {
+                    step_neighbour!(1, p + W * W, entry + Y_STEP);
+                }
+                if z > 0 && present[col - W] {
+                    step_neighbour!(2, p - W, entry - Z_STEP);
+                }
+                if z + 1 < W && present[col + W] {
+                    step_neighbour!(3, p + W, entry + Z_STEP);
+                }
+                if x > 0 && present[col - 1] {
+                    step_neighbour!(4, p - 1, entry - X_STEP);
+                }
+                if x + 1 < W && present[col + 1] {
+                    step_neighbour!(5, p + 1, entry + X_STEP);
+                }
+            }
+            rest[0].clear();
+        }
+    };
+
+    if buckets.iter().any(|b| !b.is_empty()) {
+        spread(block, buckets);
+    }
+
+    if sky_light && h > 0 {
+        scratch.lowest.resize(W * W, h as i32);
+        let lowest = &mut scratch.lowest[..W * W];
+        let mut max_lowest = 0usize;
+        let top_y = (top_section * 16).min(h - 1);
+        if all_present {
+            sky[top_y * (W * W)..h * (W * W)].fill(15);
+        }
+        for (dz, row) in region.iter().enumerate() {
+            let z_base = dz * 16;
+            for (dx, chunk) in row.iter().enumerate() {
+                let x_base = dx * 16;
+                if chunk.is_none() {
+                    for lz in 0..16 {
+                        let start = (z_base + lz) * W + x_base;
+                        lowest[start..start + 16].fill(h as i32);
+                    }
+                    continue;
+                }
+                // Above `chunk_top[c] * 16` every block in this chunk is uniform air
+                // (`states == 0`), so sky passes unoccluded down to `start_y` (keeping the
+                // boundary check against `start_y - 1` for upward-occluding top-of-section blocks).
+                let start_y = (chunk_top[dz * 3 + dx] * 16).min(h - 1);
+                let fill_end = if all_present { top_y } else { h };
+                for y in start_y..fill_end {
+                    let y_off = y * (W * W);
+                    for lz in 0..16 {
+                        let row_start = y_off + (z_base + lz) * W + x_base;
+                        sky[row_start..row_start + 16].fill(15);
+                    }
+                }
+                if start_y == 0 {
+                    for lz in 0..16 {
+                        let start = (z_base + lz) * W + x_base;
+                        lowest[start..start + 16].fill(0);
+                    }
+                } else {
+                    for lz in 0..16 {
+                        let z = z_base + lz;
+                        for lx in 0..16 {
+                            let x = x_base + lx;
+                            let col = z * W + x;
+                            let mut y = start_y;
+                            let mut p = start_y * (W * W) + col;
+                            while y > 0 {
+                                let next_p = p - (W * W);
+                                if tables.packed_edge_occluded(states[p], states[next_p]) {
+                                    break;
+                                }
+                                y -= 1;
+                                p = next_p;
+                                sky[p] = 15;
+                            }
+                            lowest[col] = y as i32;
+                            max_lowest = max_lowest.max(y);
+                        }
+                    }
+                }
+            }
+        }
+
+        if max_lowest > 0 {
+            {
+                let sky_top = &mut buckets[13];
+                for z in 0..W {
+                    for x in 0..W {
+                        let col = z * W + x;
+                        if !present[col] {
+                            continue;
+                        }
+                        let own = lowest[col] as usize;
+                        let mut deepest = own;
+                        if x > 0 && present[col - 1] {
+                            deepest = deepest.max(lowest[col - 1] as usize);
+                        }
+                        if x + 1 < W && present[col + 1] {
+                            deepest = deepest.max(lowest[col + 1] as usize);
+                        }
+                        if z > 0 && present[col - W] {
+                            deepest = deepest.max(lowest[col - W] as usize);
+                        }
+                        if z + 1 < W && present[col + W] {
+                            deepest = deepest.max(lowest[col + W] as usize);
+                        }
+                        // Seed propagation from source cells that border darker cells.
+                        if deepest > own {
+                            let end = deepest.min(h);
+                            for y in own..end {
+                                sky_top.push(pack_pos(x, y, z));
+                            }
+                        } else if own > 0 {
+                            // Flat column: can only propagate straight down if the block below
+                            // accepts light (dampening < 15 and unblocked downward face).
+                            let p = own * (W * W) + col;
+                            let below = states[p - (W * W)];
+                            if (below & 0xF) < 15 {
+                                let from = states[p];
+                                if (from | below) < 16
+                                    || !tables.packed_blocked(from, below, Direction::Down as usize)
+                                {
+                                    sky_top.push(pack_pos(x, own, z));
                                 }
                             }
                         }
                     }
-                }};
+                }
             }
-            if y > 0 {
-                step_neighbour!(0, p - W * W, entry - Y_STEP);
-            }
-            if y + 1 < h {
-                step_neighbour!(1, p + W * W, entry + Y_STEP);
-            }
-            if z > 0 && present[col - W] {
-                step_neighbour!(2, p - W, entry - Z_STEP);
-            }
-            if z + 1 < W && present[col + W] {
-                step_neighbour!(3, p + W, entry + Z_STEP);
-            }
-            if x > 0 && present[col - 1] {
-                step_neighbour!(4, p - 1, entry - X_STEP);
-            }
-            if x + 1 < W && present[col + 1] {
-                step_neighbour!(5, p + 1, entry + X_STEP);
+            if !buckets[13].is_empty() {
+                spread(sky, buckets);
             }
         }
-    };
-    spread(sky, sky_queue);
-    spread(block, queue);
+    }
+
     let result = pack_lighting(sections, h, sky, block, sky_light);
     scratch.clear_queues();
     result
@@ -924,6 +1051,26 @@ fn nibble(layer: &[u8], i: usize) -> u8 {
     (layer[i >> 1] >> ((i & 1) * 4)) & 15
 }
 
+/// Whether `Section::compact` would collapse non-minimal block or biome storage.
+#[inline]
+fn section_needs_compact(section: &Section) -> bool {
+    (section.blocks.bits() != 0 && section.blocks.uniform().is_some())
+        || (section.biomes.bits() != 0 && section.biomes.uniform().is_some())
+}
+
+/// Exact variant-and-payload equality between two already-compact `Light` values.
+#[inline]
+fn light_exact_eq(a: &Light, b: &Light) -> bool {
+    match (a, b) {
+        (Light::Uniform(x), Light::Uniform(y)) => x == y,
+        (Light::Sky(a, x), Light::Sky(b, y)) | (Light::Block(a, x), Light::Block(b, y)) => {
+            x == y && a == b
+        }
+        (Light::Full(a), Light::Full(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// A column's light as vanilla stores it, two DataLayers per section (sky,
 /// block; `layers[i]` for section `i`, `None` where no layer is stored), into
 /// the sections' packed light, which then needs no light job. A missing sky
@@ -939,9 +1086,16 @@ pub fn light_from_layers<L: AsRef<[u8]>>(
     let sections = chunk.sections.len();
     for (si, (sky, block)) in layers.iter().enumerate().take(sections).rev() {
         let sky = sky.as_ref().filter(|_| sky_light);
-        let section = Arc::make_mut(&mut chunk.sections[si]);
         if sky.is_none() && block.is_none() && above.iter().all(|&v| v == above[0]) {
-            section.light = Light::Uniform(above[0] << 4);
+            let target = above[0] << 4;
+            let current = &chunk.sections[si];
+            if matches!(current.light, Light::Uniform(v) if v == target)
+                && !section_needs_compact(current)
+            {
+                continue;
+            }
+            let section = Arc::make_mut(&mut chunk.sections[si]);
+            section.light = Light::Uniform(target);
             section.compact();
             continue;
         }
@@ -955,13 +1109,29 @@ pub fn light_from_layers<L: AsRef<[u8]>>(
             }
             let first = slice[0];
             if first & 15 == first >> 4 && slice.iter().all(|&b| b == first) {
-                section.light = Light::Uniform((first & 15) << 4);
+                let target = (first & 15) << 4;
+                let current = &chunk.sections[si];
+                if matches!(current.light, Light::Uniform(v) if v == target)
+                    && !section_needs_compact(current)
+                {
+                    continue;
+                }
+                let section = Arc::make_mut(&mut chunk.sections[si]);
+                section.light = Light::Uniform(target);
+                section.compact();
             } else {
+                let current = &chunk.sections[si];
+                if matches!(&current.light, Light::Sky(layer, 0) if layer.as_slice() == slice)
+                    && !section_needs_compact(current)
+                {
+                    continue;
+                }
                 let mut layer = Box::new([0u8; 2048]);
                 layer.copy_from_slice(slice);
+                let section = Arc::make_mut(&mut chunk.sections[si]);
                 section.light = Light::Sky(layer, 0);
+                section.compact();
             }
-            section.compact();
             continue;
         }
         let mut data = [0u8; 4096];
@@ -973,7 +1143,13 @@ pub fn light_from_layers<L: AsRef<[u8]>>(
         for (i, a) in above.iter_mut().enumerate() {
             *a = data[i] >> 4;
         }
-        section.light = Light::from_slice(&data);
+        let new_light = Light::from_slice(&data);
+        let current = &chunk.sections[si];
+        if light_exact_eq(&current.light, &new_light) && !section_needs_compact(current) {
+            continue;
+        }
+        let section = Arc::make_mut(&mut chunk.sections[si]);
+        section.light = new_light;
         section.compact();
     }
     crate::chunk::share_uniform(&mut chunk.sections);
@@ -1054,12 +1230,12 @@ impl<S: std::hash::BuildHasher> LightWorld for HashMap<(i32, i32), Arc<Chunk>, S
 /// The sections one relight touches, held for the whole flood fill so each
 /// cell access is an array index instead of a chunk lookup. Light a section
 /// gets written is copied out on the first write and stored back by `finish`.
-struct Region<'w> {
+struct Region<'w, 's> {
     world: &'w mut dyn LightWorld,
     layout: ColumnLayout,
-    slots: Vec<Slot>,
+    slots: &'s mut Vec<Slot>,
     /// Section key (cx, s, cz) to slot, `NONE` where the chunk isn't lit.
-    index: FxHashMap<Pos, u32>,
+    index: &'s mut FxHashMap<Pos, u32>,
     last: (Pos, u32),
 }
 struct Slot {
@@ -1067,15 +1243,63 @@ struct Slot {
     /// The world's section; its light is the value before this relight.
     section: Arc<Section>,
     light: Option<Box<[u8; 4096]>>,
+    /// Lazy palette emission cache for `lt_sources`: 0 = unknown, 1 = none, 2 = may emit.
+    has_emitters: u8,
+}
+impl Slot {
+    #[inline(always)]
+    fn level_at(&self, sky: bool, i: usize) -> u8 {
+        let packed = match &self.light {
+            Some(light) => light[i],
+            None => self.section.light(i),
+        };
+        if sky { packed >> 4 } else { packed & 15 }
+    }
+    #[inline(always)]
+    fn set_level_at(&mut self, sky: bool, i: usize, value: u8) {
+        let light = self
+            .light
+            .get_or_insert_with(|| self.section.light.to_array());
+        let old = light[i];
+        light[i] = if sky {
+            (old & 0x0F) | (value << 4)
+        } else {
+            (old & 0xF0) | value
+        };
+    }
+    #[inline]
+    fn may_emit(&mut self, tables: &LightTables) -> bool {
+        if self.has_emitters == 0 {
+            let emits = if self.section.blocks.bits() == 0 {
+                tables.info[self.section.get(0) as usize] > 0xFFFF
+            } else if let Some(list) = self.section.blocks.palette() {
+                list.iter().any(|&id| tables.info[id as usize] > 0xFFFF)
+            } else {
+                true
+            };
+            self.has_emitters = if emits { 2 } else { 1 };
+        }
+        self.has_emitters == 2
+    }
 }
 const NONE: u32 = u32::MAX;
-impl<'w> Region<'w> {
-    fn new(world: &'w mut dyn LightWorld) -> Self {
+impl Drop for Region<'_, '_> {
+    fn drop(&mut self) {
+        // Never retain `Arc<Section>` references in thread-local scratch across calls
+        // or unwinds, so world sections stay uniquely owned for in-place `Arc::make_mut`.
+        self.slots.clear();
+        self.index.clear();
+    }
+}
+impl<'w, 's> Region<'w, 's> {
+    fn new(world: &'w mut dyn LightWorld, scratch: &'s mut RegionScratch) -> Self {
+        scratch.slots.clear();
+        scratch.index.clear();
         Self {
             layout: world.layout(),
             world,
-            slots: Vec::with_capacity(16),
-            index: FxHashMap::default(),
+            slots: &mut scratch.slots,
+            index: &mut scratch.index,
             last: ((i32::MIN, 0, 0), NONE),
         }
     }
@@ -1098,6 +1322,7 @@ impl<'w> Region<'w> {
                     key,
                     section: section.clone(),
                     light: None,
+                    has_emitters: 0,
                 });
                 (self.slots.len() - 1) as u32
             }
@@ -1106,72 +1331,33 @@ impl<'w> Region<'w> {
         self.index.insert(key, slot);
         slot
     }
-    fn state(&mut self, x: i32, y: i32, z: i32) -> Option<u32> {
-        let slot = self.slot(x, y, z)?;
-        Some(self.slots[slot].section.get(index(x, y, z)))
-    }
-    /// What the cell emits: its state's light, or a `dynamic_light` state's stored answer; 0
-    /// outside loaded, lit chunks.
-    fn emission(&mut self, tables: &LightTables, x: i32, y: i32, z: i32) -> u8 {
-        let Some(state) = self.state(x, y, z) else {
+    /// What a cell of known `state` emits: its state's light, or a `dynamic_light` state's
+    /// stored answer.
+    #[inline]
+    fn emission_of(&self, tables: &LightTables, state: u32, x: i32, y: i32, z: i32) -> u8 {
+        let info = tables.info[state as usize];
+        if info <= 0xFFFF {
             return 0;
-        };
-        let cell = &tables.cells[state as usize];
-        if !cell.dynamic {
-            return cell.emission;
         }
-        self.world
-            .dynamic_emission(x, y, z)
-            .unwrap_or(cell.emission)
+        let own = ((info >> 16) & 15) as u8;
+        if info & DYNAMIC == 0 {
+            own
+        } else {
+            self.world.dynamic_emission(x, y, z).unwrap_or(own).min(15)
+        }
     }
-    /// The one state of the section holding `y`, when it has a single one.
-    fn uniform_state(&mut self, x: i32, y: i32, z: i32) -> Option<u32> {
-        let slot = self.slot(x, y, z)?;
-        let section = &self.slots[slot].section;
-        (section.blocks.bits() == 0).then(|| section.get(0))
-    }
-    /// Packed light (sky << 4 | block), None outside loaded, lit chunks.
-    fn light(&mut self, x: i32, y: i32, z: i32) -> Option<u8> {
-        let slot = self.slot(x, y, z)?;
-        let slot = &self.slots[slot];
-        let i = index(x, y, z);
-        Some(match &slot.light {
-            Some(light) => light[i],
-            None => slot.section.light(i),
-        })
-    }
-    /// State and packed light of a cell, with a single section lookup.
-    fn cell(&mut self, x: i32, y: i32, z: i32) -> Option<(u32, u8)> {
-        let slot = self.slot(x, y, z)?;
-        let slot = &self.slots[slot];
-        let i = index(x, y, z);
-        let light = match &slot.light {
-            Some(light) => light[i],
-            None => slot.section.light(i),
-        };
-        Some((slot.section.get(i), light))
-    }
-    /// Rewrite a cell's packed light; nothing outside loaded, lit chunks.
-    fn update_light(&mut self, x: i32, y: i32, z: i32, f: impl FnOnce(u8) -> u8) {
-        let Some(slot) = self.slot(x, y, z) else {
-            return;
-        };
-        let slot = &mut self.slots[slot];
-        let light = slot
-            .light
-            .get_or_insert_with(|| slot.section.light.to_array());
-        let i = index(x, y, z);
-        light[i] = f(light[i]);
-    }
-    /// Store back the light of every section whose values changed.
-    fn finish(self) {
-        for slot in self.slots {
+    /// Store back the light of every section whose values changed and record
+    /// the exact changed cell classes in `changed`.
+    fn finish(self, changed: &mut LightChanges) {
+        for slot in self.slots.drain(..) {
             let Some(light) = slot.light else {
                 continue;
             };
-            if (0..4096).all(|i| slot.section.light(i) == light[i]) {
+            let classes = classes_differing_light(&slot.section.light, &light);
+            if classes == 0 {
                 continue;
             }
+            changed.add(slot.key, classes);
             // Drop the clone first so the world's section isn't copied.
             drop(slot.section);
             let (cx, s, cz) = slot.key;
@@ -1293,46 +1479,106 @@ impl LightChanges {
         }
     }
 }
-fn level(world: &mut Region, sky: bool, p: Pos) -> Option<u8> {
-    world
-        .light(p.0, p.1, p.2)
-        .map(|v| if sky { v >> 4 } else { v & 15 })
+#[inline(always)]
+fn axis_class(v: usize) -> u32 {
+    match v & 15 {
+        0 => 0,
+        15 => 2,
+        _ => 1,
+    }
 }
-fn set_level(world: &mut Region, sky: bool, p: Pos, value: u8) {
-    world.update_light(p.0, p.1, p.2, |old| {
-        if sky {
-            (old & 0x0F) | value << 4
-        } else {
-            (old & 0xF0) | value
+
+#[inline]
+fn row_diff_classes(row: usize, ra: &[u8; 16], rb: &[u8; 16]) -> u32 {
+    if ra == rb {
+        return 0;
+    }
+    let base = 3 * axis_class(row >> 4) + 9 * axis_class(row & 15);
+    let mut classes = 0u32;
+    if ra[0] != rb[0] {
+        classes |= 1 << base;
+    }
+    if ra[15] != rb[15] {
+        classes |= 1 << (base + 2);
+    }
+    if ra[1..15] != rb[1..15] {
+        classes |= 1 << (base + 1);
+    }
+    classes
+}
+
+/// The classes (bit `LightChanges::class`) of the cells, in section index order
+/// (`y << 8 | z << 4 | x`), where `old` and `new` differ.
+fn classes_differing_light(old: &Light, new: &[u8; 4096]) -> u32 {
+    let mut classes = 0u32;
+    let rows_new = new.as_chunks::<16>().0;
+    match old {
+        Light::Full(a) => {
+            for (row, (ra, rb)) in a.as_chunks::<16>().0.iter().zip(rows_new).enumerate() {
+                classes |= row_diff_classes(row, ra, rb);
+            }
         }
-    });
+        Light::Uniform(v) => {
+            let uniform = [*v; 16];
+            for (row, rb) in rows_new.iter().enumerate() {
+                classes |= row_diff_classes(row, &uniform, rb);
+            }
+        }
+        Light::Sky(..) | Light::Block(..) => {
+            let mut old_row = [0u8; 16];
+            for (row, rb) in rows_new.iter().enumerate() {
+                old.copy_run(row << 4, &mut old_row);
+                classes |= row_diff_classes(row, &old_row, rb);
+            }
+        }
+    }
+    classes
 }
+
 /// `ChunkSkyLightSources`: the Y of the upper block of the highest occluded
 /// edge in the column (every block at or above it is a sky source).
-fn lowest_sky_source(world: &mut Region, tables: &LightTables, x: i32, z: i32) -> i32 {
-    let (min_y, max_y) = (world.layout.min_y(), world.layout.max_y());
-    let mut y = max_y - 1;
-    let Some(mut top) = world.state(x, y, z) else {
+/// Reads sections directly from `world` without cloning `Arc<Section>` into
+/// `Region::slots`.
+fn lowest_sky_source(world: &Region<'_, '_>, tables: &LightTables, x: i32, z: i32) -> i32 {
+    let layout = world.layout;
+    let (min_y, max_y) = (layout.min_y(), layout.max_y());
+    let sections = layout.sections();
+    if sections == 0 {
+        return min_y;
+    }
+    let (cx, cz) = (x >> 4, z >> 4);
+    let col_i = (((z & 15) << 4) | (x & 15)) as usize;
+    let mut s = sections - 1;
+    let Some(mut section) = world.world.section(cx, s, cz) else {
         return min_y;
     };
+    let mut y = max_y - 1;
+    let mut top = tables.packed[section.get((15 << 8) | col_i) as usize];
     while y > min_y {
+        let next_y = y - 1;
+        let next_s = ((next_y - min_y) >> 4) as usize;
+        if next_s != s {
+            let Some(sec) = world.world.section(cx, next_s, cz) else {
+                break;
+            };
+            s = next_s;
+            section = sec;
+        }
         // A section of one state that lets light through itself (the air of
         // a tall column) holds no source edge: go to its bottom block.
-        if let Some(state) = world.uniform_state(x, y - 1, z)
-            && state == top
-            && !tables.edge_occluded(top as usize, top as usize)
-        {
-            y = ((y - 1 - min_y) & !15) + min_y;
-            continue;
+        if section.blocks.bits() == 0 {
+            let state = tables.packed[section.get(0) as usize];
+            if state == top && !tables.packed_edge_occluded(top, top) {
+                y = layout.section_y(s);
+                continue;
+            }
         }
-        let Some(bottom) = world.state(x, y - 1, z) else {
-            break;
-        };
-        if tables.edge_occluded(top as usize, bottom as usize) {
+        let bottom = tables.packed[section.get((((next_y & 15) as usize) << 8) | col_i) as usize];
+        if tables.packed_edge_occluded(top, bottom) {
             return y;
         }
         top = bottom;
-        y -= 1;
+        y = next_y;
     }
     min_y
 }
@@ -1354,21 +1600,37 @@ pub fn relight(
     if positions.is_empty() {
         return;
     }
-    RELIGHT_SCRATCH.with_borrow_mut(|scratch| {
+    let mut run = |scratch: &mut RelightScratch| {
         scratch.clear();
-        let mut region = Region::new(world);
-        relight_region(
-            &mut region,
-            tables,
-            sky_light,
-            positions,
-            force,
-            scratch,
-            changed,
-        );
-        region.finish();
+        {
+            let mut region = Region::new(world, &mut scratch.region);
+            relight_region(
+                &mut region,
+                tables,
+                sky_light,
+                positions,
+                force,
+                &mut scratch.queues,
+                &mut scratch.sky_seeds,
+            );
+            region.finish(changed);
+        }
         scratch.clear();
-    });
+    };
+    let reused = RELIGHT_SCRATCH
+        .try_with(|cell| {
+            if let Ok(mut scratch) = cell.try_borrow_mut() {
+                run(&mut scratch);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+    if !reused {
+        let mut local = RelightScratch::new();
+        run(&mut local);
+    }
 }
 /// The columns `changed` touched that border a loaded column not lit yet
 /// (`unlit`). `relight` reads and writes only lit columns, so an edit's
@@ -1388,129 +1650,237 @@ pub fn beside_unlit(changed: &LightChanges, unlit: impl Fn(i32, i32) -> bool) ->
     columns
 }
 fn relight_region(
-    world: &mut Region,
+    world: &mut Region<'_, '_>,
     tables: &LightTables,
     sky_light: bool,
     positions: &[Pos],
     force: bool,
-    scratch: &mut RelightScratch,
-    changed: &mut LightChanges,
+    queues: &mut RelightQueues,
+    sky_seeds: &mut Vec<Pos>,
 ) {
     crate::spans::time("lt_block", || {
-        relight_layer(world, tables, false, positions, force, scratch, changed)
+        relight_layer(world, tables, false, positions, force, queues)
     });
     if sky_light {
-        let (min_y, max_y) = (world.layout.min_y(), world.layout.max_y());
-        let mut seeds = positions.to_vec();
-        let mut columns: FxHashMap<(i32, i32), i32> = FxHashMap::default();
+        let layout = world.layout;
+        let (min_y, max_y, sections) = (layout.min_y(), layout.max_y(), layout.sections());
+        sky_seeds.clear();
+        sky_seeds.extend_from_slice(positions);
+        queues.sources.clear();
         crate::spans::time("lt_columns", || {
             for &(x, _, z) in positions {
-                if columns.contains_key(&(x, z)) {
+                if queues.sources.contains_key(&(x, z)) {
                     continue;
                 }
                 let source = lowest_sky_source(world, tables, x, z);
-                columns.insert((x, z), source);
+                queues.sources.insert((x, z), source);
+                let (cx, cz) = (x >> 4, z >> 4);
+                let col_i = (((z & 15) << 4) | (x & 15)) as usize;
                 // Cells whose source status changed: non-15 at or above the new
-                // lowest source, and old 15s (sources) below it.
-                for y in source..max_y {
-                    if level(world, true, (x, y, z)).is_some_and(|l| l != 15) {
-                        seeds.push((x, y, z));
+                // lowest source, and old 15s (sources) below it. `lt_block` never
+                // mutates sky nibbles, so we inspect `world.world.section` directly
+                // and skip uniform `sky == 15` sections in O(1).
+                if source < max_y {
+                    let start_s = ((source - min_y) >> 4) as usize;
+                    for s in start_s..sections {
+                        let Some(section) = world.world.section(cx, s, cz) else {
+                            continue;
+                        };
+                        let sec_y = layout.section_y(s);
+                        let y_lo = source.max(sec_y);
+                        let y_hi = sec_y + 15;
+                        match &section.light {
+                            Light::Uniform(v) if (v >> 4) == 15 => continue,
+                            Light::Block(_, sky_val) if *sky_val == 15 => continue,
+                            Light::Uniform(_) | Light::Block(..) => {
+                                for y in y_lo..=y_hi {
+                                    sky_seeds.push((x, y, z));
+                                }
+                            }
+                            Light::Sky(layer, _) => {
+                                for y in y_lo..=y_hi {
+                                    let i = (((y & 15) as usize) << 8) | col_i;
+                                    if nibble(&layer[..], i) != 15 {
+                                        sky_seeds.push((x, y, z));
+                                    }
+                                }
+                            }
+                            Light::Full(a) => {
+                                for y in y_lo..=y_hi {
+                                    let i = (((y & 15) as usize) << 8) | col_i;
+                                    if (a[i] >> 4) != 15 {
+                                        sky_seeds.push((x, y, z));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                let mut y = source - 1;
-                while y >= min_y && level(world, true, (x, y, z)) == Some(15) {
-                    seeds.push((x, y, z));
-                    y -= 1;
+                if source > min_y {
+                    let mut y = source - 1;
+                    let mut s = ((y - min_y) >> 4) as usize;
+                    while let Some(section) = world.world.section(cx, s, cz) {
+                        let sec_y = layout.section_y(s);
+                        match &section.light {
+                            Light::Uniform(v) if (v >> 4) != 15 => break,
+                            Light::Block(_, sky_val) if *sky_val != 15 => break,
+                            Light::Uniform(_) | Light::Block(..) => {
+                                while y >= sec_y {
+                                    sky_seeds.push((x, y, z));
+                                    y -= 1;
+                                }
+                            }
+                            Light::Sky(layer, _) => {
+                                let mut stopped = false;
+                                while y >= sec_y {
+                                    let i = (((y & 15) as usize) << 8) | col_i;
+                                    if nibble(&layer[..], i) == 15 {
+                                        sky_seeds.push((x, y, z));
+                                        y -= 1;
+                                    } else {
+                                        stopped = true;
+                                        break;
+                                    }
+                                }
+                                if stopped {
+                                    break;
+                                }
+                            }
+                            Light::Full(a) => {
+                                let mut stopped = false;
+                                while y >= sec_y {
+                                    let i = (((y & 15) as usize) << 8) | col_i;
+                                    if (a[i] >> 4) == 15 {
+                                        sky_seeds.push((x, y, z));
+                                        y -= 1;
+                                    } else {
+                                        stopped = true;
+                                        break;
+                                    }
+                                }
+                                if stopped {
+                                    break;
+                                }
+                            }
+                        }
+                        if s == 0 {
+                            break;
+                        }
+                        s -= 1;
+                    }
                 }
             }
         });
         crate::spans::time("lt_sky", || {
-            relight_layer(world, tables, true, &seeds, force, scratch, changed)
+            relight_layer(world, tables, true, sky_seeds, force, queues)
         });
     }
 }
 fn relight_layer(
-    world: &mut Region,
+    world: &mut Region<'_, '_>,
     tables: &LightTables,
     sky: bool,
     seeds: &[Pos],
     force: bool,
-    scratch: &mut RelightScratch,
-    changed: &mut LightChanges,
+    queues: &mut RelightQueues,
 ) {
-    scratch.decrease.clear();
-    scratch.cleared.clear();
-    scratch.increase.clear();
-    scratch.sources.clear();
-
-    if seeds.len() > scratch.decrease.capacity() {
-        scratch.decrease.reserve(seeds.len());
-    }
-    if seeds.len() > scratch.cleared.capacity() {
-        scratch.cleared.reserve(seeds.len());
-    }
-    if seeds.len() > scratch.increase.capacity() {
-        scratch.increase.reserve(seeds.len());
+    queues.decrease.clear();
+    queues.cleared.clear();
+    for bucket in &mut queues.increase {
+        bucket.clear();
     }
 
-    let decrease = &mut scratch.decrease;
-    let cleared = &mut scratch.cleared;
-    let increase = &mut scratch.increase;
+    if seeds.len() > queues.decrease.capacity() {
+        queues.decrease.reserve(seeds.len());
+    }
+    if seeds.len() > queues.cleared.capacity() {
+        queues.cleared.reserve(seeds.len());
+    }
+
+    let decrease = &mut queues.decrease;
+    let cleared = &mut queues.cleared;
+    let increase = &mut queues.increase;
     for &p in seeds {
-        let Some(old) = level(world, sky, p) else {
+        let Some(slot_idx) = world.slot(p.0, p.1, p.2) else {
             continue;
         };
+        let i = index(p.0, p.1, p.2);
+        let old = world.slots[slot_idx].level_at(sky, i);
         // `BlockLightEngine.checkNode`: a block emitting at least the light
         // already there keeps it and pulls its neighbours' light in. Clearing
         // it would darken and relight everything it lit (flowing lava next to
         // lava: thousands of cells per block).
         if !sky && !force && old > 0 {
-            let emission = world.emission(tables, p.0, p.1, p.2);
+            let state = world.slots[slot_idx].section.get(i);
+            let emission = world.emission_of(tables, state, p.0, p.1, p.2);
             if emission >= old {
                 if emission > old {
-                    set_level(world, sky, p, emission);
-                    changed.push(p);
+                    world.slots[slot_idx].set_level_at(false, i, emission);
                 }
                 decrease.push_back((p, 0));
-                increase.push_back(p);
+                if emission > 1 {
+                    increase[(emission - 2) as usize].push(p);
+                }
                 continue;
             }
         }
         if old > 0 {
-            set_level(world, sky, p, 0);
-            changed.push(p);
+            world.slots[slot_idx].set_level_at(sky, i, 0);
         }
         cleared.push(p);
         decrease.push_back((p, if force { 15 } else { old }));
     }
     while let Some((p, from)) = decrease.pop_front() {
-        for (ox, oy, oz) in OFFSETS {
-            let q = (p.0 + ox, p.1 + oy, p.2 + oz);
-            let Some(l) = level(world, sky, q) else {
-                continue;
+        let Some(from_slot) = world.slot(p.0, p.1, p.2) else {
+            continue;
+        };
+        let from_i = index(p.0, p.1, p.2);
+        let (lx, ly, lz) = (from_i & 15, from_i >> 8, (from_i >> 4) & 15);
+        let clear_sky_down = sky && from == 15;
+        macro_rules! step_decrease {
+            ($q:expr, $same_section:expr, $same_i:expr, $dir:tt) => {{
+                let q = $q;
+                let resolved = if $same_section {
+                    Some((from_slot, $same_i))
+                } else {
+                    world.slot(q.0, q.1, q.2).map(|s| (s, index(q.0, q.1, q.2)))
+                };
+                if let Some((to_slot, to_i)) = resolved {
+                    let l = world.slots[to_slot].level_at(sky, to_i);
+                    if l != 0 {
+                        if step_decrease!(@cond $dir, l) {
+                            world.slots[to_slot].set_level_at(sky, to_i, 0);
+                            cleared.push(q);
+                            decrease.push_back((q, l));
+                        } else if l > 1 {
+                            increase[(l - 2) as usize].push(q);
+                        }
+                    }
+                }
+            }};
+            (@cond down, $l:expr) => {
+                $l < from || (clear_sky_down && $l == 15)
             };
-            if l == 0 {
-                continue;
-            }
-            // Sky light runs straight down without loss, so a 15 below a
-            // cleared 15 may have come from it too.
-            if l < from || (sky && oy == -1 && l == 15 && from == 15) {
-                set_level(world, sky, q, 0);
-                changed.push(q);
-                cleared.push(q);
-                decrease.push_back((q, l));
-            } else {
-                increase.push_back(q);
-            }
+            (@cond other, $l:expr) => {
+                $l < from
+            };
         }
+        // Sky light runs straight down without loss, so a 15 below a cleared 15
+        // may have come from it too.
+        step_decrease!((p.0, p.1 - 1, p.2), ly > 0, from_i - 256, down);
+        step_decrease!((p.0, p.1 + 1, p.2), ly < 15, from_i + 256, other);
+        step_decrease!((p.0, p.1, p.2 - 1), lz > 0, from_i - 16, other);
+        step_decrease!((p.0, p.1, p.2 + 1), lz < 15, from_i + 16, other);
+        step_decrease!((p.0 - 1, p.1, p.2), lx > 0, from_i - 1, other);
+        step_decrease!((p.0 + 1, p.1, p.2), lx < 15, from_i + 1, other);
     }
     // Sources inside the cleared area light up again.
-    let sources = &mut scratch.sources;
+    let sources = &mut queues.sources;
     let mut last_xz = (i32::MIN, i32::MIN);
     let mut last_lowest = 0;
     crate::spans::time("lt_sources", || {
-        for &p in cleared.iter() {
-            let seed = if sky {
+        if sky {
+            for &p in &*cleared {
                 let lowest = if (p.0, p.2) == last_xz {
                     last_lowest
                 } else {
@@ -1521,38 +1891,90 @@ fn relight_layer(
                     last_lowest = lowest;
                     lowest
                 };
-                if p.1 >= lowest { 15 } else { 0 }
-            } else {
-                world.emission(tables, p.0, p.1, p.2)
-            };
-            if seed > level(world, sky, p).unwrap_or(15) {
-                set_level(world, sky, p, seed);
-                changed.push(p);
-                increase.push_back(p);
+                if p.1 >= lowest
+                    && let Some(slot_idx) = world.slot(p.0, p.1, p.2)
+                {
+                    let i = index(p.0, p.1, p.2);
+                    if world.slots[slot_idx].level_at(true, i) < 15 {
+                        world.slots[slot_idx].set_level_at(true, i, 15);
+                        increase[13].push(p);
+                    }
+                }
+            }
+        } else {
+            for &p in &*cleared {
+                let Some(slot_idx) = world.slot(p.0, p.1, p.2) else {
+                    continue;
+                };
+                if !world.slots[slot_idx].may_emit(tables) {
+                    continue;
+                }
+                let i = index(p.0, p.1, p.2);
+                let state = world.slots[slot_idx].section.get(i);
+                let seed = world.emission_of(tables, state, p.0, p.1, p.2);
+                if seed > world.slots[slot_idx].level_at(false, i) {
+                    world.slots[slot_idx].set_level_at(false, i, seed);
+                    if seed > 1 {
+                        increase[(seed - 2) as usize].push(p);
+                    }
+                }
             }
         }
     });
-    while let Some(p) = increase.pop_front() {
-        let Some((from, packed)) = world.cell(p.0, p.1, p.2) else {
-            continue;
-        };
-        let l = if sky { packed >> 4 } else { packed & 15 };
-        if l <= 1 {
-            continue;
-        }
-        for (d, (ox, oy, oz)) in OFFSETS.iter().enumerate() {
-            let q = (p.0 + ox, p.1 + oy, p.2 + oz);
-            let Some((to, packed)) = world.cell(q.0, q.1, q.2) else {
+    // 14-bucket descending BFS (levels 15 down to 2) with light-first pruning
+    // and single-slot same-section neighbour expansion.
+    for b in (0..14).rev() {
+        let l = (b + 2) as u8;
+        let min_threshold = l - 1;
+        let (lower, rest) = increase.split_at_mut(b);
+        for &p in &rest[0] {
+            let Some(from_slot) = world.slot(p.0, p.1, p.2) else {
                 continue;
             };
-            let ql = if sky { packed >> 4 } else { packed & 15 };
-            let next = l.saturating_sub(tables.cells[to as usize].dampening.max(1));
-            if next > ql && !tables.blocked(from as usize, to as usize, d) {
-                set_level(world, sky, q, next);
-                changed.push(q);
-                increase.push_back(q);
+            let from_i = index(p.0, p.1, p.2);
+            if world.slots[from_slot].level_at(sky, from_i) != l {
+                continue;
             }
+            let mut from_p: Option<u16> = None;
+            let (lx, ly, lz) = (from_i & 15, from_i >> 8, (from_i >> 4) & 15);
+            macro_rules! step_increase {
+                ($d:expr, $q:expr, $same_section:expr, $same_i:expr) => {{
+                    let q = $q;
+                    let resolved = if $same_section {
+                        Some((from_slot, $same_i))
+                    } else {
+                        world.slot(q.0, q.1, q.2).map(|s| (s, index(q.0, q.1, q.2)))
+                    };
+                    if let Some((to_slot, to_i)) = resolved {
+                        let ql = world.slots[to_slot].level_at(sky, to_i);
+                        if ql < min_threshold {
+                            let to_p =
+                                tables.packed[world.slots[to_slot].section.get(to_i) as usize];
+                            let next = l.saturating_sub(((to_p & 0xF) as u8).max(1));
+                            if next > ql {
+                                let fp = *from_p.get_or_insert_with(|| {
+                                    tables.packed
+                                        [world.slots[from_slot].section.get(from_i) as usize]
+                                });
+                                if (fp | to_p) < 16 || !tables.packed_blocked(fp, to_p, $d) {
+                                    world.slots[to_slot].set_level_at(sky, to_i, next);
+                                    if next > 1 {
+                                        lower[(next - 2) as usize].push(q);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }};
+            }
+            step_increase!(0, (p.0, p.1 - 1, p.2), ly > 0, from_i - 256);
+            step_increase!(1, (p.0, p.1 + 1, p.2), ly < 15, from_i + 256);
+            step_increase!(2, (p.0, p.1, p.2 - 1), lz > 0, from_i - 16);
+            step_increase!(3, (p.0, p.1, p.2 + 1), lz < 15, from_i + 16);
+            step_increase!(4, (p.0 - 1, p.1, p.2), lx > 0, from_i - 1);
+            step_increase!(5, (p.0 + 1, p.1, p.2), lx < 15, from_i + 1);
         }
+        rest[0].clear();
     }
 }
 
@@ -2628,15 +3050,15 @@ pub(crate) mod tests {
     #[test]
     fn scratch_queues_shrink_above_capacity_cap() {
         let mut scratch = LightScratch::new();
-        scratch.queue.resize(100_000, 0);
-        scratch.sky_queue.resize(100_000, 0);
-        assert!(scratch.queue.capacity() >= 100_000);
-        assert!(scratch.sky_queue.capacity() >= 100_000);
+        scratch.buckets[0].resize(100_000, 0);
+        scratch.buckets[13].resize(100_000, 0);
+        assert!(scratch.buckets[0].capacity() >= 100_000);
+        assert!(scratch.buckets[13].capacity() >= 100_000);
         scratch.clear_queues();
-        assert_eq!(scratch.queue.len(), 0);
-        assert_eq!(scratch.sky_queue.len(), 0);
-        assert!(scratch.queue.capacity() < 100_000);
-        assert!(scratch.sky_queue.capacity() < 100_000);
+        for bucket in &scratch.buckets {
+            assert_eq!(bucket.len(), 0);
+            assert!(bucket.capacity() < 100_000);
+        }
     }
 
     /// The baseline flood-fill lighting algorithm before the scratch and wavefront optimizations.
@@ -2849,19 +3271,19 @@ pub(crate) mod tests {
                 );
                 let mut states = vec![0u16; W * W * 16];
                 let mut block = vec![0u8; W * W * 16];
-                let mut queue = Vec::new();
+                let mut buckets: [Vec<u32>; 14] = std::array::from_fn(|_| Vec::new());
                 states_of(
                     &section,
                     &tables,
                     at,
                     &mut states,
                     &mut block,
-                    &mut queue,
+                    &mut buckets,
                     &mut SectionScratch::new(),
                 );
 
                 section.unpack(&mut ids);
-                let mut want_queue = Vec::new();
+                let mut want_buckets: [Vec<u32>; 14] = std::array::from_fn(|_| Vec::new());
                 for (i, &id) in ids.iter().enumerate() {
                     let info = tables.info[id as usize];
                     let p = at.row(i >> 4) + (i & 15);
@@ -2870,11 +3292,21 @@ pub(crate) mod tests {
                         "{distinct} values, emitting {emitting}: state at {i}"
                     );
                     if info > 0xFFFF {
-                        assert_eq!(block[p], (info >> 16) as u8, "emission at {i}");
-                        want_queue.push(p as u32);
+                        let em = ((info >> 16) & 15) as u8;
+                        assert_eq!(block[p], em, "emission at {i}");
+                        if em > 1 {
+                            want_buckets[(em - 2) as usize].push(pack_pos(
+                                at.x + (i & 15),
+                                at.y + (i >> 8),
+                                at.z + ((i >> 4) & 15),
+                            ));
+                        }
                     }
                 }
-                assert_eq!(queue, want_queue, "{distinct} values, emitting {emitting}");
+                assert_eq!(
+                    buckets, want_buckets,
+                    "{distinct} values, emitting {emitting}"
+                );
             }
         }
     }
@@ -3034,5 +3466,747 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    const TEST_OFFSETS: [(i32, i32, i32); 6] = [
+        (0, -1, 0),
+        (0, 1, 0),
+        (0, 0, -1),
+        (0, 0, 1),
+        (-1, 0, 0),
+        (1, 0, 0),
+    ];
+
+    const TOP_SLAB: u32 = 4;
+    const WATER: u32 = 5;
+    const TINTED_GLASS: u32 = 6;
+    const GLOW_LICHEN: u32 = 7;
+    const LAVA: u32 = 8;
+    const DIM_EMITTER: u32 = 9;
+    const DAMP_EMITTER: u32 = 10;
+    const DYN_LAMP: u32 = 11;
+    const CAVE_AIR: u32 = 12;
+
+    /// Rich test tables covering unshaped/shaped occluders, complementary half-faces,
+    /// partial dampening, tinted glass, mixed-level emitters (1, 5, 7, 14, 15), dynamic
+    /// emission, and distinct states with identical packed light properties.
+    fn rich_tables() -> LightTables {
+        const HALF_BOT: u16 = 2;
+        const HALF_TOP: u16 = 3;
+        let cell = |dampening, emission, dynamic, faces: [u16; 6]| Cell {
+            dampening,
+            emission,
+            dynamic,
+            shaped: faces.iter().any(|&f| f != EMPTY),
+            faces,
+        };
+        let n = 4usize;
+        let mut occludes = vec![false; n * n];
+        for a in 0..n {
+            for b in 0..n {
+                occludes[a * n + b] = a == FULL as usize
+                    || b == FULL as usize
+                    || (a == HALF_BOT as usize && b == HALF_TOP as usize)
+                    || (a == HALF_TOP as usize && b == HALF_BOT as usize);
+            }
+        }
+        LightTables::from_parts(
+            vec![
+                cell(0, 0, false, [EMPTY; 6]),
+                cell(15, 0, false, [FULL; 6]),
+                cell(0, 14, false, [EMPTY; 6]),
+                cell(
+                    0,
+                    0,
+                    false,
+                    [FULL, EMPTY, HALF_BOT, HALF_BOT, HALF_BOT, HALF_BOT],
+                ),
+                cell(
+                    0,
+                    0,
+                    false,
+                    [EMPTY, FULL, HALF_TOP, HALF_TOP, HALF_TOP, HALF_TOP],
+                ),
+                cell(1, 0, false, [EMPTY; 6]),
+                cell(15, 0, false, [EMPTY; 6]),
+                cell(0, 7, false, [EMPTY; 6]),
+                cell(0, 15, false, [EMPTY; 6]),
+                cell(0, 1, false, [EMPTY; 6]),
+                cell(3, 5, false, [EMPTY; 6]),
+                cell(0, 4, true, [EMPTY; 6]),
+                cell(0, 0, false, [EMPTY; 6]),
+            ],
+            occludes,
+            n,
+        )
+    }
+
+    #[test]
+    fn packed_tables_match_reference_occlusion_for_all_pairs() {
+        let t = rich_tables();
+        for (a, &pa) in t.packed.iter().enumerate() {
+            for (b, &pb) in t.packed.iter().enumerate() {
+                assert_eq!(
+                    t.packed_edge_occluded(pa, pb),
+                    t.edge_occluded(a, b),
+                    "edge_occluded mismatch for ({a}, {b})"
+                );
+                for d in 0..6 {
+                    let fast_blocked = (pa | pb) >= 16 && t.packed_blocked(pa, pb, d);
+                    assert_eq!(
+                        fast_blocked,
+                        t.blocked(a, b, d),
+                        "blocked mismatch for ({a}, {b}, dir={d})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reference textbook FIFO `VecDeque` incremental relighter using `tables.blocked`
+    /// and `tables.edge_occluded`, used for bit-exact differential verification.
+    fn reference_relight(
+        world: &mut HashMap<(i32, i32), Arc<Chunk>>,
+        tables: &LightTables,
+        sky_light: bool,
+        positions: &[Pos],
+        force: bool,
+    ) {
+        if positions.is_empty() {
+            return;
+        }
+        let layout = world.layout();
+        let (min_y, max_y) = (layout.min_y(), layout.max_y());
+        let mut edited: FxHashMap<Pos, Box<[u8; 4096]>> = FxHashMap::default();
+
+        let state_of = |w: &HashMap<(i32, i32), Arc<Chunk>>, p: Pos| -> Option<u32> {
+            let s = layout.section_index(p.1)?;
+            Some(w.section(p.0 >> 4, s, p.2 >> 4)?.get(index(p.0, p.1, p.2)))
+        };
+        let level_of = |w: &HashMap<(i32, i32), Arc<Chunk>>,
+                        edited: &FxHashMap<Pos, Box<[u8; 4096]>>,
+                        sky: bool,
+                        p: Pos|
+         -> Option<u8> {
+            let s = layout.section_index(p.1)?;
+            let key = (p.0 >> 4, s as i32, p.2 >> 4);
+            let i = index(p.0, p.1, p.2);
+            let packed = if let Some(buf) = edited.get(&key) {
+                buf[i]
+            } else {
+                w.section(key.0, s, key.2)?.light(i)
+            };
+            Some(if sky { packed >> 4 } else { packed & 15 })
+        };
+        let set_level_of = |w: &HashMap<(i32, i32), Arc<Chunk>>,
+                            edited: &mut FxHashMap<Pos, Box<[u8; 4096]>>,
+                            sky: bool,
+                            p: Pos,
+                            val: u8| {
+            let Some(s) = layout.section_index(p.1) else {
+                return;
+            };
+            let key = (p.0 >> 4, s as i32, p.2 >> 4);
+            let Some(sec) = w.section(key.0, s, key.2) else {
+                return;
+            };
+            let buf = edited.entry(key).or_insert_with(|| sec.light.to_array());
+            let i = index(p.0, p.1, p.2);
+            let old = buf[i];
+            buf[i] = if sky {
+                (old & 0x0F) | (val << 4)
+            } else {
+                (old & 0xF0) | val
+            };
+        };
+        let emission_of = |w: &HashMap<(i32, i32), Arc<Chunk>>, p: Pos| -> u8 {
+            let Some(st) = state_of(w, p) else {
+                return 0;
+            };
+            let cell = &tables.cells[st as usize];
+            if !cell.dynamic {
+                return cell.emission;
+            }
+            w.dynamic_emission(p.0, p.1, p.2)
+                .unwrap_or(cell.emission)
+                .min(15)
+        };
+        let lowest_sky = |w: &HashMap<(i32, i32), Arc<Chunk>>, x: i32, z: i32| -> i32 {
+            let mut y = max_y - 1;
+            let Some(mut top) = state_of(w, (x, y, z)) else {
+                return min_y;
+            };
+            while y > min_y {
+                let Some(bottom) = state_of(w, (x, y - 1, z)) else {
+                    break;
+                };
+                if tables.edge_occluded(top as usize, bottom as usize) {
+                    return y;
+                }
+                top = bottom;
+                y -= 1;
+            }
+            min_y
+        };
+        let run_layer = |w: &HashMap<(i32, i32), Arc<Chunk>>,
+                         edited: &mut FxHashMap<Pos, Box<[u8; 4096]>>,
+                         sky: bool,
+                         seeds: &[Pos]| {
+            let mut dec = VecDeque::new();
+            let mut cleared = Vec::new();
+            let mut inc = VecDeque::new();
+            let mut sources: FxHashMap<(i32, i32), i32> = FxHashMap::default();
+            for &p in seeds {
+                let Some(old) = level_of(w, edited, sky, p) else {
+                    continue;
+                };
+                if !sky && !force && old > 0 {
+                    let em = emission_of(w, p);
+                    if em >= old {
+                        if em > old {
+                            set_level_of(w, edited, false, p, em);
+                        }
+                        dec.push_back((p, 0));
+                        inc.push_back(p);
+                        continue;
+                    }
+                }
+                if old > 0 {
+                    set_level_of(w, edited, sky, p, 0);
+                }
+                cleared.push(p);
+                dec.push_back((p, if force { 15 } else { old }));
+            }
+            while let Some((p, from)) = dec.pop_front() {
+                for (ox, oy, oz) in TEST_OFFSETS {
+                    let q = (p.0 + ox, p.1 + oy, p.2 + oz);
+                    let Some(l) = level_of(w, edited, sky, q) else {
+                        continue;
+                    };
+                    if l == 0 {
+                        continue;
+                    }
+                    if l < from || (sky && oy == -1 && l == 15 && from == 15) {
+                        set_level_of(w, edited, sky, q, 0);
+                        cleared.push(q);
+                        dec.push_back((q, l));
+                    } else {
+                        inc.push_back(q);
+                    }
+                }
+            }
+            for &p in &cleared {
+                let seed = if sky {
+                    let lowest = *sources
+                        .entry((p.0, p.2))
+                        .or_insert_with(|| lowest_sky(w, p.0, p.2));
+                    if p.1 >= lowest { 15 } else { 0 }
+                } else {
+                    emission_of(w, p)
+                };
+                if seed > level_of(w, edited, sky, p).unwrap_or(15) {
+                    set_level_of(w, edited, sky, p, seed);
+                    inc.push_back(p);
+                }
+            }
+            while let Some(p) = inc.pop_front() {
+                let Some(from) = state_of(w, p) else {
+                    continue;
+                };
+                let Some(l) = level_of(w, edited, sky, p) else {
+                    continue;
+                };
+                if l <= 1 {
+                    continue;
+                }
+                for (d, (ox, oy, oz)) in TEST_OFFSETS.iter().enumerate() {
+                    let q = (p.0 + ox, p.1 + oy, p.2 + oz);
+                    let Some(to) = state_of(w, q) else {
+                        continue;
+                    };
+                    let Some(ql) = level_of(w, edited, sky, q) else {
+                        continue;
+                    };
+                    let next = l.saturating_sub(tables.cells[to as usize].dampening.max(1));
+                    if next > ql && !tables.blocked(from as usize, to as usize, d) {
+                        set_level_of(w, edited, sky, q, next);
+                        inc.push_back(q);
+                    }
+                }
+            }
+        };
+
+        run_layer(world, &mut edited, false, positions);
+        if sky_light {
+            let mut seeds = positions.to_vec();
+            let mut seen: FxHashMap<(i32, i32), i32> = FxHashMap::default();
+            for &(x, _, z) in positions {
+                if seen.contains_key(&(x, z)) {
+                    continue;
+                }
+                let src = lowest_sky(world, x, z);
+                seen.insert((x, z), src);
+                for y in src..max_y {
+                    if level_of(world, &edited, true, (x, y, z)).is_some_and(|l| l != 15) {
+                        seeds.push((x, y, z));
+                    }
+                }
+                let mut y = src - 1;
+                while y >= min_y && level_of(world, &edited, true, (x, y, z)) == Some(15) {
+                    seeds.push((x, y, z));
+                    y -= 1;
+                }
+            }
+            run_layer(world, &mut edited, true, &seeds);
+        }
+        for ((cx, s, cz), buf) in edited {
+            let s = s as usize;
+            let unchanged = world
+                .section(cx, s, cz)
+                .is_some_and(|sec| (0..4096).all(|i| sec.light(i) == buf[i]));
+            if !unchanged {
+                world.set_section_light(cx, s, cz, Light::packed(buf));
+            }
+        }
+    }
+
+    /// Differential test of `light_chunk` vs `old_light_chunk` across rich block types:
+    /// empty 3x3 (`max_lowest == 0`), asymmetric chunk tops (`chunk_top` bulk sky fill),
+    /// top-of-section upward-occluding slabs/stone/water/tinted glass, top-of-world blocks,
+    /// flat water surfaces (downward sky propagation), mixed-level emitters (1..=15), and
+    /// missing neighbour patterns.
+    #[test]
+    fn light_chunk_rich_differential_matches_reference() {
+        let t = rich_tables();
+        let layout = ColumnLayout::new(-64, 64).unwrap();
+        let static_states = [
+            AIR,
+            STONE,
+            TORCH,
+            SLAB,
+            TOP_SLAB,
+            WATER,
+            TINTED_GLASS,
+            GLOW_LICHEN,
+            LAVA,
+            DIM_EMITTER,
+            DAMP_EMITTER,
+            CAVE_AIR,
+        ];
+        let mut rng = 0xCAFE_BABE_1234_5678_u64;
+        let mut next = |max: usize| -> usize {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 32) as usize) % max
+        };
+
+        for round in 0..24usize {
+            let sky_light = round.is_multiple_of(2);
+            let mut chunks = Vec::with_capacity(9);
+            for cz in -1..=1 {
+                for cx in -1..=1 {
+                    let mut c = Chunk::with_layout(cx, cz, layout);
+                    match round % 6 {
+                        0 => {
+                            // Completely empty 3x3 (`max_lowest == 0`).
+                        }
+                        1 => {
+                            // Flat water sheet over air cavity (exercises `own == deepest && own > 0 && damp < 15`).
+                            for i in 0..256 {
+                                c.set(i & 15, -32, i >> 4, WATER);
+                            }
+                            if (cx, cz) == (0, 0) {
+                                c.set(8, -40, 8, DIM_EMITTER);
+                                c.set(9, -40, 8, GLOW_LICHEN);
+                                c.set(10, -40, 8, LAVA);
+                                c.set(11, -40, 8, DAMP_EMITTER);
+                            }
+                        }
+                        2 => {
+                            // Asymmetric heights: one tall chunk up to world top (`max_y - 1`),
+                            // others low or empty with top-of-section slabs at `ly == 15`.
+                            if (cx, cz) == (1, 1) {
+                                for i in 0..256 {
+                                    let st = if (i & 3) == 0 { TOP_SLAB } else { STONE };
+                                    c.set(i & 15, layout.max_y() - 1, i >> 4, st);
+                                    c.set(i & 15, layout.max_y() - 2, i >> 4, WATER);
+                                }
+                            } else if (cx, cz) == (0, 0) {
+                                // `y = -49` is `ly == 15` of section 0 (boundary at `chunk_top * 16`).
+                                for x in 0..16 {
+                                    for z in 0..16 {
+                                        let st = match (x + z) % 5 {
+                                            0 => TOP_SLAB,
+                                            1 => SLAB,
+                                            2 => TINTED_GLASS,
+                                            3 => WATER,
+                                            _ => AIR,
+                                        };
+                                        c.set(x, -49, z, st);
+                                    }
+                                }
+                                c.set(7, -50, 7, TORCH);
+                                c.set(8, -50, 7, GLOW_LICHEN);
+                            }
+                        }
+                        _ => {
+                            // General randomized terrain, complementary slabs, and mixed emitters.
+                            let fill_y = layout.min_y() + (next(3) * 16) as i32;
+                            for y in layout.min_y()..fill_y {
+                                let st = if next(4) == 0 { CAVE_AIR } else { STONE };
+                                for i in 0..256 {
+                                    c.set(i & 15, y, i >> 4, st);
+                                }
+                            }
+                            for _ in 0..60 {
+                                let x = next(16) as i32;
+                                let z = next(16) as i32;
+                                let y = layout.min_y() + next(layout.height() as usize) as i32;
+                                let st = static_states[next(static_states.len())];
+                                c.set(x, y, z, st);
+                            }
+                        }
+                    }
+                    chunks.push(c);
+                }
+            }
+            let mut region: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
+            for (dz, row) in region.iter_mut().enumerate() {
+                for (dx, slot) in row.iter_mut().enumerate() {
+                    let include = (dz == 1 && dx == 1)
+                        || match round % 4 {
+                            0 => true,
+                            1 => !(dz + dx).is_multiple_of(2),
+                            2 => next(10) < 7,
+                            _ => dz == 1 || dx == 1,
+                        };
+                    if include {
+                        *slot = Some(&chunks[dz * 3 + dx]);
+                    }
+                }
+            }
+            let old = old_light_chunk(&region, &t, sky_light);
+            let new = light_chunk(&region, &t, sky_light);
+            assert_eq!(
+                old.len(),
+                new.len(),
+                "round {round}: section count mismatch"
+            );
+            for (si, (g, w)) in new.iter().zip(&old).enumerate() {
+                for i in 0..4096 {
+                    assert_eq!(
+                        g.get(i),
+                        w.get(i),
+                        "round {round} (sky={sky_light}) section {si} cell {i}: got {:#04x}, want {:#04x}",
+                        g.get(i),
+                        w.get(i)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Differential test of `relight` vs textbook FIFO `reference_relight`, exact cell-diff
+    /// `LightChanges`, and full `light_chunk` across both compact and full-height Overworld
+    /// columns, sky/block layers, `force=true/false`, complementary slabs, water, tinted
+    /// glass, mixed emitters, dynamic lights, chunk/section borders, and no-op edits.
+    #[test]
+    fn relight_differential_matches_reference_bfs_and_exact_changes() {
+        let t = rich_tables();
+        let all_states = [
+            AIR,
+            STONE,
+            TORCH,
+            SLAB,
+            TOP_SLAB,
+            WATER,
+            TINTED_GLASS,
+            GLOW_LICHEN,
+            LAVA,
+            DIM_EMITTER,
+            DAMP_EMITTER,
+            DYN_LAMP,
+            CAVE_AIR,
+        ];
+        let mut rng = 0x517C_C1B7_2722_0A95_u64;
+        let mut next = |max: usize| -> usize {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 32) as usize) % max
+        };
+
+        for (layout, sky_light, rounds) in [
+            (ColumnLayout::new(-32, 64).unwrap(), true, 40usize),
+            (ColumnLayout::new(-32, 64).unwrap(), false, 25usize),
+            (ColumnLayout::VANILLA, true, 16usize),
+        ] {
+            let mut w_new = lit_world(layout, &t, |c| {
+                // Seed complementary slabs over open sky, water, mixed emitters, and a dynamic lamp.
+                for x in 4..12 {
+                    for z in 4..12 {
+                        c.set(x, 8, z, if (x + z) & 1 == 0 { SLAB } else { TOP_SLAB });
+                    }
+                }
+                c.set(8, 4, 8, WATER);
+                c.set(9, 4, 8, GLOW_LICHEN);
+                c.set(10, 4, 8, DYN_LAMP);
+                if let Some(cell) = c.dynamic_cell(10, 4, 8) {
+                    c.dynamic_emission.insert(cell, 11);
+                }
+            });
+            // Re-light initial world with the exact `sky_light` mode for this pass.
+            let keys: Vec<_> = w_new.keys().copied().collect();
+            let relit: Vec<_> = keys
+                .iter()
+                .map(|&(cx, cz)| {
+                    let region: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|dz| {
+                        std::array::from_fn(|dx| {
+                            w_new
+                                .get(&(cx + dx as i32 - 1, cz + dz as i32 - 1))
+                                .map(|c| &**c)
+                        })
+                    });
+                    let mut c = (*w_new[&(cx, cz)]).clone();
+                    apply_lighting(&mut c, light_chunk(&region, &t, sky_light));
+                    c.lit = true;
+                    ((cx, cz), Arc::new(c))
+                })
+                .collect();
+            w_new = relit.into_iter().collect();
+            let mut w_ref = w_new.clone();
+
+            let xz_coords = [-16, -15, -1, 0, 1, 7, 14, 15, 16, 17, 31];
+            let y_coords = [
+                layout.min_y(),
+                layout.min_y() + 1,
+                -1,
+                0,
+                1,
+                4,
+                8,
+                15,
+                16,
+                layout.max_y() - 2,
+                layout.max_y() - 1,
+            ];
+
+            for round in 0..rounds {
+                let force = round.is_multiple_of(5);
+                let count = if round.is_multiple_of(3) {
+                    1
+                } else {
+                    1 + next(6)
+                };
+                let mut positions = Vec::with_capacity(count + 1);
+                for _ in 0..count {
+                    let x = xz_coords[next(xz_coords.len())];
+                    let z = xz_coords[next(xz_coords.len())];
+                    let y = y_coords[next(y_coords.len())];
+                    // Every 4th round also exercise no-op edits where light does not change.
+                    if round % 4 != 3 {
+                        let st = all_states[next(all_states.len())];
+                        let dyn_ans = if st == DYN_LAMP {
+                            [None, Some(0), Some(1), Some(9), Some(13), Some(15)][next(6)]
+                        } else {
+                            None
+                        };
+                        for world in [&mut w_new, &mut w_ref] {
+                            let c = Arc::make_mut(world.get_mut(&(x >> 4, z >> 4)).unwrap());
+                            c.set(x & 15, y, z & 15, st);
+                            if let Some(cell) = c.dynamic_cell(x & 15, y, z & 15) {
+                                if let Some(v) = dyn_ans {
+                                    c.dynamic_emission.insert(cell, v);
+                                } else {
+                                    c.dynamic_emission.remove(&cell);
+                                }
+                            }
+                        }
+                    }
+                    positions.push((x, y, z));
+                }
+                if round.is_multiple_of(6)
+                    && let Some(&dup) = positions.first()
+                {
+                    positions.push(dup);
+                }
+
+                let before = w_new.clone();
+                let mut changed = LightChanges::default();
+                relight(&mut w_new, &t, sky_light, &positions, force, &mut changed);
+                reference_relight(&mut w_ref, &t, sky_light, &positions, force);
+
+                // 1. Bit-exact match against textbook FIFO reference across all 9 chunks.
+                for (&key, new_chunk) in &w_new {
+                    let ref_chunk = &w_ref[&key];
+                    for (si, (ns, rs)) in new_chunk
+                        .sections
+                        .iter()
+                        .zip(&ref_chunk.sections)
+                        .enumerate()
+                    {
+                        for i in 0..4096 {
+                            assert_eq!(
+                                ns.light(i),
+                                rs.light(i),
+                                "sky={sky_light} round={round} force={force} chunk={key:?} sec={si} cell={i}: new={:#04x}, ref={:#04x}",
+                                ns.light(i),
+                                rs.light(i)
+                            );
+                        }
+                    }
+                }
+
+                // 2. Exact match between `changed` and actual stored light diff.
+                let mut expected_changed = LightChanges::default();
+                expected_changed.keyed(layout);
+                for (&(cx, cz), new_chunk) in &w_new {
+                    let old_chunk = &before[&(cx, cz)];
+                    for (si, (old_s, new_s)) in old_chunk
+                        .sections
+                        .iter()
+                        .zip(&new_chunk.sections)
+                        .enumerate()
+                    {
+                        for i in 0..4096 {
+                            if old_s.light(i) != new_s.light(i) {
+                                let lx = (i & 15) as i32;
+                                let ly = (i >> 8) as i32;
+                                let lz = ((i >> 4) & 15) as i32;
+                                expected_changed.push((
+                                    cx * 16 + lx,
+                                    layout.section_y(si) + ly,
+                                    cz * 16 + lz,
+                                ));
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    changed, expected_changed,
+                    "LightChanges mismatch at sky={sky_light} round={round}"
+                );
+            }
+
+            // 3. Centre chunk matches a fresh full `light_chunk` after all incremental edits.
+            let region: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|dz| {
+                std::array::from_fn(|dx| w_new.get(&(dx as i32 - 1, dz as i32 - 1)).map(|c| &**c))
+            });
+            let full = light_chunk(&region, &t, sky_light);
+            for (si, s) in full.iter().enumerate() {
+                for i in 0..4096 {
+                    assert_eq!(
+                        w_new[&(0, 0)].sections[si].light(i),
+                        s.get(i),
+                        "full light mismatch sky={sky_light} sec={si} cell={i}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn light_from_layers_avoids_cow_clones_on_matching_sections() {
+        let mut chunk = Chunk::empty(0, 0);
+        let initial_ptrs: Vec<_> = chunk.sections.iter().map(Arc::as_ptr).collect();
+
+        let varying_sky: Vec<u8> = (0..2048)
+            .map(|k| ((((k * 7 + 3) & 15) << 4) | ((k * 5 + 1) & 15)) as u8)
+            .collect();
+        let varying_block: Vec<u8> = (0..2048)
+            .map(|k| ((((k * 3 + 2) & 15) << 4) | ((k * 11) & 15)) as u8)
+            .collect();
+        let mut layers: Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> = vec![(None, None); SECTIONS];
+        // Sections 10..SECTIONS have (None, None) with uniform above=15 -> already Uniform(0xF0).
+        // Section 9 has an explicit uniform sky=15 layer -> already Uniform(0xF0).
+        layers[9].0 = Some(vec![0xFF; 2048]);
+        // Section 8 has varying sky-only light -> Light::Sky(_, 0).
+        layers[8].0 = Some(varying_sky);
+        // Section 4 has both sky and block light -> Light::Full.
+        layers[4] = (Some(vec![0x73; 2048]), Some(varying_block));
+        // Section 2 has uniform sky=0 and varying block light -> Light::Block.
+        layers[2] = (
+            Some(vec![0x00; 2048]),
+            Some((0..2048).map(|k| (k & 0xFF) as u8).collect()),
+        );
+
+        light_from_layers(&mut chunk, &layers, [15; 256], true);
+
+        // Upper uniform air sections (9..SECTIONS) must not have been COW-cloned.
+        for (si, (sec, &initial)) in chunk.sections.iter().zip(&initial_ptrs).enumerate().skip(9) {
+            assert_eq!(
+                Arc::as_ptr(sec),
+                initial,
+                "section {si} was needlessly cloned on matching Uniform(0xF0)"
+            );
+        }
+
+        // Re-applying the exact same layers must perform zero COW clones across ALL 24 sections.
+        let after_first: Vec<_> = chunk.sections.iter().map(Arc::as_ptr).collect();
+        light_from_layers(&mut chunk, &layers, [15; 256], true);
+        let after_second: Vec<_> = chunk.sections.iter().map(Arc::as_ptr).collect();
+        assert_eq!(
+            after_first, after_second,
+            "re-applying identical layers must clone zero sections"
+        );
+
+        // A section with matching light but non-minimal uniform blocks must still be compacted.
+        chunk.set(0, MIN_Y + 12 * 16, 0, STONE);
+        chunk.set(0, MIN_Y + 12 * 16, 0, AIR);
+        assert_ne!(chunk.sections[12].blocks.bits(), 0);
+        assert!(matches!(chunk.sections[12].light, Light::Uniform(0xF0)));
+        light_from_layers(&mut chunk, &layers, [15; 256], true);
+        assert_eq!(
+            chunk.sections[12].blocks.bits(),
+            0,
+            "matching-light section with non-minimal uniform blocks must still compact"
+        );
+
+        // No-sky dimension with already-dark Uniform(0) sections performs zero COW clones.
+        let mut dark = Chunk::empty(0, 0);
+        let empty_layers: Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> = vec![(None, None); SECTIONS];
+        light_from_layers(&mut dark, &empty_layers, [0; 256], false);
+        let dark_ptrs: Vec<_> = dark.sections.iter().map(Arc::as_ptr).collect();
+        light_from_layers(&mut dark, &empty_layers, [0; 256], false);
+        assert_eq!(
+            dark_ptrs,
+            dark.sections.iter().map(Arc::as_ptr).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn release_scratch_frees_light_and_relight_scratch() {
+        let mut w = world(|c| {
+            c.set(8, 0, 8, TORCH);
+        });
+        Arc::make_mut(w.get_mut(&(0, 0)).unwrap()).set(8, 0, 8, AIR);
+        let mut changed = LightChanges::default();
+        relight(&mut w, &tables(), true, &[(8, 0, 8)], false, &mut changed);
+
+        // `relight` must never retain `Arc<Section>` slots in thread-local scratch.
+        RELIGHT_SCRATCH.with_borrow_mut(|scratch| {
+            assert!(scratch.region.slots.is_empty());
+            assert!(scratch.region.index.is_empty());
+            scratch.queues.decrease.resize(32_000, ((0, 0, 0), 0));
+            scratch.queues.cleared.resize(32_000, (0, 0, 0));
+            scratch.queues.increase[0].resize(32_000, (0, 0, 0));
+            scratch.queues.increase[13].resize(32_000, (0, 0, 0));
+            scratch.sky_seeds.resize(32_000, (0, 0, 0));
+            scratch.clear();
+            assert!(scratch.queues.decrease.capacity() < 32_000);
+            assert!(scratch.queues.cleared.capacity() < 32_000);
+            assert!(scratch.queues.increase[0].capacity() < 32_000);
+            assert!(scratch.queues.increase[13].capacity() < 32_000);
+            assert!(scratch.sky_seeds.capacity() < 32_000);
+        });
+
+        release_scratch();
+        assert!(SCRATCH_POOL.lock().unwrap().len() <= kept_scratch());
+        RELIGHT_SCRATCH.with_borrow(|scratch| {
+            assert_eq!(scratch.region.slots.capacity(), 0);
+            assert_eq!(scratch.region.index.capacity(), 0);
+            assert_eq!(scratch.queues.decrease.capacity(), 0);
+            assert_eq!(scratch.queues.cleared.capacity(), 0);
+            assert!(scratch.queues.increase.iter().all(|b| b.capacity() == 0));
+            assert_eq!(scratch.queues.sources.capacity(), 0);
+            assert_eq!(scratch.sky_seeds.capacity(), 0);
+        });
     }
 }
