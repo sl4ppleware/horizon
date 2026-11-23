@@ -97,8 +97,7 @@ struct Taa {
 @group(0) @binding(4) var<uniform> taa: Taa;
 
 // Catmull-Rom over the history in 5 bilinear taps: sharper than one under motion.
-fn sample_history(uv: vec2<f32>) -> vec3<f32> {
-    let size = vec2<f32>(textureDimensions(history));
+fn sample_history(uv: vec2<f32>, size: vec2<f32>) -> vec3<f32> {
     let pos = uv * size;
     let centre = floor(pos - 0.5) + 0.5;
     let f = pos - centre;
@@ -107,9 +106,10 @@ fn sample_history(uv: vec2<f32>) -> vec3<f32> {
     let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
     let w3 = f * f * (-0.5 + 0.5 * f);
     let w12 = w1 + w2;
-    let t0 = (centre - 1.0) / size;
-    let t3 = (centre + 2.0) / size;
-    let t12 = (centre + w2 / w12) / size;
+    let inv_size = 1.0 / size;
+    let t0 = (centre - 1.0) * inv_size;
+    let t3 = (centre + 2.0) * inv_size;
+    let t12 = (centre + w2 / w12) * inv_size;
     let c = textureSampleLevel(history, world_sampler, vec2(t12.x, t0.y), 0.0).rgb * (w12.x * w0.y)
         + textureSampleLevel(history, world_sampler, vec2(t0.x, t12.y), 0.0).rgb * (w0.x * w12.y)
         + textureSampleLevel(history, world_sampler, t12, 0.0).rgb * (w12.x * w12.y)
@@ -141,56 +141,84 @@ fn clip_box(c: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
+struct TaaPresent {
+    @location(0) history: vec4<f32>,
+    @location(1) screen: vec4<f32>,
+};
+
 // It runs at the history's size, which upscaling makes larger than the world's.
 // The history is unjittered: each output pixel takes the world pixel whose
 // jittered sample lands nearest its centre, weighted by how near it lands.
-@fragment fn fs_taa(in: PostOut) -> @location(0) vec4<f32> {
+fn taa_resolve(in_uv: vec2<f32>) -> vec4<f32> {
     let size = vec2<f32>(textureDimensions(world));
     // The jitter moved the scene by `jitter` in clip space: where this pixel's
     // point was drawn, in world pixels.
-    let drawn = (in.uv + taa.jitter.xy * vec2(0.5, -0.5)) * size;
+    let drawn = (in_uv + taa.jitter.xy * vec2(0.5, -0.5)) * size;
     let last = vec2<i32>(size) - 1;
     let p = clamp(vec2<i32>(floor(drawn)), vec2(0), last);
     let centre = textureLoad(world, p, 0);
-    var lo = to_ycocg(centre.rgb);
-    var hi = lo;
+    // Uniform reset: skip the 18 neighbourhood/depth loads and history reprojection.
+    if taa.jitter.z > 0.0 {
+        return centre;
+    }
+    let c0 = to_ycocg(centre.rgb);
+    var lo = c0;
+    var hi = c0;
     // Mean and spread of the 3x3 (YCoCg): the history is clipped to a box around
     // the mean a few deviations wide, tighter than min..max, so that what changed
     // does not linger as a smear.
-    var m1 = vec3(0.0);
-    var m2 = vec3(0.0);
+    var m1 = c0;
+    var m2 = c0 * c0;
     // Reversed depth: the nearest of the 3x3 is the largest, and its motion keeps
     // the edges of what is in front from trailing.
-    var near = 0.0;
+    var near = max(0.0, textureLoad(depth, p, 0).r);
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
-            let q = clamp(p + vec2(x, y), vec2(0), last);
-            let c = to_ycocg(textureLoad(world, q, 0).rgb);
-            lo = min(lo, c);
-            hi = max(hi, c);
-            m1 += c;
-            m2 += c * c;
-            near = max(near, textureLoad(depth, q, 0).r);
+            if x != 0 || y != 0 {
+                let q = clamp(p + vec2(x, y), vec2(0), last);
+                let c = to_ycocg(textureLoad(world, q, 0).rgb);
+                lo = min(lo, c);
+                hi = max(hi, c);
+                m1 += c;
+                m2 += c * c;
+                near = max(near, textureLoad(depth, q, 0).r);
+            }
         }
     }
-    let ndc = vec2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
+    let ndc = vec2(in_uv.x * 2.0 - 1.0, 1.0 - in_uv.y * 2.0);
     let previous = taa.reproject * vec4(ndc, near, 1.0);
     let uv = vec2(0.5, -0.5) * previous.xy / previous.w + 0.5;
-    if taa.jitter.z > 0.0 || any(uv != clamp(uv, vec2(0.0), vec2(1.0))) {
-        return vec4(centre.rgb, centre.a);
+    if any(uv != clamp(uv, vec2(0.0), vec2(1.0))) {
+        return centre;
     }
+    let hist_size = vec2<f32>(textureDimensions(history));
     // How far this pixel moved since the last frame, in output pixels.
-    let speed = length((uv - in.uv) * vec2<f32>(textureDimensions(history)));
+    let speed = length((uv - in_uv) * hist_size);
     let moving = clamp(speed / 6.0, 0.0, 1.0);
     let mean = m1 / 9.0;
     let sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
     let wide = mix(1.25, 0.75, moving) * sigma;
-    let past = from_ycocg(clip_box(to_ycocg(sample_history(uv)), max(lo, mean - wide), min(hi, mean + wide)));
+    let past = from_ycocg(clip_box(
+        to_ycocg(sample_history(uv, hist_size)),
+        max(lo, mean - wide),
+        min(hi, mean + wide),
+    ));
     // How far the sample landed from this pixel's centre, in output pixels: a
     // Gaussian of it scales the new frame's share, so that frames whose sample
     // fell far away (most of them when upscaling) barely move the pixel. Under
     // motion the history is resampled every frame and blurs, so new frames weigh more.
-    let off = (drawn - (vec2<f32>(p) + 0.5)) * vec2<f32>(textureDimensions(history)) / size;
+    let off = (drawn - (vec2<f32>(p) + 0.5)) * hist_size / size;
     let share = mix(0.1, 0.3, moving) * exp(-2.0 * dot(off, off));
     return vec4(mix(past, centre.rgb, share), centre.a);
+}
+
+@fragment fn fs_taa(in: PostOut) -> @location(0) vec4<f32> {
+    return taa_resolve(in.uv);
+}
+
+// Single-pass MRT resolve directly to both history and screen when no
+// resampling or post sharpening is needed, skipping the fullscreen `fs_copy`.
+@fragment fn fs_taa_present(in: PostOut) -> TaaPresent {
+    let resolved = taa_resolve(in.uv);
+    return TaaPresent(resolved, resolved);
 }

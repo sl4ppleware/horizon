@@ -50,7 +50,74 @@ struct TaaUniform {
 struct TaaResources {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
+    /// Single-pass MRT pipeline (`fs_taa_present`) writing `[history[i], screen]` in one pass
+    /// when TAA resolves directly at the screen's size without post sharpening. `None` if the
+    /// backend could not compile the 2-target pipeline (falls back to `pipeline` + `draw_onto`).
+    present: Option<wgpu::RenderPipeline>,
     uniform: wgpu::Buffer,
+}
+
+impl TaaResources {
+    fn upload_uniform(
+        &self,
+        uploads: &mut crate::gfx::upload::Uploads,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &UpscaleFrame<'_>,
+    ) {
+        let uniform = TaaUniform {
+            reproject: frame.reproject,
+            jitter: [
+                frame.jitter_clip[0],
+                frame.jitter_clip[1],
+                if frame.reset { 1.0 } else { 0.0 },
+                0.0,
+            ],
+        };
+        uploads.buffer(encoder, &self.uniform, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// Resolve TAA into `taa.history[i]` and present the resolved colour onto `screen` in one
+    /// MRT render pass, eliminating the fullscreen `fs_copy` pass.
+    fn resolve_and_present(
+        &self,
+        present: &wgpu::RenderPipeline,
+        uploads: &mut crate::gfx::upload::Uploads,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &UpscaleFrame<'_>,
+        taa: &History,
+        screen: &wgpu::TextureView,
+        timing: Option<&mut super::pack_timing::PassTiming>,
+    ) {
+        let i = (frame.index % 2) as usize;
+        self.upload_uniform(uploads, encoder, frame);
+        let clear_store = wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            store: wgpu::StoreOp::Store,
+        };
+        let attachments = [
+            Some(wgpu::RenderPassColorAttachment {
+                view: &taa.history[i],
+                resolve_target: None,
+                depth_slice: None,
+                ops: clear_store,
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: screen,
+                resolve_target: None,
+                depth_slice: None,
+                ops: clear_store,
+            }),
+        ];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Horizon TAA"),
+            timestamp_writes: timing.and_then(|t| t.writes(self.name())),
+            color_attachments: &attachments,
+            ..Default::default()
+        });
+        pass.set_pipeline(present);
+        pass.set_bind_group(0, &taa.resolve[i], &[]);
+        pass.draw(0..3, 0..1);
+    }
 }
 
 /// One frame handed to an upscaler backend: the jittered world at `render_size` and what
@@ -87,7 +154,7 @@ pub(super) trait UpscalerBackend {
     /// Write this frame's output and return the bind group that shows it (`draw_onto`).
     fn resolve<'t>(
         &self,
-        uploads: &mut super::upload::Uploads,
+        uploads: &mut crate::gfx::upload::Uploads,
         encoder: &mut wgpu::CommandEncoder,
         frame: &UpscaleFrame<'_>,
         target: &'t Self::Target,
@@ -104,7 +171,7 @@ impl UpscalerBackend for TaaResources {
 
     fn resolve<'t>(
         &self,
-        uploads: &mut super::upload::Uploads,
+        uploads: &mut crate::gfx::upload::Uploads,
         encoder: &mut wgpu::CommandEncoder,
         frame: &UpscaleFrame<'_>,
         taa: &'t History,
@@ -112,16 +179,7 @@ impl UpscalerBackend for TaaResources {
     ) -> &'t wgpu::BindGroup {
         // The resolve bind group already samples `frame.color` and `frame.depth`.
         let i = (frame.index % 2) as usize;
-        let uniform = TaaUniform {
-            reproject: frame.reproject,
-            jitter: [
-                frame.jitter_clip[0],
-                frame.jitter_clip[1],
-                if frame.reset { 1.0 } else { 0.0 },
-                0.0,
-            ],
-        };
-        uploads.buffer(encoder, &self.uniform, 0, bytemuck::bytes_of(&uniform));
+        self.upload_uniform(uploads, encoder, frame);
         let attachments = [Some(wgpu::RenderPassColorAttachment {
             view: &taa.history[i],
             resolve_target: None,
@@ -304,6 +362,7 @@ impl Post {
                 });
             let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
             let taa_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Horizon TAA"),
                 layout: Some(&taa_pipeline_layout),
@@ -329,18 +388,68 @@ impl Post {
                 multiview_mask: None,
                 cache: None,
             });
+            let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Horizon TAA"),
+                size: std::mem::size_of::<TaaUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let memory = pollster::block_on(memory.pop());
             let internal = pollster::block_on(internal.pop());
-            match internal.or(pollster::block_on(validation.pop())) {
+            let validation = pollster::block_on(validation.pop());
+            match memory.or(internal).or(validation) {
                 None => {
-                    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("Horizon TAA"),
-                        size: std::mem::size_of::<TaaUniform>() as u64,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
+                    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+                    let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                    let present = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("Horizon TAA present"),
+                        layout: Some(&taa_pipeline_layout),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: Some("vs_post"),
+                            compilation_options: Default::default(),
+                            buffers: &[],
+                        },
+                        primitive: Default::default(),
+                        depth_stencil: None,
+                        multisample: Default::default(),
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: Some("fs_taa_present"),
+                            compilation_options: Default::default(),
+                            targets: &[
+                                Some(wgpu::ColorTargetState {
+                                    format: HISTORY_FORMAT,
+                                    blend: None,
+                                    write_mask: wgpu::ColorWrites::ALL,
+                                }),
+                                Some(wgpu::ColorTargetState {
+                                    format,
+                                    blend: None,
+                                    write_mask: wgpu::ColorWrites::ALL,
+                                }),
+                            ],
+                        }),
+                        multiview_mask: None,
+                        cache: None,
                     });
+                    let memory = pollster::block_on(memory.pop());
+                    let internal = pollster::block_on(internal.pop());
+                    let validation = pollster::block_on(validation.pop());
+                    let present = match memory.or(internal).or(validation) {
+                        None => Some(present),
+                        Some(e) => {
+                            log::warn!(
+                                "Horizon renderer: single-pass TAA present unavailable ({e}); using two-pass resolve"
+                            );
+                            None
+                        }
+                    };
                     Some(TaaResources {
                         layout: taa_layout,
                         pipeline: taa_pipeline,
+                        present,
                         uniform,
                     })
                 }
@@ -774,10 +883,34 @@ impl Post {
         })
     }
 
+    /// Whether TAA can resolve into `taa.history[i]` and present onto `screen` in one MRT pass:
+    /// no post sharpening is active (`taa_upscale() <= 1.0 || sharpness == 0.0`), `screen` matches
+    /// `taa.size` and `self.format` without resampling, and `screen` aliases none of TAA's targets.
+    fn can_taa_present(
+        &self,
+        screen: &wgpu::TextureView,
+        target: &WorldTarget,
+        taa: &History,
+    ) -> bool {
+        if self.taa_upscale() > 1.0 && self.sharpness > 0.0 {
+            return false;
+        }
+        let screen_tex = screen.texture();
+        screen_tex.dimension() == wgpu::TextureDimension::D2
+            && screen_tex.mip_level_count() == 1
+            && screen_tex.sample_count() == 1
+            && [screen_tex.width(), screen_tex.height()] == taa.size
+            && screen_tex.format().remove_srgb_suffix() == self.format.remove_srgb_suffix()
+            && screen_tex != taa.history[0].texture()
+            && screen_tex != taa.history[1].texture()
+            && screen_tex != target.color.texture()
+            && screen_tex != target.depth.texture()
+    }
+
     /// Draw the scaled world onto `screen`, through TAA when this frame's `jitter` had it on.
     pub fn finish(
         &self,
-        uploads: &mut super::upload::Uploads,
+        uploads: &mut crate::gfx::upload::Uploads,
         encoder: &mut wgpu::CommandEncoder,
         screen: &wgpu::TextureView,
         mut timing: Option<&mut super::pack_timing::PassTiming>,
@@ -787,6 +920,12 @@ impl Post {
             self.finish_with(encoder, screen, &target.group, timing.as_deref_mut());
             return;
         };
+        if let Some(present) = &res.present
+            && self.can_taa_present(screen, target, taa)
+        {
+            res.resolve_and_present(present, uploads, encoder, &frame, taa, screen, timing);
+            return;
+        }
         let shown = res.resolve(uploads, encoder, &frame, taa, timing.as_deref_mut());
         let pipeline = if self.taa_upscale() > 1.0 {
             &self.sharpen
@@ -804,7 +943,7 @@ impl Post {
     pub(super) fn resolve_taa_staged(
         &mut self,
         device: &wgpu::Device,
-        uploads: &mut super::upload::Uploads,
+        uploads: &mut crate::gfx::upload::Uploads,
         encoder: &mut wgpu::CommandEncoder,
         mut timing: Option<&mut super::pack_timing::PassTiming>,
     ) -> Option<wgpu::TextureView> {
@@ -829,7 +968,7 @@ impl Post {
         encoder: &mut wgpu::CommandEncoder,
         timing: Option<&mut super::pack_timing::PassTiming>,
     ) -> Option<wgpu::TextureView> {
-        let mut uploads = super::upload::Uploads::new(device);
+        let mut uploads = crate::gfx::upload::Uploads::new(device);
         let view = self.resolve_taa_staged(device, &mut uploads, encoder, timing);
         uploads.finish(encoder);
         view
@@ -1255,5 +1394,681 @@ mod tests {
         assert!(post.will_replace_target(window, false, false));
         assert!(post.prepare(&device, window, false, false).is_none());
         assert!(!post.will_replace_target(window, false, false));
+    }
+
+    #[test]
+    fn world_post_wgsl_validates_and_translates_all_targets() {
+        let source = include_str!("../world_post.wgsl");
+        let module = naga::front::wgsl::parse_str(source).expect("world_post.wgsl parses");
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("world_post.wgsl validates");
+
+        let mut found_taa = false;
+        let mut found_present = false;
+        for entry in &module.entry_points {
+            if entry.stage == naga::ShaderStage::Fragment && entry.name == "fs_taa" {
+                found_taa = true;
+            }
+            if entry.stage == naga::ShaderStage::Fragment && entry.name == "fs_taa_present" {
+                found_present = true;
+                let result = entry
+                    .function
+                    .result
+                    .as_ref()
+                    .expect("fs_taa_present returns an MRT struct");
+                let naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner else {
+                    panic!("fs_taa_present must return a struct");
+                };
+                let locations: Vec<u32> = members
+                    .iter()
+                    .map(|m| match &m.binding {
+                        Some(naga::Binding::Location { location, .. }) => *location,
+                        other => panic!("unexpected fs_taa_present member binding: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(locations, [0, 1]);
+            }
+
+            let (processed, processed_info) = naga::back::pipeline_constants::process_overrides(
+                &module,
+                &info,
+                Some((entry.stage, &entry.name)),
+                &Default::default(),
+            )
+            .unwrap_or_else(|e| panic!("overrides {}: {e}", entry.name));
+
+            let mut hlsl = String::new();
+            naga::back::hlsl::Writer::new(
+                &mut hlsl,
+                &naga::back::hlsl::Options::default(),
+                &naga::back::hlsl::PipelineOptions {
+                    entry_point: Some((entry.stage, entry.name.clone())),
+                },
+            )
+            .write(&processed, &processed_info, None)
+            .unwrap_or_else(|e| panic!("HLSL {}: {e}", entry.name));
+            assert!(!hlsl.is_empty(), "HLSL {}", entry.name);
+
+            let (msl, _) = naga::back::msl::write_string(
+                &processed,
+                &processed_info,
+                &naga::back::msl::Options {
+                    fake_missing_bindings: true,
+                    ..Default::default()
+                },
+                &naga::back::msl::PipelineOptions {
+                    entry_point: Some((entry.stage, entry.name.clone())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("MSL {}: {e}", entry.name));
+            assert!(!msl.is_empty(), "MSL {}", entry.name);
+
+            let spv = naga::back::spv::write_vec(
+                &processed,
+                &processed_info,
+                &naga::back::spv::Options::default(),
+                Some(&naga::back::spv::PipelineOptions {
+                    shader_stage: entry.stage,
+                    entry_point: entry.name.clone(),
+                }),
+            )
+            .unwrap_or_else(|e| panic!("SPIR-V {}: {e}", entry.name));
+            assert!(!spv.is_empty(), "SPIR-V {}", entry.name);
+
+            for version in [330, 400] {
+                let mut glsl = String::new();
+                naga::back::glsl::Writer::new(
+                    &mut glsl,
+                    &processed,
+                    &processed_info,
+                    &naga::back::glsl::Options {
+                        version: naga::back::glsl::Version::Desktop(version),
+                        ..Default::default()
+                    },
+                    &naga::back::glsl::PipelineOptions {
+                        shader_stage: entry.stage,
+                        entry_point: entry.name.clone(),
+                        multiview: None,
+                    },
+                    Default::default(),
+                )
+                .and_then(|mut w| w.write())
+                .unwrap_or_else(|e| panic!("GLSL {version} {}: {e}", entry.name));
+                assert!(!glsl.is_empty(), "GLSL {version} {}", entry.name);
+                assert!(
+                    !glsl.contains("ARB_arrays_of_arrays"),
+                    "{} needs ARB_arrays_of_arrays on GLSL {version}",
+                    entry.name
+                );
+            }
+        }
+        assert!(found_taa, "missing fs_taa entry point");
+        assert!(found_present, "missing fs_taa_present entry point");
+
+        // `textureDimensions(history)` is queried once and passed into `sample_history`.
+        assert_eq!(source.matches("textureDimensions(history)").count(), 1);
+        // Uniform reset returns before the 3x3 neighbourhood loop executes.
+        let reset_pos = source
+            .find("if taa.jitter.z > 0.0")
+            .expect("uniform reset check");
+        let loop_pos = source
+            .find("for (var y = -1; y <= 1; y++)")
+            .expect("3x3 neighbourhood loop");
+        assert!(
+            reset_pos < loop_pos,
+            "reset early-out must precede 3x3 loop"
+        );
+    }
+
+    fn make_screen_target(
+        device: &wgpu::Device,
+        size: [u32; 2],
+        format: wgpu::TextureFormat,
+        mip_level_count: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("TAA test screen"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        (texture, view)
+    }
+
+    fn read_texture_bytes(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        texel_bytes: u32,
+    ) -> Vec<u8> {
+        let size = texture.size();
+        let stride = (size.width * texel_bytes).next_multiple_of(256);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("TAA test readback"),
+            size: u64::from(stride * size.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: None,
+                },
+            },
+            size,
+        );
+        queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let mapped = buffer.slice(..).get_mapped_range().unwrap();
+        let row_bytes = (size.width * texel_bytes) as usize;
+        let stride = stride as usize;
+        let mut out = Vec::with_capacity(row_bytes * size.height as usize);
+        for y in 0..size.height as usize {
+            let start = y * stride;
+            out.extend_from_slice(&mapped[start..start + row_bytes]);
+        }
+        drop(mapped);
+        buffer.unmap();
+        out
+    }
+
+    fn make_test_scene_pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        format: wgpu::TextureFormat,
+        phase: f32,
+        scale: f32,
+    ) -> wgpu::RenderPipeline {
+        let constants = [("PHASE", f64::from(phase)), ("SCALE", f64::from(scale))];
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("TAA test scene"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    fn draw_test_world(
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+    ) {
+        let attachments = [Some(wgpu::RenderPassColorAttachment {
+            view: color,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("TAA test scene"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.draw(0..3, 0..1);
+    }
+
+    #[test]
+    fn can_taa_present_gates_mrt_on_sharpening_size_format_and_aliasing() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((device, _)) = test_device() else {
+            eprintln!("TAA MRT gate GPU skipped: no test device");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut post = Post::new(&device, format);
+        if !post.supports_taa() {
+            eprintln!("TAA MRT gate GPU skipped: TAA unsupported");
+            return;
+        }
+        let window = [32, 32];
+        post.taa = true;
+        post.jitter(window, true, Mat4::IDENTITY, DVec3::ZERO);
+        assert!(post.prepare(&device, window, false, false).is_some());
+
+        let (_, matching) = make_screen_target(&device, window, format, 1);
+        let (_, different_size) = make_screen_target(&device, [16, 16], format, 1);
+        let (_, different_format) =
+            make_screen_target(&device, window, wgpu::TextureFormat::Rgba16Float, 1);
+        let (_, mipmapped) = make_screen_target(&device, window, format, 2);
+
+        let check = |post: &Post, view: &wgpu::TextureView| {
+            let target = post.target.as_ref().expect("target");
+            let taa = target.taa.as_ref().expect("history");
+            post.can_taa_present(view, target, taa)
+        };
+
+        // Native 1x TAA uses MRT regardless of the upscaling sharpness slider (default 0.85 or 0.0).
+        assert!(check(&post, &matching));
+        post.set_sharpness(&device, 0.0);
+        assert!(check(&post, &matching));
+        post.set_sharpness(&device, 0.85);
+        assert!(check(&post, &matching));
+
+        // Held upscale behaves as native 1x.
+        post.upscale = 2.0;
+        post.hold_upscale(true);
+        assert!(check(&post, &matching));
+        post.hold_upscale(false);
+
+        // Active upscaling with sharpening > 0 must fall back to 2-pass (`fs_taa` + `fs_sharpen`).
+        assert!(!check(&post, &matching));
+        // Active upscaling with sharpness == 0.0 needs no sharpening pass when sizes match.
+        post.set_sharpness(&device, 0.0);
+        assert!(check(&post, &matching));
+        post.upscale = 1.0;
+        post.set_sharpness(&device, 0.85);
+
+        // Size mismatch, format mismatch, mipmapped target, and aliased TAA targets are rejected.
+        assert!(!check(&post, &different_size));
+        assert!(!check(&post, &different_format));
+        assert!(!check(&post, &mipmapped));
+        {
+            let target = post.target.as_ref().expect("target");
+            let taa = target.taa.as_ref().expect("history");
+            assert!(!post.can_taa_present(&target.color, target, taa));
+            assert!(!post.can_taa_present(&taa.history[0], target, taa));
+            assert!(!post.can_taa_present(&taa.history[1], target, taa));
+            assert!(!post.can_taa_present(&target.depth, target, taa));
+        }
+
+        // Scaled resolution (`scale != 1.0`) mismatches window size and falls back to 2-pass copy.
+        post.scale = 0.75;
+        post.jitter(window, true, Mat4::IDENTITY, DVec3::ZERO);
+        assert!(post.prepare(&device, window, false, false).is_some());
+        assert!(!check(&post, &matching));
+
+        // Non-sRGB view over an sRGB swapchain-style texture is accepted by `remove_srgb_suffix`.
+        post.scale = 1.0;
+        post.jitter(window, true, Mat4::IDENTITY, DVec3::ZERO);
+        assert!(post.prepare(&device, window, false, false).is_some());
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let srgb_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("TAA test sRGB screen"),
+            size: wgpu::Extent3d {
+                width: window[0],
+                height: window[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[format],
+        });
+        let srgb_view = srgb_tex.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(format),
+            ..Default::default()
+        });
+        if pollster::block_on(validation.pop()).is_none() {
+            assert!(check(&post, &srgb_view));
+        }
+    }
+
+    #[test]
+    fn single_pass_mrt_taa_matches_two_pass_resolve_and_copy() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((device, queue)) = test_device() else {
+            eprintln!("TAA MRT pixel-exactness GPU skipped: no test device");
+            return;
+        };
+        let window = [32, 32];
+        let proj = Mat4::perspective_rh(1.2, 1.0, 1024.0, 0.05);
+        let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("TAA test scene"),
+            source: wgpu::ShaderSource::Wgsl(
+                "
+                override PHASE: f32 = 0.0;
+                override SCALE: f32 = 1.0;
+                struct VOut {
+                    @builtin(position) clip: vec4<f32>,
+                    @location(0) uv: vec2<f32>,
+                };
+                @vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
+                    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+                    let z = 0.2 + 0.25 * p.x + 0.15 * p.y;
+                    return VOut(vec4<f32>(p * 2.0 - 1.0, z, 1.0), vec2<f32>(p.x, 1.0 - p.y));
+                }
+                @fragment fn fs(in: VOut) -> @location(0) vec4<f32> {
+                    let s = in.uv + vec2<f32>(PHASE * 0.07, PHASE * 0.03);
+                    let edge = select(0.15, 0.85, s.x > 0.45);
+                    let checker = select(0.0, 0.3, ((u32(s.x * 16.0) + u32(s.y * 16.0)) & 1u) == 0u);
+                    let r = clamp(edge + checker, 0.0, 1.0) * SCALE;
+                    let g = fract(s.y * 3.0 + PHASE * 0.2) * SCALE;
+                    let b = (0.2 + 0.5 * s.x * s.y) * SCALE;
+                    return vec4<f32>(r, g, b, 1.0);
+                }
+                "
+                .into(),
+            ),
+        });
+        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("TAA test scene"),
+            bind_group_layouts: &[],
+            ..Default::default()
+        });
+        let frames = [
+            // Frame 0: initial reset (`taa.jitter.z == 1.0`), tests reset early-out.
+            (0.0f32, proj, DVec3::new(0.0, 64.0, 0.0), false),
+            // Frame 1: subtle motion (`taa.jitter.z == 0.0`), tests 3x3 clamp + history blend.
+            (
+                1.0f32,
+                proj * Mat4::from_rotation_y(0.02),
+                DVec3::new(0.15, 64.02, -0.1),
+                false,
+            ),
+            // Frame 2: large jump (`taa.jitter.z == 0.0`), tests off-screen UV disocclusion.
+            (
+                2.0f32,
+                proj * Mat4::from_rotation_y(1.8),
+                DVec3::new(5.0, 64.0, 5.0),
+                false,
+            ),
+            // Frame 3: after `forget_history()`, tests discarded-frame / cut reset recovery.
+            (
+                3.0f32,
+                proj * Mat4::from_rotation_y(1.82),
+                DVec3::new(5.1, 64.0, 5.0),
+                true,
+            ),
+        ];
+
+        for (label, format, texel_bytes, color_scale, upscale, sharpness, exact_blend_screen) in [
+            (
+                "native Rgba16Float HDR",
+                wgpu::TextureFormat::Rgba16Float,
+                8u32,
+                2.5f32,
+                1.0f32,
+                0.85f32,
+                true,
+            ),
+            (
+                "upscale 2x sharpness 0 Rgba16Float",
+                wgpu::TextureFormat::Rgba16Float,
+                8u32,
+                2.5f32,
+                2.0f32,
+                0.0f32,
+                true,
+            ),
+            (
+                "native Rgba8Unorm SDR",
+                wgpu::TextureFormat::Rgba8Unorm,
+                4u32,
+                1.0f32,
+                1.0f32,
+                0.85f32,
+                false,
+            ),
+        ] {
+            let mut post_mrt = Post::new(&device, format);
+            let mut post_ref = Post::new(&device, format);
+            if !post_mrt.supports_taa() {
+                eprintln!("TAA MRT pixel-exactness GPU skipped: TAA unsupported");
+                return;
+            }
+            assert!(
+                post_mrt
+                    .taa_resources
+                    .as_ref()
+                    .is_some_and(|r| r.present.is_some()),
+                "{label}: MRT present pipeline must compile"
+            );
+            // Force the reference instance onto the production 2-pass fallback path.
+            post_ref.taa_resources.as_mut().expect("TAA").present = None;
+            for post in [&mut post_mrt, &mut post_ref] {
+                post.taa = true;
+                post.upscale = upscale;
+                post.set_sharpness(&device, sharpness);
+            }
+
+            let (screen_mrt_tex, screen_mrt) = make_screen_target(&device, window, format, 1);
+            let (screen_ref_tex, screen_ref) = make_screen_target(&device, window, format, 1);
+            let mut uploads_mrt = crate::gfx::upload::Uploads::new(&device);
+            let mut uploads_ref = crate::gfx::upload::Uploads::new(&device);
+            let mut prev_screen = Vec::new();
+
+            for (frame_idx, (phase, view_proj, camera, forget)) in frames.into_iter().enumerate() {
+                if forget {
+                    post_mrt.forget_history();
+                    post_ref.forget_history();
+                }
+                let _ = post_mrt.jitter(window, true, view_proj, camera);
+                let _ = post_ref.jitter(window, true, view_proj, camera);
+                let (color_mrt, depth_mrt) = post_mrt
+                    .prepare(&device, window, false, false)
+                    .expect("MRT target");
+                let (color_ref, depth_ref) = post_ref
+                    .prepare(&device, window, false, false)
+                    .expect("ref target");
+                {
+                    let target = post_mrt.target.as_ref().expect("MRT target");
+                    let taa = target.taa.as_ref().expect("MRT history");
+                    assert!(
+                        post_mrt.can_taa_present(&screen_mrt, target, taa),
+                        "{label} frame {frame_idx}: expected MRT path"
+                    );
+                }
+
+                let scene_pipeline = make_test_scene_pipeline(
+                    &device,
+                    &scene_shader,
+                    &scene_layout,
+                    format,
+                    phase,
+                    color_scale,
+                );
+                let mut encoder = device.create_command_encoder(&Default::default());
+                draw_test_world(&mut encoder, &scene_pipeline, &color_mrt, &depth_mrt);
+                draw_test_world(&mut encoder, &scene_pipeline, &color_ref, &depth_ref);
+                post_mrt.finish(&mut uploads_mrt, &mut encoder, &screen_mrt, None);
+                post_ref.finish(&mut uploads_ref, &mut encoder, &screen_ref, None);
+                uploads_mrt.finish(&encoder);
+                uploads_ref.finish(&encoder);
+                queue.submit([encoder.finish()]);
+
+                let got_screen = read_texture_bytes(&device, &queue, &screen_mrt_tex, texel_bytes);
+                let exp_screen = read_texture_bytes(&device, &queue, &screen_ref_tex, texel_bytes);
+                let hist_slot = (post_mrt.taa_frame % 2) as usize;
+                fn history_tex(post: &Post, slot: usize) -> &wgpu::Texture {
+                    post.target
+                        .as_ref()
+                        .expect("target")
+                        .taa
+                        .as_ref()
+                        .expect("history")
+                        .history[slot]
+                        .texture()
+                }
+                let got_hist =
+                    read_texture_bytes(&device, &queue, history_tex(&post_mrt, hist_slot), 8);
+                let exp_hist =
+                    read_texture_bytes(&device, &queue, history_tex(&post_ref, hist_slot), 8);
+
+                // History buffer (`Rgba16Float`) must be bit-for-bit identical on every frame.
+                assert_eq!(
+                    got_hist, exp_hist,
+                    "{label} frame {frame_idx}: history mismatch"
+                );
+
+                // Screen target: exact for `Rgba16Float` and on reset frames for `Rgba8Unorm`;
+                // blended 8-bit frames may differ by at most 1 LSB because MRT writes f32->unorm8
+                // directly instead of double-rounding through f16 history.
+                let is_reset = frame_idx == 0 || forget;
+                if exact_blend_screen || is_reset {
+                    assert_eq!(
+                        got_screen, exp_screen,
+                        "{label} frame {frame_idx}: screen mismatch"
+                    );
+                } else {
+                    assert_eq!(got_screen.len(), exp_screen.len());
+                    let max_diff = got_screen
+                        .iter()
+                        .zip(&exp_screen)
+                        .map(|(&a, &b)| a.abs_diff(b))
+                        .max()
+                        .unwrap_or(0);
+                    assert!(
+                        max_diff <= 1,
+                        "{label} frame {frame_idx}: max channel diff {max_diff} > 1 LSB"
+                    );
+                }
+                assert!(
+                    got_screen.iter().any(|&b| b != 0),
+                    "{label} frame {frame_idx}: rendered output should not be all zeros"
+                );
+                if frame_idx > 0 {
+                    assert_ne!(
+                        got_screen, prev_screen,
+                        "{label} frame {frame_idx}: frame should advance"
+                    );
+                }
+                prev_screen = got_screen;
+            }
+        }
+
+        // Verify MRT also executes cleanly against a non-sRGB view over an sRGB swapchain-style
+        // texture (the `view_target` layout on sRGB swapchains).
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let make_srgb = || {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("TAA test sRGB screen"),
+                size: wgpu::Extent3d {
+                    width: window[0],
+                    height: window[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[format],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(format),
+                ..Default::default()
+            });
+            (tex, view)
+        };
+        let (srgb_mrt_tex, srgb_mrt) = make_srgb();
+        let (srgb_ref_tex, srgb_ref) = make_srgb();
+        if pollster::block_on(validation.pop()).is_none() {
+            let mut post_mrt = Post::new(&device, format);
+            let mut post_ref = Post::new(&device, format);
+            if post_mrt.supports_taa() {
+                post_ref.taa_resources.as_mut().expect("TAA").present = None;
+                for post in [&mut post_mrt, &mut post_ref] {
+                    post.taa = true;
+                }
+                let _ = post_mrt.jitter(window, true, proj, DVec3::ZERO);
+                let _ = post_ref.jitter(window, true, proj, DVec3::ZERO);
+                let (color_mrt, depth_mrt) = post_mrt
+                    .prepare(&device, window, false, false)
+                    .expect("MRT target");
+                let (color_ref, depth_ref) = post_ref
+                    .prepare(&device, window, false, false)
+                    .expect("ref target");
+                let scene_pipeline = make_test_scene_pipeline(
+                    &device,
+                    &scene_shader,
+                    &scene_layout,
+                    format,
+                    0.5,
+                    1.0,
+                );
+                let mut uploads_mrt = crate::gfx::upload::Uploads::new(&device);
+                let mut uploads_ref = crate::gfx::upload::Uploads::new(&device);
+                {
+                    let target = post_mrt.target.as_ref().expect("MRT target");
+                    let taa = target.taa.as_ref().expect("MRT history");
+                    assert!(
+                        post_mrt.can_taa_present(&srgb_mrt, target, taa),
+                        "sRGB swapchain view must use single-pass MRT"
+                    );
+                }
+                let mut encoder = device.create_command_encoder(&Default::default());
+                draw_test_world(&mut encoder, &scene_pipeline, &color_mrt, &depth_mrt);
+                draw_test_world(&mut encoder, &scene_pipeline, &color_ref, &depth_ref);
+                post_mrt.finish(&mut uploads_mrt, &mut encoder, &srgb_mrt, None);
+                post_ref.finish(&mut uploads_ref, &mut encoder, &srgb_ref, None);
+                uploads_mrt.finish(&encoder);
+                uploads_ref.finish(&encoder);
+                queue.submit([encoder.finish()]);
+                assert_eq!(
+                    read_texture_bytes(&device, &queue, &srgb_mrt_tex, 4),
+                    read_texture_bytes(&device, &queue, &srgb_ref_tex, 4),
+                    "sRGB swapchain view reset frame mismatch"
+                );
+            }
+        }
     }
 }

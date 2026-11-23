@@ -14196,6 +14196,7 @@ mod tests {
         // CIT glint sampled one image through two samplers until arismoko/horizon#2386.
         for (file, entry) in [
             ("world_post.wgsl", "fs_taa"),
+            ("world_post.wgsl", "fs_taa_present"),
             ("pack_post.wgsl", "fs_blit"),
             ("hud.wgsl", "fs_cit_glint"),
         ] {
