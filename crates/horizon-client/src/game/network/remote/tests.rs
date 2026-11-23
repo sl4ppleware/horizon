@@ -381,6 +381,7 @@ fn update_attributes_answers_the_local_players_living_reads() {
                 position: [0.0; 3],
                 codec_base: [0.0; 3],
                 silent: false,
+                bucket: super::EntityBucket::Mob,
                 vehicle: None,
             },
         );
@@ -4240,6 +4241,7 @@ fn any_tracked_passenger_makes_its_vehicle_a_vehicle() {
         position: [0.0, 64.0, 0.0],
         codec_base: [0.0, 64.0, 0.0],
         silent: false,
+        bucket: super::EntityBucket::classify(kind, kind == "minecraft:player"),
         vehicle: None,
     };
     let mut entities = HashMap::from([
@@ -4335,6 +4337,7 @@ fn a_sound_entity_is_heard_where_its_entity_is() {
             position: [8.5, 64.0, -3.5],
             codec_base: [8.5, 64.0, -3.5],
             silent: false,
+            bucket: super::EntityBucket::Mob,
             vehicle: None,
         },
     );
@@ -4379,6 +4382,7 @@ fn a_sound_entity_retains_silence_for_players_and_non_mob_targets() {
             position: [8.5, 64.0, -3.5],
             codec_base: [8.5, 64.0, -3.5],
             silent: true,
+            bucket: super::EntityBucket::Projectile,
             vehicle: None,
         },
     );
@@ -4392,6 +4396,102 @@ fn a_sound_entity_retains_silence_for_players_and_non_mob_targets() {
     assert!(player.silent);
     assert!(super::entity_sound_state(9, None, None, &tracked, None).is_none());
 }
+#[test]
+fn entity_bucket_classifies_client_collections_and_packs_in_one_byte() {
+    use super::EntityBucket;
+    assert_eq!(std::mem::size_of::<EntityBucket>(), 1);
+    let all = [
+        EntityBucket::Mob,
+        EntityBucket::Dragon,
+        EntityBucket::Dropped,
+        EntityBucket::ArmorStand,
+        EntityBucket::Boat,
+        EntityBucket::Cart,
+        EntityBucket::Orb,
+        EntityBucket::Projectile,
+        EntityBucket::Falling,
+        EntityBucket::Tnt,
+        EntityBucket::Trident,
+        EntityBucket::Rocket,
+        EntityBucket::Hook,
+        EntityBucket::Object,
+        EntityBucket::Other,
+    ];
+    let mut union = 0u16;
+    for b in all {
+        assert_eq!(union & b.bit(), 0, "duplicate bit for {b:?}");
+        union |= b.bit();
+    }
+    assert_eq!(union, EntityBucket::ALL_MASK);
+
+    for (kind, is_mob, expected) in [
+        ("minecraft:zombie", true, EntityBucket::Mob),
+        ("minecraft:player", true, EntityBucket::Mob),
+        ("custom:mod_mob", true, EntityBucket::Mob),
+        ("minecraft:ender_dragon", true, EntityBucket::Dragon),
+        ("minecraft:item", false, EntityBucket::Dropped),
+        ("minecraft:armor_stand", false, EntityBucket::ArmorStand),
+        ("minecraft:oak_boat", false, EntityBucket::Boat),
+        ("minecraft:bamboo_chest_raft", false, EntityBucket::Boat),
+        ("minecraft:minecart", false, EntityBucket::Cart),
+        ("minecraft:tnt_minecart", false, EntityBucket::Cart),
+        ("minecraft:experience_orb", false, EntityBucket::Orb),
+        ("minecraft:arrow", false, EntityBucket::Projectile),
+        ("minecraft:spectral_arrow", false, EntityBucket::Projectile),
+        ("minecraft:snowball", false, EntityBucket::Projectile),
+        ("minecraft:wind_charge", false, EntityBucket::Projectile),
+        ("minecraft:shulker_bullet", false, EntityBucket::Projectile),
+        ("minecraft:falling_block", false, EntityBucket::Falling),
+        ("minecraft:tnt", false, EntityBucket::Tnt),
+        ("minecraft:trident", false, EntityBucket::Trident),
+        ("minecraft:firework_rocket", false, EntityBucket::Rocket),
+        ("minecraft:fishing_bobber", false, EntityBucket::Hook),
+        ("minecraft:text_display", false, EntityBucket::Object),
+        ("minecraft:interaction", false, EntityBucket::Object),
+        ("minecraft:item_frame", false, EntityBucket::Object),
+        ("minecraft:painting", false, EntityBucket::Object),
+        ("minecraft:cushion", false, EntityBucket::Object),
+        ("minecraft:leash_knot", false, EntityBucket::Object),
+        ("minecraft:end_crystal", false, EntityBucket::Other),
+        ("minecraft:area_effect_cloud", false, EntityBucket::Other),
+        ("minecraft:splash_potion", false, EntityBucket::Other),
+        ("minecraft:eye_of_ender", false, EntityBucket::Other),
+        ("minecraft:evoker_fangs", false, EntityBucket::Other),
+        ("minecraft:marker", false, EntityBucket::Other),
+    ] {
+        assert_eq!(
+            EntityBucket::classify(kind, is_mob),
+            expected,
+            "classify({kind}, {is_mob})"
+        );
+    }
+
+    assert_eq!(
+        EntityBucket::Dropped.bit() & EntityBucket::VEHICLE_CANDIDATE_MASK,
+        0
+    );
+    assert_eq!(
+        EntityBucket::Orb.bit() & EntityBucket::VEHICLE_CANDIDATE_MASK,
+        0
+    );
+    assert_eq!(
+        EntityBucket::Projectile.bit() & EntityBucket::VEHICLE_CANDIDATE_MASK,
+        0
+    );
+    assert_ne!(
+        EntityBucket::Boat.bit() & EntityBucket::VEHICLE_CANDIDATE_MASK,
+        0
+    );
+    assert_ne!(
+        EntityBucket::Cart.bit() & EntityBucket::VEHICLE_CANDIDATE_MASK,
+        0
+    );
+    assert_ne!(
+        EntityBucket::Mob.bit() & EntityBucket::VEHICLE_CANDIDATE_MASK,
+        0
+    );
+}
+
 #[test]
 fn a_dragon_sound_uses_live_movement_without_losing_mob_metadata() {
     use horizon_client::sound_engine::SoundEntityState;
@@ -4887,9 +4987,17 @@ fn an_unfocused_window_waits_for_the_loading_screen_to_pause() {
             .start_client_load(0, Reason::Other);
         game.focus_lost = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
         game.pause_if_inactive();
-        assert_eq!(game.screen, crate::game::Screen::Playing, "loading screen up");
+        assert_eq!(
+            game.screen,
+            crate::game::Screen::Playing,
+            "loading screen up"
+        );
         game.remote.as_mut().unwrap().level_load.finish();
         game.pause_if_inactive();
-        assert_eq!(game.screen, crate::game::Screen::Paused, "loading screen closed");
+        assert_eq!(
+            game.screen,
+            crate::game::Screen::Paused,
+            "loading screen closed"
+        );
     });
 }

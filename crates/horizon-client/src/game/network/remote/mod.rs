@@ -239,6 +239,124 @@ impl ChunkGenerator for NoTerrain {
     }
 }
 
+/// Which client-side entity collection holds a tracked server entity.
+/// Stored as one byte on [`Tracked`] so move, motion, data, equipment and
+/// removal packets route straight to the matching list instead of scanning
+/// every entity family.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum EntityBucket {
+    Mob = 0,
+    Dragon = 1,
+    Dropped = 2,
+    ArmorStand = 3,
+    Boat = 4,
+    Cart = 5,
+    Orb = 6,
+    Projectile = 7,
+    Falling = 8,
+    Tnt = 9,
+    Trident = 10,
+    Rocket = 11,
+    Hook = 12,
+    Object = 13,
+    Other = 14,
+}
+
+impl EntityBucket {
+    pub(in crate::game) const ALL_MASK: u16 = (1u16 << 15) - 1;
+    /// Buckets whose removal may need the fallback mount/rider scan across
+    /// `mobs`, `armor_stands`, `boats`, `text_displays` and `interactions`
+    /// even when no `SetPassengers` entry was recorded in `passenger_vehicles`.
+    pub(in crate::game) const VEHICLE_CANDIDATE_MASK: u16 = Self::Mob.bit()
+        | Self::Dragon.bit()
+        | Self::ArmorStand.bit()
+        | Self::Boat.bit()
+        | Self::Cart.bit()
+        | Self::Object.bit()
+        | Self::Other.bit();
+
+    pub(in crate::game) const fn bit(self) -> u16 {
+        1u16 << (self as u8)
+    }
+
+    /// Classify an entity type spawned on a client. `is_mob` is true when
+    /// `spawn_entity_body` resolved a [`MobType`] for `kind`.
+    pub(in crate::game) fn classify(kind: &str, is_mob: bool) -> Self {
+        match kind {
+            "minecraft:ender_dragon" => Self::Dragon,
+            "minecraft:experience_orb" => Self::Orb,
+            "minecraft:item" => Self::Dropped,
+            "minecraft:armor_stand" => Self::ArmorStand,
+            "minecraft:falling_block" => Self::Falling,
+            "minecraft:tnt" => Self::Tnt,
+            "minecraft:trident" => Self::Trident,
+            "minecraft:firework_rocket" => Self::Rocket,
+            "minecraft:fishing_bobber" => Self::Hook,
+            "minecraft:leash_knot"
+            | "minecraft:text_display"
+            | "minecraft:block_display"
+            | "minecraft:item_display"
+            | "minecraft:ominous_item_spawner"
+            | "minecraft:interaction"
+            | "minecraft:item_frame"
+            | "minecraft:glow_item_frame"
+            | "minecraft:cushion"
+            | "minecraft:lightning_bolt"
+            | "minecraft:painting" => Self::Object,
+            "minecraft:arrow"
+            | "minecraft:spectral_arrow"
+            | "minecraft:snowball"
+            | "minecraft:egg"
+            | "minecraft:ender_pearl"
+            | "minecraft:small_fireball"
+            | "minecraft:fireball"
+            | "minecraft:dragon_fireball"
+            | "minecraft:llama_spit"
+            | "minecraft:wind_charge"
+            | "minecraft:breeze_wind_charge"
+            | "minecraft:shulker_bullet"
+            | "minecraft:wither_skull" => Self::Projectile,
+            _ if is_mob => Self::Mob,
+            _ if horizon_gameplay::minecarts::CartKind::from_id(kind).is_some() => Self::Cart,
+            _ if horizon_gameplay::boats::any_boat_wood(kind).is_some() => Self::Boat,
+            _ if horizon_client::projectiles::thrown_type(kind).is_some() => Self::Projectile,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Stamp-validated O(1) id-to-slot caches for non-mob remote entity lists.
+/// Each cache auto-invalidates on any structural change to its [`JoinList`].
+#[derive(Default)]
+pub(super) struct RemoteEntityIndices {
+    pub(super) dropped: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) armor_stands: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) boats: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) carts: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) orbs: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) projectiles: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) falling: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) tnts: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) tridents: horizon_gameplay::mob_index::EntityIndex,
+    pub(super) rockets: horizon_gameplay::mob_index::EntityIndex,
+}
+
+impl RemoteEntityIndices {
+    pub(super) fn clear(&mut self) {
+        self.dropped.clear();
+        self.armor_stands.clear();
+        self.boats.clear();
+        self.carts.clear();
+        self.orbs.clear();
+        self.projectiles.clear();
+        self.falling.clear();
+        self.tnts.clear();
+        self.tridents.clear();
+        self.rockets.clear();
+    }
+}
+
 /// A server entity the client tracks (position as last sent).
 pub(super) struct Tracked {
     kind: String,
@@ -249,6 +367,7 @@ pub(super) struct Tracked {
     /// this base, so the server's next delta still lands where it means.
     codec_base: [f64; 3],
     silent: bool,
+    pub(in crate::game) bucket: EntityBucket,
     /// `Entity.vehicle`: the entity it rides (`SetPassengers`), whatever either one's type.
     pub(in crate::game) vehicle: Option<u32>,
 }
@@ -619,6 +738,7 @@ pub(super) struct Remote {
     /// follows (`horizon:menu_extra`).
     pub(in crate::game) menu_extra: Option<horizon_protocol::menu_extra::Message>,
     pub(super) entities: HashMap<i32, Tracked>,
+    pub(super) entity_indices: RemoteEntityIndices,
     /// Per-tick remote entity scratch retained between frames.
     tick_fluids: Vec<Option<horizon_client::mobs::living::Fluids>>,
     tick_rain: Vec<bool>,

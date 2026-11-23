@@ -485,29 +485,35 @@ use super::villager_client::villager_data;
 impl Game<'_> {
     /// SetEntityData for a mob of the server's.
     pub(super) fn remote_mob_data(&mut self, id: i32, values: &[(u8, i32, Value)]) {
-        let Some(r) = &self.remote else {
+        if self.remote.is_none() {
+            return;
+        }
+        let Some(idx) = self.mob_index.find_stamped(&self.mobs, id as u32) else {
             return;
         };
         // LivingEntity.onSyncedDataUpdated(SLEEPING_POS_ID): a villager lies
         // in its bed the way the bed faces, or gets up.
-        let bed = values.iter().find_map(|v| match v {
-            (14, _, Value::OptPos(bed)) => Some(bed.map_or(0, |b| self.bed_facing(b))),
-            _ => None,
-        });
-        let professions = r.professions.clone();
-        if let Some(m) = self.mob_index.get_mut(&mut self.mobs, id as u32) {
-            let stare_sound =
-                super::villager_client::receive(m, values, &r.builtin, r.entity_id, &professions);
-            apply_registry_data(m, values, &r.registries, self.world.game_time);
-            if let Some(code) = bed
-                && m.species() == Species::Villager
-            {
-                m.extra.ints[1] = code;
-            }
-            if let Some(at) = stare_sound {
-                self.audio
-                    .play_unshared("minecraft:entity.enderman.stare", Some(at), 2.5, 1.0);
-            }
+        let bed = (self.mobs[idx].species() == Species::Villager)
+            .then(|| {
+                values.iter().find_map(|v| match v {
+                    (14, _, Value::OptPos(bed)) => Some(bed.map_or(0, |b| self.bed_facing(b))),
+                    _ => None,
+                })
+            })
+            .flatten();
+        let Some(r) = &self.remote else {
+            return;
+        };
+        let m = &mut self.mobs[idx];
+        let stare_sound =
+            super::villager_client::receive(m, values, &r.builtin, r.entity_id, &r.professions);
+        apply_registry_data(m, values, &r.registries, self.world.game_time);
+        if let Some(code) = bed {
+            m.extra.ints[1] = code;
+        }
+        if let Some(at) = stare_sound {
+            self.audio
+                .play_unshared("minecraft:entity.enderman.stare", Some(at), 2.5, 1.0);
         }
     }
 }

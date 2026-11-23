@@ -11,7 +11,14 @@ impl Game<'_> {
             .remote
             .as_mut()
             .and_then(|r| r.pending_items.remove(&id));
-        if let Some(item) = self.dropped.iter_mut().find(|d| d.id == id as u32) {
+        let existing = if let Some(r) = self.remote.as_mut() {
+            r.entity_indices
+                .dropped
+                .get_mut_stamped(&mut self.dropped, |d| d.id, id as u32)
+        } else {
+            self.dropped.iter_mut().find(|d| d.id == id as u32)
+        };
+        if let Some(item) = existing {
             item.stack = stack;
             return;
         }
@@ -23,39 +30,33 @@ impl Game<'_> {
         let mut random = horizon_client::mobs::entity_random(id as u32, at);
         let bob =
             super::super::item_entities::bob_offset(at, random.next_float(), self.clock.still());
-        self.dropped.push(ItemEntity {
+        let entity = ItemEntity {
             random,
             ..ItemEntity::new(id as u32, stack, at, velocity, bob)
-        });
+        };
+        if let Some(r) = self.remote.as_mut() {
+            r.entity_indices
+                .dropped
+                .replace_or_push(&mut self.dropped, |d| d.id, entity);
+        } else {
+            self.dropped.push(entity);
+        }
     }
     /// `Entity.lerpMotion` (and `recreateFromPacket`'s motion) for the
     /// entities whose own tick moves them on a client: dropped items, experience
     /// orbs, falling blocks and primed TNT.
     pub(super) fn remote_motion_body(&mut self, id: i32, velocity: [f64; 3]) {
-        self.remote_dragon_motion(id, velocity);
+        let bucket = self
+            .remote
+            .as_ref()
+            .and_then(|r| r.entities.get(&id).map(|t| t.bucket));
         let v = Vec3::new(velocity[0], velocity[1], velocity[2]);
-        // `falling` and `tnts` are searched from the back: AddEntity calls this right after
-        // appending the block or TNT, so a spawn doesn't walk the whole list.
-        if let Some(m) = self.mob_index.get_mut(&mut self.mobs, id as u32) {
-            // Squid.aiStep derives its body pitch and roll from network motion.
-            m.velocity = v;
-        } else if let Some(d) = self.dropped.iter_mut().find(|d| d.id == id as u32) {
-            d.velocity = v;
-        } else if let Some(i) = self.falling.iter().rposition(|f| f.id == id as u32) {
-            self.falling.update(i, |f| f.velocity = v);
-        } else if let Some(t) = self.tnts.iter_mut().rev().find(|t| t.id == id as u32) {
-            t.velocity = v;
-        } else if let Some(o) = self.orbs.iter_mut().find(|o| o.id == id as u32) {
-            o.velocity = v;
-        } else if let Some(i) = self.carts.iter().position(|c| c.id == id as u32) {
-            self.carts.update(i, |c| c.velocity = v);
-        } else if let Some(i) = self
-            .creatures
-            .projectiles
-            .iter()
-            .position(|p| p.id == id as u32)
-        {
-            self.creatures.projectiles.update(i, |p| {
+        let set_projectile_motion = |projectiles: &mut horizon_client::join_seq::JoinList<
+            horizon_client::projectiles::Projectile,
+            false,
+        >,
+                                     i: usize| {
+            projectiles.update(i, |p| {
                 p.velocity = v;
                 // AbstractArrow.lerpMotion: the stuck timer restarts, and an
                 // arrow the server set moving leaves the block it was stuck in.
@@ -67,7 +68,8 @@ impl Game<'_> {
                     }
                 }
             });
-        } else if let Some(t) = self.tridents.iter_mut().find(|t| t.id == id as u32) {
+        };
+        let set_trident_motion = |t: &mut horizon_gameplay::trident::ThrownTrident| {
             t.velocity = v;
             // AbstractArrow.lerpMotion (ThrownTrident keeps it): `life`
             // restarts, and a trident set moving leaves its block.
@@ -75,17 +77,230 @@ impl Game<'_> {
             if t.in_ground && v.length_squared() > 0.0 {
                 t.in_ground = false;
             }
-        } else if let Some(r) = self.rockets.iter_mut().find(|r| r.id == id as u32) {
-            r.velocity = v;
-        } else if self.remote_hook_motion(id as u32, v) {
-        } else if let Some(p) = self
-            .remote
-            .as_mut()
-            .and_then(|r| r.pending_items.get_mut(&id))
-        {
-            p.1 = v;
-        } else if !self.potions.remote_thrown_motion(id as u32, v) {
-            self.end.remote_eye_motion(id as u32, velocity);
+        };
+        match bucket {
+            Some(EntityBucket::Mob) => {
+                if let Some(m) = self.mob_index.get_mut(&mut self.mobs, id as u32) {
+                    // Squid.aiStep derives its body pitch and roll from network motion.
+                    m.velocity = v;
+                }
+            }
+            Some(EntityBucket::Dragon) => {
+                self.remote_dragon_motion(id, velocity);
+                if let Some(m) = self.mob_index.get_mut(&mut self.mobs, id as u32) {
+                    m.velocity = v;
+                }
+            }
+            Some(EntityBucket::Dropped) => {
+                if let Some(r) = self.remote.as_mut() {
+                    if let Some(d) = r.entity_indices.dropped.get_mut_stamped(
+                        &mut self.dropped,
+                        |d| d.id,
+                        id as u32,
+                    ) {
+                        d.velocity = v;
+                    } else if let Some(p) = r.pending_items.get_mut(&id) {
+                        p.1 = v;
+                    }
+                }
+            }
+            Some(EntityBucket::Falling) => {
+                if let Some(i) = self.remote.as_mut().and_then(|r| {
+                    r.entity_indices
+                        .falling
+                        .find_stamped(&self.falling, |f| f.id, id as u32)
+                }) {
+                    self.falling.update(i, |f| f.velocity = v);
+                }
+            }
+            Some(EntityBucket::Tnt) => {
+                if let Some(t) = self.remote.as_mut().and_then(|r| {
+                    r.entity_indices
+                        .tnts
+                        .get_mut_stamped(&mut self.tnts, |t| t.id, id as u32)
+                }) {
+                    t.velocity = v;
+                }
+            }
+            Some(EntityBucket::Orb) => {
+                if let Some(o) = self.remote.as_mut().and_then(|r| {
+                    r.entity_indices
+                        .orbs
+                        .get_mut_stamped(&mut self.orbs, |o| o.id, id as u32)
+                }) {
+                    o.velocity = v;
+                }
+            }
+            Some(EntityBucket::Cart) => {
+                if let Some(i) = self.remote.as_mut().and_then(|r| {
+                    r.entity_indices
+                        .carts
+                        .find_stamped(&self.carts, |c| c.id, id as u32)
+                }) {
+                    self.carts.update(i, |c| c.velocity = v);
+                }
+            }
+            Some(EntityBucket::Projectile) => {
+                if let Some(i) = self.remote.as_mut().and_then(|r| {
+                    r.entity_indices.projectiles.find_stamped(
+                        &self.creatures.projectiles,
+                        |p| p.id,
+                        id as u32,
+                    )
+                }) {
+                    set_projectile_motion(&mut self.creatures.projectiles, i);
+                }
+            }
+            Some(EntityBucket::Trident) => {
+                if let Some(t) = self.remote.as_mut().and_then(|r| {
+                    r.entity_indices.tridents.get_mut_stamped(
+                        &mut self.tridents,
+                        |t| t.id,
+                        id as u32,
+                    )
+                }) {
+                    set_trident_motion(t);
+                }
+            }
+            Some(EntityBucket::Rocket) => {
+                if let Some(r) = self.remote.as_mut().and_then(|r| {
+                    r.entity_indices
+                        .rockets
+                        .get_mut_stamped(&mut self.rockets, |r| r.id, id as u32)
+                }) {
+                    r.velocity = v;
+                }
+            }
+            Some(EntityBucket::Hook) => {
+                let _ = self.remote_hook_motion(id as u32, v);
+            }
+            Some(EntityBucket::ArmorStand | EntityBucket::Boat | EntityBucket::Object) => {}
+            Some(EntityBucket::Other) => {
+                if !self.potions.remote_thrown_motion(id as u32, v) {
+                    self.end.remote_eye_motion(id as u32, velocity);
+                }
+            }
+            None => {
+                self.remote_dragon_motion(id, velocity);
+                if let Some(m) = self.mob_index.get_mut(&mut self.mobs, id as u32) {
+                    m.velocity = v;
+                    return;
+                }
+                if let Some(r) = self.remote.as_mut() {
+                    if let Some(d) = r.entity_indices.dropped.get_mut_stamped(
+                        &mut self.dropped,
+                        |d| d.id,
+                        id as u32,
+                    ) {
+                        d.velocity = v;
+                        return;
+                    }
+                    if let Some(i) =
+                        r.entity_indices
+                            .falling
+                            .find_stamped(&self.falling, |f| f.id, id as u32)
+                    {
+                        self.falling.update(i, |f| f.velocity = v);
+                        return;
+                    }
+                    if let Some(t) =
+                        r.entity_indices
+                            .tnts
+                            .get_mut_stamped(&mut self.tnts, |t| t.id, id as u32)
+                    {
+                        t.velocity = v;
+                        return;
+                    }
+                    if let Some(o) =
+                        r.entity_indices
+                            .orbs
+                            .get_mut_stamped(&mut self.orbs, |o| o.id, id as u32)
+                    {
+                        o.velocity = v;
+                        return;
+                    }
+                    if let Some(i) =
+                        r.entity_indices
+                            .carts
+                            .find_stamped(&self.carts, |c| c.id, id as u32)
+                    {
+                        self.carts.update(i, |c| c.velocity = v);
+                        return;
+                    }
+                    if let Some(i) = r.entity_indices.projectiles.find_stamped(
+                        &self.creatures.projectiles,
+                        |p| p.id,
+                        id as u32,
+                    ) {
+                        set_projectile_motion(&mut self.creatures.projectiles, i);
+                        return;
+                    }
+                    if let Some(t) = r.entity_indices.tridents.get_mut_stamped(
+                        &mut self.tridents,
+                        |t| t.id,
+                        id as u32,
+                    ) {
+                        set_trident_motion(t);
+                        return;
+                    }
+                    if let Some(rocket) = r.entity_indices.rockets.get_mut_stamped(
+                        &mut self.rockets,
+                        |r| r.id,
+                        id as u32,
+                    ) {
+                        rocket.velocity = v;
+                        return;
+                    }
+                } else {
+                    if let Some(d) = self.dropped.iter_mut().find(|d| d.id == id as u32) {
+                        d.velocity = v;
+                        return;
+                    }
+                    if let Some(i) = self.falling.iter().rposition(|f| f.id == id as u32) {
+                        self.falling.update(i, |f| f.velocity = v);
+                        return;
+                    }
+                    if let Some(t) = self.tnts.iter_mut().rev().find(|t| t.id == id as u32) {
+                        t.velocity = v;
+                        return;
+                    }
+                    if let Some(o) = self.orbs.iter_mut().find(|o| o.id == id as u32) {
+                        o.velocity = v;
+                        return;
+                    }
+                    if let Some(i) = self.carts.iter().position(|c| c.id == id as u32) {
+                        self.carts.update(i, |c| c.velocity = v);
+                        return;
+                    }
+                    if let Some(i) = self
+                        .creatures
+                        .projectiles
+                        .iter()
+                        .position(|p| p.id == id as u32)
+                    {
+                        set_projectile_motion(&mut self.creatures.projectiles, i);
+                        return;
+                    }
+                    if let Some(t) = self.tridents.iter_mut().find(|t| t.id == id as u32) {
+                        set_trident_motion(t);
+                        return;
+                    }
+                    if let Some(rocket) = self.rockets.iter_mut().find(|r| r.id == id as u32) {
+                        rocket.velocity = v;
+                        return;
+                    }
+                }
+                if self.remote_hook_motion(id as u32, v) {
+                } else if let Some(p) = self
+                    .remote
+                    .as_mut()
+                    .and_then(|r| r.pending_items.get_mut(&id))
+                {
+                    p.1 = v;
+                } else if !self.potions.remote_thrown_motion(id as u32, v) {
+                    self.end.remote_eye_motion(id as u32, velocity);
+                }
+            }
         }
     }
     pub(super) fn apply_remote_health_body(&mut self) {
@@ -108,9 +323,9 @@ impl Game<'_> {
     /// Put the copy under the landing spot.
     pub(super) fn place_ghast_under_body(&mut self, id: u32, spot: Vec3) {
         let Some(m) = self
-            .mobs
-            .iter_mut()
-            .find(|m| m.id == id && m.species() == horizon_client::mobs::Species::HappyGhast)
+            .mob_index
+            .get_mut(&mut self.mobs, id)
+            .filter(|m| m.species() == horizon_client::mobs::Species::HappyGhast)
         else {
             return;
         };
@@ -148,7 +363,7 @@ impl Game<'_> {
             .entity
             .as_ref()
             .and_then(|e| {
-                let m = self.mobs.iter().find(|m| m.id == e.id as u32)?;
+                let m = self.mob_index.get_stamped(&self.mobs, e.id as u32)?;
                 let y = if e.anchor == EYES {
                     m.eye_y()
                 } else {

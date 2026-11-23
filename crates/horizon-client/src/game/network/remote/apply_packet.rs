@@ -398,8 +398,14 @@ impl Game<'_> {
                 // Entity.recreateFromPacket: objects must exist before applying motion.
                 self.remote_motion(p.id, p.velocity);
                 if self.minecart_improvements()
-                    && self.carts.iter().any(|c| c.id == p.id as u32)
                     && let Some(r) = self.remote.as_mut()
+                    && r.entities
+                        .get(&p.id)
+                        .is_some_and(|t| t.bucket == EntityBucket::Cart)
+                    && r.entity_indices
+                        .carts
+                        .find_stamped(&self.carts, |c| c.id, p.id as u32)
+                        .is_some()
                 {
                     r.cart_lerps.insert(p.id, CartLerp::new());
                 }
@@ -515,23 +521,55 @@ impl Game<'_> {
                 let holder = match p.dest {
                     0 => None,
                     d if Some(d) == me => Some(Holder::Player),
-                    d => match self.remote_knots.get(&(d as u32)) {
-                        Some(&block) => Some(Holder::Knot(block)),
-                        // Not a known knot yet: kept by id until the knot
-                        // arrives (game/network/remote_objects.rs).
-                        None if self.boats.iter().any(|b| b.id == d as u32) => {
+                    d => {
+                        if let Some(&block) = self.remote_knots.get(&(d as u32)) {
+                            Some(Holder::Knot(block))
+                        } else if let Some(r) = self.remote.as_mut() {
+                            // Not a known knot yet: kept by id until the knot
+                            // arrives (game/network/remote_objects.rs).
+                            if r.entities
+                                .get(&d)
+                                .is_none_or(|t| t.bucket == EntityBucket::Boat)
+                                && r.entity_indices
+                                    .boats
+                                    .find_stamped(&self.boats, |b| b.id, d as u32)
+                                    .is_some()
+                            {
+                                Some(Holder::Boat(d as u32))
+                            } else {
+                                Some(Holder::Mob(d as u32))
+                            }
+                        } else if self.boats.iter().any(|b| b.id == d as u32) {
                             Some(Holder::Boat(d as u32))
+                        } else {
+                            Some(Holder::Mob(d as u32))
                         }
-                        None => Some(Holder::Mob(d as u32)),
-                    },
+                    }
                 };
-                if let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.source as u32) {
+                let source_bucket = self
+                    .remote
+                    .as_ref()
+                    .and_then(|r| r.entities.get(&p.source).map(|t| t.bucket));
+                if matches!(
+                    source_bucket,
+                    None | Some(EntityBucket::Mob | EntityBucket::Dragon)
+                ) && let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.source as u32)
+                {
                     m.extra.leash = holder;
-                } else if let Some(i) = self.boats.iter().position(|b| b.id == p.source as u32) {
-                    self.boats.update(i, |b| {
-                        // A leashed boat or raft (AbstractBoat is Leashable).
-                        b.leash = holder;
-                    });
+                } else if matches!(source_bucket, None | Some(EntityBucket::Boat)) {
+                    let boat_idx = if let Some(r) = self.remote.as_mut() {
+                        r.entity_indices
+                            .boats
+                            .find_stamped(&self.boats, |b| b.id, p.source as u32)
+                    } else {
+                        self.boats.iter().position(|b| b.id == p.source as u32)
+                    };
+                    if let Some(i) = boat_idx {
+                        self.boats.update(i, |b| {
+                            // A leashed boat or raft (AbstractBoat is Leashable).
+                            b.leash = holder;
+                        });
+                    }
                 }
             }
             C::MoveVehicle(p) => self.remote_move_vehicle_and_file(p.position, p.yaw),
@@ -544,22 +582,45 @@ impl Game<'_> {
                 }
             }
             C::SetEntityData(p) => {
+                let mut bucket = None;
+                let mut is_local_player = false;
+                let mut is_level_player = false;
                 if let Some(r) = self.remote.as_mut() {
-                    for (index, _, value) in &p.values {
-                        if let (4, Value::Bool(silent)) = (index, value) {
-                            if p.id == r.entity_id {
-                                r.local_entity_silent = *silent;
-                            }
-                            if let Some(t) = r.entities.get_mut(&p.id) {
+                    is_local_player = r.entity_id == p.id;
+                    is_level_player = r.level_players.contains_key(&p.id);
+                    if let Some(t) = r.entities.get_mut(&p.id) {
+                        bucket = Some(t.bucket);
+                        for (index, _, value) in &p.values {
+                            if let (4, Value::Bool(silent)) = (index, value) {
                                 t.silent = *silent;
                             }
+                        }
+                    }
+                    if is_local_player {
+                        for (index, _, value) in &p.values {
+                            if let (4, Value::Bool(silent)) = (index, value) {
+                                r.local_entity_silent = *silent;
+                            }
+                        }
+                    }
+                    if let Some((_, _, Value::Byte(flags))) = p.values.iter().find(|v| v.0 == 0) {
+                        if flags & 0x40 != 0 {
+                            r.glowing.insert(p.id);
+                        } else {
+                            r.glowing.remove(&p.id);
                         }
                     }
                 }
                 // Entity.DATA_SHARED_FLAGS_ID, DATA_CUSTOM_NAME and
                 // DATA_CUSTOM_NAME_VISIBLE: server NPCs and holograms rely on
-                // these instead of saved NBT.
-                if let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.id as u32) {
+                // these instead of saved NBT. Resolved with a single stamped
+                // mob lookup and skipped entirely for non-mob buckets.
+                if matches!(
+                    bucket,
+                    None | Some(EntityBucket::Mob | EntityBucket::Dragon)
+                ) && let Some(mob_idx) = self.mob_index.find_stamped(&self.mobs, p.id as u32)
+                {
+                    let m = &mut self.mobs[mob_idx];
                     for (index, _, value) in &p.values {
                         match (index, value) {
                             (0, Value::Byte(flags)) => {
@@ -581,64 +642,67 @@ impl Game<'_> {
                             _ => {}
                         }
                     }
-                }
-                if let Some((_, _, Value::Byte(flags))) = p.values.iter().find(|v| v.0 == 0)
-                    && let Some(r) = self.remote.as_mut()
-                {
-                    if flags & 0x40 != 0 {
-                        r.glowing.insert(p.id);
-                    } else {
-                        r.glowing.remove(&p.id);
-                    }
-                }
-                self.remote_mob_data(p.id, &p.values);
-                if let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.id as u32)
-                    && m.species() == horizon_client::mobs::Species::Creeper
-                {
+                    self.remote_mob_data(p.id, &p.values);
+                    let m = &mut self.mobs[mob_idx];
+                    let species = m.species();
+                    let is_mannequin = &*m.kind.id == "minecraft:mannequin";
+                    let is_other = is_mannequin || (is_level_player && !is_local_player);
+                    let is_avatar = is_mannequin || is_level_player;
                     for (index, _, value) in &p.values {
                         match (index, value) {
-                            // Creeper.DATA_SWELL_DIR, DATA_IS_POWERED, DATA_IS_IGNITED.
-                            (16, Value::Int(dir)) => m.extra.counter = *dir,
-                            (17, Value::Bool(powered)) => m.extra.charged = *powered,
-                            (18, Value::Bool(ignited)) => m.extra.flag = *ignited,
-                            _ => {}
-                        }
-                    }
-                }
-                if let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.id as u32) {
-                    for (index, _, value) in &p.values {
-                        match (index, value) {
+                            // Entity.DATA_SHARED_FLAGS_ID's crouching and sprinting bits:
+                            // another player's or a mannequin's crouch (their model and
+                            // Entity.isDiscrete's name tag), and the dust a runner raises.
+                            (0, Value::Byte(flags)) if is_avatar => {
+                                m.extra.crouching = flags & 2 != 0;
+                                m.extra.sprinting = flags & 8 != 0;
+                            }
                             // Entity.DATA_TICKS_FROZEN: isFullyFrozen shakes it.
                             (7, Value::Int(ticks)) => m.ticks_frozen = *ticks,
+                            // Avatar.DATA_PLAYER_MAIN_HAND (HumanoidArm: 0 left, 1
+                            // right): the arm a swing of the main hand moves.
+                            (15, Value::Id(arm)) if is_other => {
+                                m.extra.main_hand_left = *arm == 0;
+                            }
+                            // Avatar.DATA_PLAYER_MODE_CUSTOMISATION: the skin layers
+                            // the player shows (PlayerModelPart bits).
+                            (16, Value::Byte(bits)) if is_other => {
+                                m.extra.hidden_model_parts = !(*bits as u8) & 0x7F;
+                            }
+                            // Creeper.DATA_SWELL_DIR, DATA_IS_POWERED, DATA_IS_IGNITED.
+                            (16, Value::Int(dir))
+                                if species == horizon_client::mobs::Species::Creeper =>
+                            {
+                                m.extra.counter = *dir;
+                            }
+                            (17, Value::Bool(powered))
+                                if species == horizon_client::mobs::Species::Creeper =>
+                            {
+                                m.extra.charged = *powered;
+                            }
+                            (18, Value::Bool(ignited))
+                                if species == horizon_client::mobs::Species::Creeper =>
+                            {
+                                m.extra.flag = *ignited;
+                            }
                             // Strider.DATA_SUFFOCATING (after AgeableMob's two
                             // and DATA_BOOST_TIME): a cold strider shakes.
                             (19, Value::Bool(cold))
-                                if m.species() == horizon_client::mobs::Species::Strider =>
+                                if species == horizon_client::mobs::Species::Strider =>
                             {
                                 m.extra.flag = *cold;
                             }
                             _ => {}
                         }
                     }
-                }
-                // LivingEntity.DATA_LIVING_ENTITY_FLAGS: for another player
-                // too, remote_mob_data's apply reads index 8 above.
-                let mannequin = self
-                    .mobs
-                    .iter()
-                    .any(|m| m.id == p.id as u32 && &*m.kind.id == "minecraft:mannequin");
-                let other = mannequin
-                    || self.remote.as_ref().is_some_and(|r| {
-                        r.level_players.contains_key(&p.id) && r.entity_id != p.id
-                    });
-                // LivingEntity.onSyncedDataUpdated(SLEEPING_POS_ID): another
-                // player lies down in their bed (drawn lying in it), or gets up.
-                if other {
-                    for (index, _, value) in &p.values {
-                        if let (14, Value::OptPos(bed)) = (index, value) {
-                            let code = bed.map_or(0, |b| self.bed_facing(b));
-                            let at = bed.and_then(|head| self.sleeping_position(head));
-                            if let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.id as u32) {
+                    // LivingEntity.onSyncedDataUpdated(SLEEPING_POS_ID): another
+                    // player lies down in their bed (drawn lying in it), or gets up.
+                    if is_other {
+                        for (index, _, value) in &p.values {
+                            if let (14, Value::OptPos(bed)) = (index, value) {
+                                let code = bed.map_or(0, |b| self.bed_facing(b));
+                                let at = bed.and_then(|head| self.sleeping_position(head));
+                                let m = &mut self.mobs[mob_idx];
                                 m.extra.ints[1] = code;
                                 if bed.is_some() {
                                     // setPosToBed leaves the server's position alone
@@ -652,25 +716,11 @@ impl Game<'_> {
                                 }
                             }
                         }
-                        // Avatar.DATA_PLAYER_MAIN_HAND (HumanoidArm: 0 left, 1
-                        // right): the arm a swing of the main hand moves.
-                        if let (15, Value::Id(arm)) = (index, value)
-                            && let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.id as u32)
-                        {
-                            m.extra.main_hand_left = *arm == 0;
-                        }
-                        // Avatar.DATA_PLAYER_MODE_CUSTOMISATION: the skin layers
-                        // the player shows (PlayerModelPart bits).
-                        if let (16, Value::Byte(bits)) = (index, value)
-                            && let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.id as u32)
-                        {
-                            m.extra.hidden_model_parts = !(*bits as u8) & 0x7F;
-                        }
                     }
                 }
                 // LivingEntity.onSyncedDataUpdated(SLEEPING_POS_ID): this
                 // player lies down in the bed, or gets up.
-                if self.remote.as_ref().is_some_and(|r| r.entity_id == p.id) {
+                if is_local_player {
                     for (index, _, value) in &p.values {
                         match (index, value) {
                             (14, Value::OptPos(bed)) => {
@@ -796,82 +846,425 @@ impl Game<'_> {
                         }
                     }
                 }
-                // Entity.DATA_SHARED_FLAGS_ID's crouching and sprinting bits:
-                // another player's or a mannequin's crouch (their model and
-                // Entity.isDiscrete's name tag), and the dust a runner raises.
-                if (mannequin
-                    || self
-                        .remote
-                        .as_ref()
-                        .is_some_and(|r| r.level_players.contains_key(&p.id)))
-                    && let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.id as u32)
-                {
-                    for (index, _, value) in &p.values {
-                        if let (0, Value::Byte(flags)) = (index, value) {
-                            m.extra.crouching = flags & 2 != 0;
-                            m.extra.sprinting = flags & 8 != 0;
+                match bucket {
+                    Some(EntityBucket::Mob) => {}
+                    Some(EntityBucket::Dragon) => {
+                        self.remote_dragon_data(p.id, &p.values);
+                    }
+                    Some(EntityBucket::Dropped) => {
+                        for (index, _, value) in &p.values {
+                            if *index == ITEM_ENTITY_ITEM
+                                && let Value::Item(stack) = value
+                            {
+                                self.remote_item_data(p.id, stack);
+                            }
                         }
                     }
-                }
-                for (index, _, value) in &p.values {
-                    if *index == ITEM_ENTITY_ITEM
-                        && let Value::Item(stack) = value
-                    {
-                        self.remote_item_data(p.id, stack);
+                    Some(EntityBucket::Orb) => {
+                        if let Some(o) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices.orbs.get_mut_stamped(
+                                &mut self.orbs,
+                                |o| o.id,
+                                p.id as u32,
+                            )
+                        }) {
+                            for (index, _, value) in &p.values {
+                                // ExperienceOrb.DATA_VALUE (the icon's size).
+                                if *index == 8
+                                    && let Value::Int(v) = value
+                                {
+                                    o.value = *v;
+                                }
+                            }
+                        }
                     }
-                    // ExperienceOrb.DATA_VALUE (the icon's size).
-                    if *index == 8
-                        && let Value::Int(v) = value
-                        && let Some(o) = self.orbs.iter_mut().find(|o| o.id == p.id as u32)
-                    {
-                        o.value = *v;
+                    Some(EntityBucket::ArmorStand) => {
+                        if let Some(a) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices.armor_stands.get_mut_stamped(
+                                &mut self.armor_stands,
+                                |a| a.id,
+                                p.id as u32,
+                            )
+                        }) {
+                            for (index, _, value) in &p.values {
+                                match (index, value) {
+                                    (0, Value::Byte(flags)) => a.invisible = flags & 0x20 != 0,
+                                    // Entity.DATA_CUSTOM_NAME and DATA_CUSTOM_NAME_VISIBLE.
+                                    (2, Value::OptText(name)) => {
+                                        a.custom_name = name
+                                            .as_ref()
+                                            .map(horizon_client::entity_nbt::name_text);
+                                    }
+                                    (2, Value::Text(name)) => {
+                                        a.custom_name =
+                                            Some(horizon_client::entity_nbt::name_text(name));
+                                    }
+                                    (3, Value::Bool(visible)) => a.name_visible = *visible,
+                                    (9, Value::Float(health)) => a.health = *health,
+                                    // ArmorStand.DATA_HEAD_POSE to DATA_RIGHT_LEG_POSE.
+                                    (16..=21, Value::Floats(r)) if r.len() == 3 => {
+                                        a.pose[usize::from(index - 16)] = [r[0], r[1], r[2]];
+                                    }
+                                    // ArmorStand.DATA_CLIENT_FLAGS.
+                                    (15, Value::Byte(flags)) => {
+                                        a.small = flags & 1 != 0;
+                                        a.show_arms = flags & 4 != 0;
+                                        a.no_base_plate = flags & 8 != 0;
+                                        a.marker = flags & 16 != 0;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Some(EntityBucket::Boat) => {
+                        if let Some(i) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices
+                                .boats
+                                .find_stamped(&self.boats, |b| b.id, p.id as u32)
+                        }) {
+                            self.boats.update(i, |b| {
+                                for (index, _, value) in &p.values {
+                                    // VehicleEntity's hurt, direction and damage; the paddles and
+                                    // the bubble time.
+                                    match (index, value) {
+                                        (8, Value::Int(v)) => b.hurt_time = *v,
+                                        (9, Value::Int(v)) => b.hurt_dir = *v,
+                                        (10, Value::Float(v)) => b.damage = *v,
+                                        (11, Value::Bool(v)) => b.paddling[0] = *v,
+                                        (12, Value::Bool(v)) => b.paddling[1] = *v,
+                                        // AbstractBoat.DATA_ID_BUBBLE_TIME.
+                                        (13, Value::Int(v)) => b.bubble_time = *v,
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Some(EntityBucket::Cart) => {
+                        if let Some(i) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices
+                                .carts
+                                .find_stamped(&self.carts, |c| c.id, p.id as u32)
+                        }) {
+                            let registry = self.pack.assets.registry;
+                            self.carts.update(i, |c| {
+                                for (index, _, value) in &p.values {
+                                    match (index, value) {
+                                        (8, Value::Int(v)) => c.hurt_time = *v,
+                                        (9, Value::Int(v)) => c.hurt_dir = *v,
+                                        (10, Value::Float(v)) => c.damage = *v,
+                                        // AbstractMinecart.DATA_ID_CUSTOM_DISPLAY_BLOCK (0, air,
+                                        // for none) and DATA_ID_DISPLAY_OFFSET.
+                                        (11, Value::Id(state)) => {
+                                            c.custom_display = (*state > 0).then(|| {
+                                                horizon_client::entity_nbt::state_to_nbt(
+                                                    registry,
+                                                    BlockStateId(*state as u32),
+                                                )
+                                            });
+                                        }
+                                        (12, Value::Int(offset)) => {
+                                            c.custom_offset = Some(*offset);
+                                        }
+                                        (13, Value::Bool(lit))
+                                            if c.kind
+                                                == horizon_gameplay::minecarts::CartKind::Furnace =>
+                                        {
+                                            c.fuel = i32::from(*lit);
+                                        }
+                                        // MinecartCommandBlock.onSyncedDataUpdated: setCommand
+                                        // (which resets the success count) and setLastOutput.
+                                        (13, Value::String(command))
+                                            if c.kind
+                                                == horizon_gameplay::minecarts::CartKind::CommandBlock =>
+                                        {
+                                            c.command.set_command(command);
+                                        }
+                                        (14, Value::Text(output))
+                                            if c.kind
+                                                == horizon_gameplay::minecarts::CartKind::CommandBlock =>
+                                        {
+                                            c.command.last_output =
+                                                Some(horizon_client::scoreboard::comp_text(
+                                                    &horizon_client::scoreboard::tag_to_json(
+                                                        output,
+                                                    ),
+                                                ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Some(EntityBucket::Object) => {
+                        self.remote_object_data(p.id, &p.values);
+                    }
+                    Some(EntityBucket::Tnt) => {
+                        if let Some(t) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices.tnts.get_mut_stamped(
+                                &mut self.tnts,
+                                |t| t.id,
+                                p.id as u32,
+                            )
+                        }) {
+                            for (index, _, value) in &p.values {
+                                // PrimedTnt.DATA_FUSE_ID.
+                                if let (8, Value::Int(fuse)) = (index, value) {
+                                    t.fuse = *fuse;
+                                }
+                            }
+                        }
+                    }
+                    Some(EntityBucket::Falling) => {
+                        if let Some(i) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices.falling.find_stamped(
+                                &self.falling,
+                                |f| f.id,
+                                p.id as u32,
+                            )
+                        }) {
+                            self.falling.update(i, |f| {
+                                for (index, _, value) in &p.values {
+                                    // FallingBlockEntity.DATA_START_POS (the model's seed).
+                                    if let (8, Value::Pos(pos)) = (index, value) {
+                                        f.start_pos = horizon_core::position::BlockPos::new(
+                                            pos[0], pos[1], pos[2],
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Some(EntityBucket::Trident) => {
+                        if let Some(t) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices.tridents.get_mut_stamped(
+                                &mut self.tridents,
+                                |t| t.id,
+                                p.id as u32,
+                            )
+                        }) {
+                            for (index, _, value) in &p.values {
+                                // AbstractArrow.ID_FLAGS (no physics) and IN_GROUND, and
+                                // ThrownTrident.ID_LOYALTY.
+                                match (index, value) {
+                                    // Clients retain the server's fire flag until the next update.
+                                    (0, Value::Byte(flags)) => t.fire_ticks = i32::from(flags & 1),
+                                    (8, Value::Byte(flags)) => t.no_physics = flags & 2 != 0,
+                                    (10, Value::Bool(in_ground)) => t.in_ground = *in_ground,
+                                    (11, Value::Byte(loyalty)) => {
+                                        t.loyalty = u32::from(*loyalty as u8);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Some(EntityBucket::Rocket) => {
+                        if let Some(i) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices.rockets.find_stamped(
+                                &self.rockets,
+                                |rk| rk.id,
+                                p.id as u32,
+                            )
+                        }) {
+                            for (index, _, value) in &p.values {
+                                match (index, value) {
+                                    // FireworkRocketEntity.DATA_ID_FIREWORKS_ITEM: its
+                                    // explosions for `createFireworks`.
+                                    (8, Value::Item(stack)) => {
+                                        if let Some(stack) = self.to_stack(stack) {
+                                            let (_, explosions) =
+                                                horizon_gameplay::fireworks::fireworks_of(&stack);
+                                            let rk = &mut self.rockets[i];
+                                            rk.explosions = explosions;
+                                            rk.item = stack;
+                                        }
+                                    }
+                                    // DATA_ATTACHED_TO_TARGET (OptionalInt: the id plus 1).
+                                    (9, Value::Id(v)) => {
+                                        let v = (*v > 0).then(|| (*v - 1) as u32);
+                                        self.rockets[i].attached_to = v;
+                                    }
+                                    // DATA_SHOT_AT_ANGLE.
+                                    (10, Value::Bool(a)) => {
+                                        self.rockets[i].angled = *a;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Some(EntityBucket::Projectile) => {
+                        if let Some(i) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices.projectiles.find_stamped(
+                                &self.creatures.projectiles,
+                                |pr| pr.id,
+                                p.id as u32,
+                            )
+                        }) {
+                            // Fireball.DATA_ITEM_STACK: the item a fireball is drawn as.
+                            if self.creatures.projectiles[i].kind.is_item_fireball()
+                                && let Some(stack) =
+                                    p.values.iter().find_map(|(index, _, value)| {
+                                        match (index, value) {
+                                            (8, Value::Item(stack)) => Some(stack),
+                                            _ => None,
+                                        }
+                                    })
+                                && let Some(stack) = self.to_stack(stack)
+                            {
+                                self.creatures
+                                    .projectiles
+                                    .update(i, |pr| pr.set_item(stack));
+                            }
+                            self.creatures.projectiles.update(i, |pr| {
+                                use horizon_client::projectiles::ProjectileKind;
+                                for (index, _, value) in &p.values {
+                                    match (&mut pr.kind, index, value) {
+                                        // Entity.DATA_SHARED_FLAGS_ID's FLAG_ONFIRE.
+                                        (_, 0, Value::Byte(flags)) => {
+                                            if let Some(a) = pr.arrow.as_mut() {
+                                                a.synced_fire = flags & 1 != 0;
+                                            } else {
+                                                pr.synced_fire = flags & 1 != 0;
+                                            }
+                                        }
+                                        (_, 1, Value::Int(air_supply)) => {
+                                            pr.air_supply = *air_supply;
+                                        }
+                                        // AbstractArrow.ID_FLAGS (critical) and IN_GROUND.
+                                        (
+                                            ProjectileKind::Arrow { critical, .. },
+                                            8,
+                                            Value::Byte(flags),
+                                        ) => {
+                                            *critical = flags & 1 != 0;
+                                            if let Some(a) = pr.arrow.as_mut() {
+                                                a.no_physics = flags & 2 != 0;
+                                            }
+                                        }
+                                        (
+                                            ProjectileKind::Arrow { .. },
+                                            5,
+                                            Value::Bool(no_gravity),
+                                        ) => {
+                                            pr.no_gravity = *no_gravity;
+                                        }
+                                        (
+                                            ProjectileKind::Arrow { .. },
+                                            10,
+                                            Value::Bool(in_ground),
+                                        ) => {
+                                            if *in_ground
+                                                && !pr.stuck
+                                                && pr.age > 0
+                                                && let Some(a) = pr.arrow.as_mut()
+                                                && a.shake <= 0
+                                            {
+                                                a.shake = 7;
+                                            }
+                                            pr.stuck = *in_ground;
+                                            if let Some(a) = pr.arrow.as_mut() {
+                                                a.in_ground = *in_ground;
+                                            }
+                                        }
+                                        // Arrow.ID_EFFECT_COLOR.
+                                        (ProjectileKind::Arrow { .. }, 11, Value::Int(color)) => {
+                                            if let Some(a) = pr.arrow.as_mut() {
+                                                a.effect_color = *color;
+                                            }
+                                        }
+                                        // WitherSkull.DATA_DANGEROUS.
+                                        (
+                                            ProjectileKind::WitherSkull { dangerous },
+                                            8,
+                                            Value::Bool(d),
+                                        ) => {
+                                            *dangerous = *d;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Some(EntityBucket::Hook) => {
+                        self.remote_hook_data(p.id as u32, &p.values);
+                    }
+                    Some(EntityBucket::Other) => {
+                        self.remote_projectile_data(p.id, &p.values);
+                    }
+                    None => {
+                        for (index, _, value) in &p.values {
+                            if *index == ITEM_ENTITY_ITEM
+                                && let Value::Item(stack) = value
+                            {
+                                self.remote_item_data(p.id, stack);
+                            }
+                            // ExperienceOrb.DATA_VALUE (the icon's size).
+                            if *index == 8
+                                && let Value::Int(v) = value
+                                && let Some(o) = if let Some(r) = self.remote.as_mut() {
+                                    r.entity_indices.orbs.get_mut_stamped(
+                                        &mut self.orbs,
+                                        |o| o.id,
+                                        p.id as u32,
+                                    )
+                                } else {
+                                    self.orbs.iter_mut().find(|o| o.id == p.id as u32)
+                                }
+                            {
+                                o.value = *v;
+                            }
+                        }
+                        self.remote_object_data(p.id, &p.values);
+                        self.remote_projectile_data(p.id, &p.values);
+                        self.remote_dragon_data(p.id, &p.values);
                     }
                 }
-                self.remote_object_data(p.id, &p.values);
-                self.remote_projectile_data(p.id, &p.values);
-                self.remote_dragon_data(p.id, &p.values);
             }
             // ClientPacketListener.handleSetEquipment: what a mob or another
             // player holds and wears (EquipmentSlot ordinals).
             C::SetEquipment(p) => {
-                self.remote_object_equipment(p.id, &p.slots);
-                let items: Vec<(u8, Option<Arc<str>>, Option<ItemStack>)> = p
-                    .slots
-                    .iter()
-                    .map(|(slot, stack)| {
-                        (
-                            *slot,
-                            stack
-                                .as_ref()
-                                .filter(|s| s.count > 0)
-                                .map(|s| self.item_name(s.item)),
-                            self.to_stack(stack),
-                        )
-                    })
-                    .collect();
-                // CrossbowItem.isCharged: the main hand's `charged_projectiles`
-                // (AvatarRenderer.getArmPose holds a loaded crossbow up).
-                let charged = p.slots.iter().find(|(slot, _)| *slot == 0).map(|(_, s)| {
-                    s.as_ref().is_some_and(|s| {
-                        matches!(
-                            s.component(horizon_protocol::item::component::CHARGED_PROJECTILES),
-                            Some(horizon_protocol::item::Component::Stacks(list))
-                                if !list.is_empty()
-                        )
-                    })
-                });
-                if let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.id as u32) {
-                    if let Some(charged) = charged
-                        && &*m.kind.id == "minecraft:player"
-                    {
-                        m.extra.charged = charged;
+                let bucket = self
+                    .remote
+                    .as_ref()
+                    .and_then(|r| r.entities.get(&p.id).map(|t| t.bucket));
+                match bucket {
+                    Some(EntityBucket::ArmorStand) => {
+                        if let Some(i) = self.remote.as_mut().and_then(|r| {
+                            r.entity_indices.armor_stands.find_stamped(
+                                &self.armor_stands,
+                                |a| a.id,
+                                p.id as u32,
+                            )
+                        }) {
+                            let items: Vec<_> = p
+                                .slots
+                                .iter()
+                                .map(|(slot, stack)| (usize::from(*slot), self.to_stack(stack)))
+                                .collect();
+                            let a = &mut self.armor_stands[i];
+                            for (slot, item) in items {
+                                a.equipment.set(slot, item);
+                            }
+                        }
                     }
-                    for (slot, item, stack) in items {
-                        let stack = stack.or_else(|| {
-                            item.filter(|item| &**item != "minecraft:air")
-                                .map(|item| ItemStack::new(&item, 1))
-                        });
-                        m.set_equipment_stack(slot as usize, stack);
+                    Some(EntityBucket::Mob | EntityBucket::Dragon) => {
+                        if let Some(mob_idx) = self.mob_index.find_stamped(&self.mobs, p.id as u32)
+                        {
+                            self.apply_remote_mob_equipment(mob_idx, &p.slots);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.remote_object_equipment(p.id, &p.slots);
+                        if let Some(mob_idx) = self.mob_index.find_stamped(&self.mobs, p.id as u32)
+                        {
+                            self.apply_remote_mob_equipment(mob_idx, &p.slots);
+                        }
                     }
                 }
             }
@@ -879,24 +1272,76 @@ impl Game<'_> {
                 // ClientPacketListener.handleTakeItemEntity: the pickup sound at
                 // the orb, item or arrow, whoever collects it (the server sends
                 // none); an entity this client doesn't track sounds at this player.
-                let orb_at = self
-                    .orbs
-                    .iter()
-                    .find(|o| o.id == p.item as u32)
-                    .map(|o| o.position);
+                let id = p.item as u32;
+                let bucket = self
+                    .remote
+                    .as_ref()
+                    .and_then(|r| r.entities.get(&p.item).map(|t| t.bucket));
+                let (orb_idx, dropped_idx, proj_idx, trident_idx) = if let Some(r) =
+                    self.remote.as_mut()
+                {
+                    match bucket {
+                        Some(EntityBucket::Orb) => (
+                            r.entity_indices.orbs.find_stamped(&self.orbs, |o| o.id, id),
+                            None,
+                            None,
+                            None,
+                        ),
+                        Some(EntityBucket::Dropped) => (
+                            None,
+                            r.entity_indices
+                                .dropped
+                                .find_stamped(&self.dropped, |d| d.id, id),
+                            None,
+                            None,
+                        ),
+                        Some(EntityBucket::Projectile) => (
+                            None,
+                            None,
+                            r.entity_indices.projectiles.find_stamped(
+                                &self.creatures.projectiles,
+                                |s| s.id,
+                                id,
+                            ),
+                            None,
+                        ),
+                        Some(EntityBucket::Trident) => (
+                            None,
+                            None,
+                            None,
+                            r.entity_indices
+                                .tridents
+                                .find_stamped(&self.tridents, |t| t.id, id),
+                        ),
+                        _ => (
+                            r.entity_indices.orbs.find_stamped(&self.orbs, |o| o.id, id),
+                            r.entity_indices
+                                .dropped
+                                .find_stamped(&self.dropped, |d| d.id, id),
+                            r.entity_indices.projectiles.find_stamped(
+                                &self.creatures.projectiles,
+                                |s| s.id,
+                                id,
+                            ),
+                            r.entity_indices
+                                .tridents
+                                .find_stamped(&self.tridents, |t| t.id, id),
+                        ),
+                    }
+                } else {
+                    (
+                        self.orbs.iter().position(|o| o.id == id),
+                        self.dropped.iter().position(|d| d.id == id),
+                        self.creatures.projectiles.iter().position(|s| s.id == id),
+                        self.tridents.iter().position(|t| t.id == id),
+                    )
+                };
+                let orb_at = orb_idx.map(|i| self.orbs[i].position);
                 let orb = orb_at.is_some();
-                let item = self.dropped.iter().find(|d| d.id == p.item as u32);
-                let shot = self
-                    .creatures
-                    .projectiles
-                    .iter()
-                    .find(|s| s.id == p.item as u32);
-                let shot = shot.map(|s| s.position).or_else(|| {
-                    self.tridents
-                        .iter()
-                        .find(|t| t.id == p.item as u32)
-                        .map(|t| t.position)
-                });
+                let item = dropped_idx.map(|i| &self.dropped[i]);
+                let shot = proj_idx
+                    .map(|i| self.creatures.projectiles[i].position)
+                    .or_else(|| trident_idx.map(|i| self.tridents[i].position));
                 let at = match (item, shot) {
                     (Some(d), _) => Some([d.position.x, d.position.y, d.position.z]),
                     (None, Some(s)) => Some([s.x, s.y, s.z]),
@@ -937,27 +1382,23 @@ impl Game<'_> {
                 } else {
                     super::super::pickups::Collector::Mob(p.player as u32)
                 };
-                if let Some(item) = self.dropped.iter().find(|d| d.id == p.item as u32).cloned() {
+                if let Some(i) = dropped_idx {
+                    let item = self.dropped[i].clone();
                     self.add_pickup(
                         super::super::pickups::Taken::Item(Box::new(item)),
                         collector,
                     );
-                } else if let Some(orb) = self.orbs.iter().find(|o| o.id == p.item as u32).cloned()
-                {
+                } else if let Some(i) = orb_idx {
+                    let orb = self.orbs[i].clone();
                     self.add_pickup(super::super::pickups::Taken::Orb(Box::new(orb)), collector);
-                } else if let Some(shot) = self
-                    .creatures
-                    .projectiles
-                    .iter()
-                    .find(|s| s.id == p.item as u32)
-                    .cloned()
-                {
+                } else if let Some(i) = proj_idx {
                     // An arrow flies to its collector too, then goes.
+                    let shot = self.creatures.projectiles[i].clone();
                     self.add_pickup(
                         super::super::pickups::Taken::Arrow(Box::new(shot)),
                         collector,
                     );
-                } else if let Some(i) = self.tridents.iter().position(|t| t.id == p.item as u32) {
+                } else if let Some(i) = trident_idx {
                     // So does a trident: a server's client keeps them apart.
                     let trident = self.tridents.remove(i);
                     self.add_pickup(
@@ -981,11 +1422,24 @@ impl Game<'_> {
             // ClientPacketListener.handleProjectilePowerPacket: the power a
             // hurting projectile accelerates by, sent bundled with its motion.
             C::ProjectilePower(p) => {
-                super::super::remote_projectiles::remote_projectile_power(
-                    &mut self.creatures.projectiles,
-                    p.id,
-                    p.power,
-                );
+                if let Some(r) = self.remote.as_mut() {
+                    if let Some(i) = r.entity_indices.projectiles.find_stamped(
+                        &self.creatures.projectiles,
+                        |pr| pr.id,
+                        p.id as u32,
+                    ) && self.creatures.projectiles[i].is_hurting()
+                    {
+                        self.creatures
+                            .projectiles
+                            .update(i, |pr| pr.acceleration = p.power);
+                    }
+                } else {
+                    super::super::remote_projectiles::remote_projectile_power(
+                        &mut self.creatures.projectiles,
+                        p.id,
+                        p.power,
+                    );
+                }
             }
             // ClientPacketListener.handleDamageEvent: LivingEntity.handleDamageEvent
             // jolts the walk animation and restarts the hurt flash, and the
@@ -1012,7 +1466,7 @@ impl Game<'_> {
                         .and_then(|id| u32::try_from(id).ok())
                         .and_then(|id| {
                             self.mob_index
-                                .get(&self.mobs, id)
+                                .get_stamped(&self.mobs, id)
                                 .map(|m| m.kind.id.to_string())
                         });
                     self.events
@@ -1172,7 +1626,7 @@ impl Game<'_> {
                 }
                 // LivingEntity.handleEntityEvent 60: the poof as the dead body goes.
                 if p.event == 60
-                    && let Some(m) = self.mob_index.get(&self.mobs, p.id as u32)
+                    && let Some(m) = self.mob_index.get_stamped(&self.mobs, p.id as u32)
                 {
                     let (at, w, h) = (m.position, f64::from(m.width()), f64::from(m.height()));
                     self.death_poof([at.x, at.y, at.z], w, h);
@@ -1181,7 +1635,12 @@ impl Game<'_> {
                     self.remote_totem(p.id);
                 }
                 // Mob.handleEntityEvent 20: the spawn poof.
-                if p.event == 20 && self.mobs.iter().any(|m| m.id == p.id as u32) {
+                if p.event == 20
+                    && self
+                        .mob_index
+                        .find_stamped(&self.mobs, p.id as u32)
+                        .is_some()
+                {
                     self.poof_particles(p.id as u32);
                 }
                 // The particle bursts of Villager 12 to 14 and 42, TamableAnimal
@@ -1192,22 +1651,29 @@ impl Game<'_> {
                 // Snowball and ThrownEgg.handleEntityEvent 3: the crumbs where
                 // the projectile is (the server removes it right after).
                 if p.event == 3 {
-                    let crumbs = self
-                        .creatures
-                        .projectiles
-                        .iter()
-                        .find(|pr| pr.id == p.id as u32)
-                        .and_then(|pr| {
-                            let item = match pr.kind {
-                                horizon_client::projectiles::ProjectileKind::Snowball => {
-                                    "minecraft:snowball"
-                                }
-                                horizon_client::projectiles::ProjectileKind::Egg => "minecraft:egg",
-                                horizon_client::projectiles::ProjectileKind::Thrown(t) => t.item,
-                                _ => return None,
-                            };
-                            Some(([pr.position.x, pr.position.y, pr.position.z], item))
-                        });
+                    let projectile = if let Some(r) = self.remote.as_mut() {
+                        r.entity_indices.projectiles.get_stamped(
+                            &self.creatures.projectiles,
+                            |pr| pr.id,
+                            p.id as u32,
+                        )
+                    } else {
+                        self.creatures
+                            .projectiles
+                            .iter()
+                            .find(|pr| pr.id == p.id as u32)
+                    };
+                    let crumbs = projectile.and_then(|pr| {
+                        let item = match pr.kind {
+                            horizon_client::projectiles::ProjectileKind::Snowball => {
+                                "minecraft:snowball"
+                            }
+                            horizon_client::projectiles::ProjectileKind::Egg => "minecraft:egg",
+                            horizon_client::projectiles::ProjectileKind::Thrown(t) => t.item,
+                            _ => return None,
+                        };
+                        Some(([pr.position.x, pr.position.y, pr.position.z], item))
+                    });
                     if let Some((at, item)) = crumbs {
                         self.item_burst(at, item);
                     }
@@ -1224,9 +1690,8 @@ impl Game<'_> {
                             .as_ref()
                             .map(|q| [q.position.x, q.position.y, q.position.z])
                     } else {
-                        self.mobs
-                            .iter()
-                            .find(|m| m.id == p.id as u32)
+                        self.mob_index
+                            .get_stamped(&self.mobs, p.id as u32)
                             .map(|m| [m.position.x, m.position.y, m.position.z])
                     };
                     if let Some(at) = at {
@@ -2046,5 +2511,44 @@ impl Game<'_> {
             _ => {}
         }
         Ok(())
+    }
+
+    fn apply_remote_mob_equipment(&mut self, mob_idx: usize, slots: &[(u8, Option<Stack>)]) {
+        let items: Vec<(u8, Option<Arc<str>>, Option<ItemStack>)> = slots
+            .iter()
+            .map(|(slot, stack)| {
+                (
+                    *slot,
+                    stack
+                        .as_ref()
+                        .filter(|s| s.count > 0)
+                        .map(|s| self.item_name(s.item)),
+                    self.to_stack(stack),
+                )
+            })
+            .collect();
+        // CrossbowItem.isCharged: the main hand's `charged_projectiles`
+        // (AvatarRenderer.getArmPose holds a loaded crossbow up).
+        let charged = slots.iter().find(|(slot, _)| *slot == 0).map(|(_, s)| {
+            s.as_ref().is_some_and(|s| {
+                matches!(
+                    s.component(horizon_protocol::item::component::CHARGED_PROJECTILES),
+                    Some(horizon_protocol::item::Component::Stacks(list)) if !list.is_empty()
+                )
+            })
+        });
+        let m = &mut self.mobs[mob_idx];
+        if let Some(charged) = charged
+            && &*m.kind.id == "minecraft:player"
+        {
+            m.extra.charged = charged;
+        }
+        for (slot, item, stack) in items {
+            let stack = stack.or_else(|| {
+                item.filter(|item| &**item != "minecraft:air")
+                    .map(|item| ItemStack::new(&item, 1))
+            });
+            m.set_equipment_stack(slot as usize, stack);
+        }
     }
 }

@@ -163,12 +163,14 @@ impl Game<'_> {
             self.world.day_time = day;
             self.world.weather = weather;
             self.mobs.clear();
+            self.mob_index.clear();
             self.clear_remote_objects();
             self.clear_remote_projectiles();
             self.dropped.clear();
             self.clear_client_particles();
             if let Some(r) = self.remote.as_mut() {
                 r.entities.clear();
+                r.entity_indices.clear();
                 r.passenger_vehicles.clear();
                 r.lerps.clear();
                 r.cart_lerps.clear();
