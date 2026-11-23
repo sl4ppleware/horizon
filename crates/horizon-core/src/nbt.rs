@@ -494,20 +494,18 @@ impl<'a> Reader<'a, '_> {
             11 => {
                 let len = self.count(4)?;
                 self.charge(4 * len as u64)?;
-                let mut values = Vec::with_capacity(len);
-                for _ in 0..len {
-                    values.push(i32::from_be_bytes(self.number()?));
-                }
-                Tag::IntArray(values)
+                let raw = self.take(len * 4)?;
+                let (chunks, remainder) = raw.as_chunks::<4>();
+                debug_assert!(remainder.is_empty());
+                Tag::IntArray(chunks.iter().copied().map(i32::from_be_bytes).collect())
             }
             12 => {
                 let len = self.count(8)?;
                 self.charge(8 * len as u64)?;
-                let mut values = Vec::with_capacity(len);
-                for _ in 0..len {
-                    values.push(i64::from_be_bytes(self.number()?));
-                }
-                Tag::LongArray(values)
+                let raw = self.take(len * 8)?;
+                let (chunks, remainder) = raw.as_chunks::<8>();
+                debug_assert!(remainder.is_empty());
+                Tag::LongArray(chunks.iter().copied().map(i64::from_be_bytes).collect())
             }
             _ => return Err(self.error("unknown tag type")),
         })
@@ -958,6 +956,35 @@ impl Writer<'_> {
         let len = i32::try_from(len).map_err(|_| self.error("collection too long"))?;
         self.put(&len.to_be_bytes())
     }
+    fn put_be_array<T: Copy, const N: usize>(
+        &mut self,
+        values: &[T],
+        to_be: impl Fn(T) -> [u8; N],
+    ) -> Result<(), Error> {
+        self.count(values.len())?;
+        let remaining = self.max_len - self.bytes.len();
+        match values.len().checked_mul(N) {
+            Some(byte_len) if byte_len <= remaining => {
+                self.bytes.reserve(byte_len);
+                let (blocks, tail) = values.as_chunks::<64>();
+                for block in blocks {
+                    let mut buf = [[0u8; N]; 64];
+                    for (dst, &item) in buf.iter_mut().zip(block) {
+                        *dst = to_be(item);
+                    }
+                    self.bytes.extend_from_slice(buf.as_flattened());
+                }
+                for &item in tail {
+                    self.bytes.extend_from_slice(&to_be(item));
+                }
+                Ok(())
+            }
+            _ => Err(Error {
+                offset: (self.bytes.len() - self.start) + (remaining / N) * N,
+                reason: "byte limit exceeded",
+            }),
+        }
+    }
     fn string(&mut self, string: &JavaString) -> Result<(), Error> {
         let len: usize = string
             .0
@@ -1072,18 +1099,8 @@ impl Writer<'_> {
                 }
                 self.put(&[0])?;
             }
-            Tag::IntArray(v) => {
-                self.count(v.len())?;
-                for item in v {
-                    self.put(&item.to_be_bytes())?;
-                }
-            }
-            Tag::LongArray(v) => {
-                self.count(v.len())?;
-                for item in v {
-                    self.put(&item.to_be_bytes())?;
-                }
-            }
+            Tag::IntArray(v) => self.put_be_array(v, i32::to_be_bytes)?,
+            Tag::LongArray(v) => self.put_be_array(v, i64::to_be_bytes)?,
         }
         Ok(())
     }
@@ -2023,5 +2040,150 @@ mod tests {
             (plain, 0),
             "only the root's `p` is bounded"
         );
+    }
+
+    #[test]
+    fn bulk_int_and_long_arrays_roundtrip_and_match_big_endian_wire() {
+        let mut seed = 0x517c_c1b7_2722_0a95u64;
+        let mut next_u64 = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for len in [0usize, 1, 3, 63, 64, 65, 127, 128, 129, 1024] {
+            let ints: Vec<i32> = (0..len)
+                .map(|i| match i {
+                    0 => i32::MIN,
+                    1 => i32::MAX,
+                    2 => -1,
+                    _ => next_u64() as i32,
+                })
+                .collect();
+            let mut expected_int_wire = vec![11, 0, 0];
+            expected_int_wire.extend_from_slice(&(len as i32).to_be_bytes());
+            for &v in &ints {
+                expected_int_wire.extend_from_slice(&v.to_be_bytes());
+            }
+            let int_root = NamedTag {
+                name: JavaString::default(),
+                tag: Tag::IntArray(ints.clone()),
+            };
+            let encoded = write_named(&int_root, Limits::default()).unwrap();
+            assert_eq!(encoded, expected_int_wire, "IntArray wire len={len}");
+            let (decoded, used) = read_named(&encoded, Limits::default()).unwrap();
+            assert_eq!(used, encoded.len());
+            assert_eq!(decoded, int_root);
+            let net = write_network(&int_root.tag, Limits::default()).unwrap();
+            assert_eq!(
+                read_network(&net, Limits::default()).unwrap(),
+                (int_root.tag, net.len())
+            );
+
+            let longs: Vec<i64> = (0..len)
+                .map(|i| match i {
+                    0 => i64::MIN,
+                    1 => i64::MAX,
+                    2 => -1,
+                    _ => next_u64() as i64,
+                })
+                .collect();
+            let mut expected_long_wire = vec![12, 0, 0];
+            expected_long_wire.extend_from_slice(&(len as i32).to_be_bytes());
+            for &v in &longs {
+                expected_long_wire.extend_from_slice(&v.to_be_bytes());
+            }
+            let long_root = NamedTag {
+                name: JavaString::default(),
+                tag: Tag::LongArray(longs.clone()),
+            };
+            let encoded = write_named(&long_root, Limits::default()).unwrap();
+            assert_eq!(encoded, expected_long_wire, "LongArray wire len={len}");
+            let (decoded, used) = read_named(&encoded, Limits::default()).unwrap();
+            assert_eq!(used, encoded.len());
+            assert_eq!(decoded, long_root);
+            let net = write_network(&long_root.tag, Limits::default()).unwrap();
+            assert_eq!(
+                read_network(&net, Limits::default()).unwrap(),
+                (long_root.tag, net.len())
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_array_limits_preserve_exact_error_offsets_and_leave_output_unchanged() {
+        // Named root header is 3 bytes (id + empty name) + 4-byte count = 7 bytes.
+        let int_root = NamedTag {
+            name: JavaString::default(),
+            tag: Tag::IntArray(vec![10, 20, 30]),
+        };
+        let int_wire = write_named(&int_root, Limits::default()).unwrap();
+        assert_eq!(int_wire.len(), 7 + 12);
+        for (max_bytes, expected_offset) in [(7, 7), (10, 7), (11, 11), (14, 11), (18, 15)] {
+            let mut out = b"keep".to_vec();
+            let err = write_named_into(
+                &int_root,
+                Limits {
+                    max_bytes,
+                    ..Limits::default()
+                },
+                &mut out,
+            )
+            .unwrap_err();
+            assert_eq!(err.reason, "byte limit exceeded");
+            assert_eq!(
+                err.offset, expected_offset,
+                "IntArray max_bytes={max_bytes}"
+            );
+            assert_eq!(out, b"keep");
+        }
+        assert!(
+            read_named(
+                &int_wire,
+                Limits {
+                    max_bytes: int_wire.len() - 1,
+                    ..Limits::default()
+                },
+            )
+            .is_err()
+        );
+        assert!(read_named(&int_wire[..int_wire.len() - 1], Limits::default()).is_err());
+
+        let long_root = NamedTag {
+            name: JavaString::default(),
+            tag: Tag::LongArray(vec![100, 200, 300]),
+        };
+        let long_wire = write_named(&long_root, Limits::default()).unwrap();
+        assert_eq!(long_wire.len(), 7 + 24);
+        for (max_bytes, expected_offset) in [(7, 7), (14, 7), (15, 15), (22, 15), (30, 23)] {
+            let mut out = b"keep".to_vec();
+            let err = write_named_into(
+                &long_root,
+                Limits {
+                    max_bytes,
+                    ..Limits::default()
+                },
+                &mut out,
+            )
+            .unwrap_err();
+            assert_eq!(err.reason, "byte limit exceeded");
+            assert_eq!(
+                err.offset, expected_offset,
+                "LongArray max_bytes={max_bytes}"
+            );
+            assert_eq!(out, b"keep");
+        }
+        assert!(
+            read_named(
+                &long_wire,
+                Limits {
+                    max_bytes: long_wire.len() - 1,
+                    ..Limits::default()
+                },
+            )
+            .is_err()
+        );
+        assert!(read_named(&long_wire[..long_wire.len() - 1], Limits::default()).is_err());
     }
 }

@@ -21,10 +21,25 @@ use {
 const SECTOR: usize = 4096;
 const HEADER: usize = SECTOR * 2;
 const MAX_COMPRESSED: usize = 64 * 1024 * 1024;
+/// Maximum capacity retained by thread-local NBT encode/decode scratch buffers
+/// between calls so oversized chunks do not pin multi-megabyte buffers.
+const MAX_RETAINED_NBT_BUFFER: usize = 512 * 1024;
+/// Maximum contiguous sector run buffered in a single `write_all` during
+/// [`RegionFile::write_batch`].
+const MAX_COALESCED_WRITE: usize = 512 * 1024;
 
 thread_local! {
     /// Decompression storage retained by each region-reading worker.
     static NBT_DECODE_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Serialization storage retained by each chunk-encoding worker.
+    static NBT_ENCODE_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn release_nbt_buffer(bytes: &mut Vec<u8>) {
+    bytes.clear();
+    if bytes.capacity() > MAX_RETAINED_NBT_BUFFER {
+        bytes.shrink_to(MAX_RETAINED_NBT_BUFFER);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -40,11 +55,19 @@ impl ChunkRecord {
         timestamp: u32,
         limits: Limits,
     ) -> io::Result<Self> {
-        let bytes = nbt::write_named(root, limits).map_err(|e| invalid(e.to_string()))?;
-        Ok(Self {
-            compression,
-            compressed: compression.encode(&bytes)?,
-            timestamp,
+        NBT_ENCODE_BUFFER.with_borrow_mut(|bytes| {
+            bytes.clear();
+            let result = (|| {
+                nbt::write_named_into(root, limits, bytes).map_err(|e| invalid(e.to_string()))?;
+                let compressed = compression.encode(bytes)?;
+                Ok(Self {
+                    compression,
+                    compressed,
+                    timestamp,
+                })
+            })();
+            release_nbt_buffer(bytes);
+            result
         })
     }
     /// `RegionFileStorage.read`: the root read straight off the decompressing
@@ -55,10 +78,12 @@ impl ChunkRecord {
             let decoded = self
                 .compression
                 .decode_into(&self.compressed, limits.max_bytes, bytes);
-            match nbt::read_named(bytes, limits) {
+            let result = match nbt::read_named(bytes, limits) {
                 Ok((root, _)) => Ok(root),
                 Err(e) => Err(decoded.err().unwrap_or_else(|| invalid(e.to_string()))),
-            }
+            };
+            release_nbt_buffer(bytes);
+            result
         })
     }
 }
@@ -75,6 +100,10 @@ pub struct RegionFile {
     /// The first free sector (`RegionBitmap`'s low watermark): allocation
     /// starts its first-fit search here instead of at sector 0.
     first_free: usize,
+    /// Bitset of slots that may currently have an external `c.X.Z.mcc` file on
+    /// disk (any 1-sector slot loaded from disk, or any slot written externally
+    /// during this session). Avoids redundant `unlink` syscalls for inline slots.
+    maybe_external: [u64; 16],
 }
 
 pub fn position_from_path(path: &Path) -> io::Result<ChunkPos> {
@@ -231,6 +260,26 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
+fn flush_sector_run(file: &mut File, run_start: usize, buf: &mut Vec<u8>) -> io::Result<()> {
+    file.seek(SeekFrom::Start((run_start as u64) * SECTOR as u64))?;
+    file.write_all(buf)?;
+    buf.clear();
+    Ok(())
+}
+
+struct PendingBatchOp<'a> {
+    slot: usize,
+    chunk: ChunkPos,
+    record: Option<&'a ChunkRecord>,
+    old_offset: u32,
+    old_timestamp: u32,
+    new_offset: u32,
+    new_timestamp: u32,
+    allocated: Option<(usize, usize)>,
+    new_external: bool,
+    remove_old_external: bool,
+}
+
 impl RegionFile {
     pub fn position(&self) -> ChunkPos {
         self.position
@@ -257,6 +306,12 @@ impl RegionFile {
     fn from_file(path: PathBuf, mut file: File) -> io::Result<Self> {
         let position = position_from_path(&path)?;
         let (offsets, timestamps) = read_header(&mut file)?;
+        let mut maybe_external = [0u64; 16];
+        for (i, &offset) in offsets.iter().enumerate() {
+            if offset != 0 && (offset & 255) == 1 {
+                maybe_external[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
         let mut region = Self {
             file,
             path,
@@ -265,6 +320,7 @@ impl RegionFile {
             timestamps,
             used: Vec::new(),
             first_free: 0,
+            maybe_external,
         };
         region.force(0, 2);
         for offset in offsets.into_iter().filter(|&o| o != 0) {
@@ -334,10 +390,10 @@ impl RegionFile {
             self.free(start, sectors);
             return Err(invalid("region sector address limit exceeded"));
         }
-        let directory = self.path.parent().unwrap_or(Path::new(".")).to_owned();
-        let external_file = external_path(&directory, chunk);
         let mut data = Vec::with_capacity(sectors * SECTOR);
         if external {
+            let directory = self.path.parent().unwrap_or(Path::new("."));
+            let external_file = external_path(directory, chunk);
             let temporary = directory.join(format!(".c.{}.{}.mcc.tmp", chunk.x, chunk.z));
             let written = File::create(&temporary)
                 .and_then(|mut f| {
@@ -351,6 +407,7 @@ impl RegionFile {
                 self.free(start, sectors);
                 return Err(e);
             }
+            self.set_maybe_external(i, true);
             data.extend_from_slice(&1u32.to_be_bytes());
             data.push(record.compression as u8 | 128);
         } else {
@@ -361,23 +418,269 @@ impl RegionFile {
         data.resize(sectors * SECTOR, 0);
         let written = self
             .file
-            .seek(SeekFrom::Start((start * SECTOR) as u64))
+            .seek(SeekFrom::Start((start as u64) * SECTOR as u64))
             .and_then(|_| self.file.write_all(&data));
         if let Err(e) = written {
             self.free(start, sectors);
             return Err(e);
         }
         let old = self.offsets[i];
+        let old_timestamp = self.timestamps[i];
+        let had_maybe_external = self.maybe_external(i);
         self.offsets[i] = (start as u32) << 8 | sectors as u32;
         self.timestamps[i] = record.timestamp;
-        self.write_header()?;
-        if !external {
-            remove_if_exists(&external_file)?;
+        if let Err(e) = self.write_header() {
+            self.offsets[i] = old;
+            self.timestamps[i] = old_timestamp;
+            self.free(start, sectors);
+            return Err(e);
         }
         if old != 0 {
             self.free((old >> 8) as usize, (old & 255) as usize);
         }
+        if !external && had_maybe_external {
+            let path = external_path(self.path.parent().unwrap_or(Path::new(".")), chunk);
+            remove_if_exists(&path)?;
+            self.set_maybe_external(i, false);
+        }
         Ok(())
+    }
+
+    /// Commit a batch of chunk writes (`Some`) and clears (`None`) with a
+    /// single 8 KiB header rewrite, preserving the crash-safety invariant that
+    /// old sectors remain reserved until the new header is written.
+    ///
+    /// Duplicate positions in `ops` coalesce to their last entry after every
+    /// entry is validated. Returns whether the region changed.
+    pub fn write_batch(
+        &mut self,
+        ops: &[(ChunkPos, Option<&ChunkRecord>)],
+        clear_timestamp: u32,
+    ) -> io::Result<bool> {
+        if ops.is_empty() {
+            return Ok(false);
+        }
+
+        // Phase 0: validate every op and coalesce duplicate positions (last op
+        // wins) before mutating the sector bitmap or writing to disk.
+        let mut effective: Vec<(usize, ChunkPos, Option<&ChunkRecord>)> =
+            Vec::with_capacity(ops.len().min(1024));
+        let mut seen = [u16::MAX; 1024];
+        for &(chunk, record) in ops {
+            let i = slot(self.position, chunk)?;
+            if let Some(record) = record
+                && record.compressed.len() > MAX_COMPRESSED
+            {
+                return Err(invalid("compressed chunk limit exceeded"));
+            }
+            if seen[i] == u16::MAX {
+                seen[i] = effective.len() as u16;
+                effective.push((i, chunk, record));
+            } else {
+                effective[usize::from(seen[i])] = (i, chunk, record);
+            }
+        }
+
+        // Phase 1a: allocate all new sectors while keeping every old sector
+        // reserved so a crash or error before the header write cannot corrupt
+        // existing chunks.
+        let mut pending: Vec<PendingBatchOp<'_>> = Vec::with_capacity(effective.len());
+        for (i, chunk, record) in effective {
+            let old_offset = self.offsets[i];
+            let old_timestamp = self.timestamps[i];
+            match record {
+                Some(record) => {
+                    let required = (record.compressed.len() + 5).div_ceil(SECTOR);
+                    let new_external = required >= 256;
+                    let sectors = if new_external { 1 } else { required };
+                    let start = self.allocate(sectors);
+                    if start + sectors > 0x100_0000 {
+                        self.free(start, sectors);
+                        self.free_pending(&pending);
+                        return Err(invalid("region sector address limit exceeded"));
+                    }
+                    pending.push(PendingBatchOp {
+                        slot: i,
+                        chunk,
+                        record: Some(record),
+                        old_offset,
+                        old_timestamp,
+                        new_offset: (start as u32) << 8 | sectors as u32,
+                        new_timestamp: record.timestamp,
+                        allocated: Some((start, sectors)),
+                        new_external,
+                        remove_old_external: !new_external && self.maybe_external(i),
+                    });
+                }
+                None => {
+                    if old_offset == 0 {
+                        continue;
+                    }
+                    pending.push(PendingBatchOp {
+                        slot: i,
+                        chunk,
+                        record: None,
+                        old_offset,
+                        old_timestamp,
+                        new_offset: 0,
+                        new_timestamp: clear_timestamp,
+                        allocated: None,
+                        new_external: false,
+                        remove_old_external: self.maybe_external(i),
+                    });
+                }
+            }
+        }
+        if pending.is_empty() {
+            return Ok(false);
+        }
+
+        // Phase 1b: write all newly allocated sector payloads (coalescing
+        // contiguous sector runs up to MAX_COALESCED_WRITE).
+        let mut run_buf = Vec::new();
+        let mut run_start_sector: Option<usize> = None;
+        let mut run_next_sector: usize = 0;
+        for op in &pending {
+            let (Some((start, sectors)), Some(record)) = (op.allocated, op.record) else {
+                continue;
+            };
+            let bytes_len = sectors * SECTOR;
+            if let Some(run_start) = run_start_sector
+                && (start != run_next_sector || run_buf.len() + bytes_len > MAX_COALESCED_WRITE)
+            {
+                if let Err(e) = flush_sector_run(&mut self.file, run_start, &mut run_buf) {
+                    self.free_pending(&pending);
+                    return Err(e);
+                }
+                run_start_sector = None;
+            }
+            if run_start_sector.is_none() {
+                run_start_sector = Some(start);
+            }
+            let chunk_start = run_buf.len();
+            if op.new_external {
+                run_buf.extend_from_slice(&1u32.to_be_bytes());
+                run_buf.push(record.compression as u8 | 128);
+            } else {
+                run_buf.extend_from_slice(&(record.compressed.len() as u32 + 1).to_be_bytes());
+                run_buf.push(record.compression as u8);
+                run_buf.extend_from_slice(&record.compressed);
+            }
+            run_buf.resize(chunk_start + bytes_len, 0);
+            run_next_sector = start + sectors;
+        }
+        if let Some(run_start) = run_start_sector
+            && let Err(e) = flush_sector_run(&mut self.file, run_start, &mut run_buf)
+        {
+            self.free_pending(&pending);
+            return Err(e);
+        }
+
+        // Phase 1c: write and sync temporary external `.mcc` files for any
+        // oversized chunks before publishing them.
+        let mut staged_externals: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
+        for op in &pending {
+            if !op.new_external {
+                continue;
+            }
+            let Some(record) = op.record else {
+                continue;
+            };
+            let directory = self.path.parent().unwrap_or(Path::new("."));
+            let temporary = directory.join(format!(".c.{}.{}.mcc.tmp", op.chunk.x, op.chunk.z));
+            let external_file = external_path(directory, op.chunk);
+            let written = File::create(&temporary).and_then(|mut f| {
+                f.write_all(&record.compressed)?;
+                // The region's sync only covers the stub, not this external payload.
+                f.sync_all()
+            });
+            if let Err(e) = written {
+                let _ = fs::remove_file(&temporary);
+                for (_, staged_tmp, _) in &staged_externals {
+                    let _ = fs::remove_file(staged_tmp);
+                }
+                self.free_pending(&pending);
+                return Err(e);
+            }
+            staged_externals.push((op.slot, temporary, external_file));
+        }
+
+        // Phase 1d: atomically publish staged `.mcc` files before the header points to them.
+        for (idx, (slot_idx, temporary, external_file)) in staged_externals.iter().enumerate() {
+            if let Err(e) = fs::rename(temporary, external_file) {
+                for (_, remaining_tmp, _) in &staged_externals[idx..] {
+                    let _ = fs::remove_file(remaining_tmp);
+                }
+                self.free_pending(&pending);
+                return Err(e);
+            }
+            self.set_maybe_external(*slot_idx, true);
+        }
+
+        // Phase 2: update header tables and commit the 8 KiB header once.
+        for op in &pending {
+            self.offsets[op.slot] = op.new_offset;
+            self.timestamps[op.slot] = op.new_timestamp;
+        }
+        if let Err(e) = self.write_header() {
+            for op in &pending {
+                self.offsets[op.slot] = op.old_offset;
+                self.timestamps[op.slot] = op.old_timestamp;
+            }
+            self.free_pending(&pending);
+            return Err(e);
+        }
+
+        // Phase 3: free all superseded sectors and unlink obsolete `.mcc` files
+        // only for slots that could have held an external payload.
+        for op in &pending {
+            if op.old_offset != 0 {
+                self.free(
+                    (op.old_offset >> 8) as usize,
+                    (op.old_offset & 255) as usize,
+                );
+            }
+        }
+        let mut first_unlink_err: Option<io::Error> = None;
+        for op in &pending {
+            if !op.remove_old_external {
+                continue;
+            }
+            let path = external_path(self.path.parent().unwrap_or(Path::new(".")), op.chunk);
+            match remove_if_exists(&path) {
+                Ok(()) => self.set_maybe_external(op.slot, false),
+                Err(e) => {
+                    if first_unlink_err.is_none() {
+                        first_unlink_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_unlink_err {
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    fn maybe_external(&self, index: usize) -> bool {
+        (self.maybe_external[index >> 6] & (1u64 << (index & 63))) != 0
+    }
+
+    fn set_maybe_external(&mut self, index: usize, value: bool) {
+        let mask = 1u64 << (index & 63);
+        if value {
+            self.maybe_external[index >> 6] |= mask;
+        } else {
+            self.maybe_external[index >> 6] &= !mask;
+        }
+    }
+
+    fn free_pending(&mut self, pending: &[PendingBatchOp<'_>]) {
+        for op in pending {
+            if let Some((start, sectors)) = op.allocated {
+                self.free(start, sectors);
+            }
+        }
     }
 
     /// `RegionFile.clear`: the chunk is gone; `timestamp` marks when.
@@ -388,12 +691,21 @@ impl RegionFile {
         if old == 0 {
             return Ok(false);
         }
+        let old_timestamp = self.timestamps[i];
+        let had_maybe_external = self.maybe_external(i);
         self.offsets[i] = 0;
         self.timestamps[i] = timestamp;
-        self.write_header()?;
-        let directory = self.path.parent().unwrap_or(Path::new("."));
-        remove_if_exists(&external_path(directory, chunk))?;
+        if let Err(e) = self.write_header() {
+            self.offsets[i] = old;
+            self.timestamps[i] = old_timestamp;
+            return Err(e);
+        }
         self.free((old >> 8) as usize, (old & 255) as usize);
+        if had_maybe_external {
+            let path = external_path(self.path.parent().unwrap_or(Path::new(".")), chunk);
+            remove_if_exists(&path)?;
+            self.set_maybe_external(i, false);
+        }
         Ok(true)
     }
 
@@ -807,5 +1119,439 @@ mod tests {
         assert!(header.read_chunk(ChunkPos::new(0, 64)).is_err());
         assert!(RegionHeader::read(dir.join("r.5.5.mca")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Private temporary directory created atomically with a non-recursive
+    /// `DirBuilder` (`0o700` on Unix) so test fixtures never reuse or delete
+    /// a directory they did not create.
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn create(prefix: &str) -> Self {
+            use std::{
+                collections::hash_map::RandomState,
+                hash::BuildHasher,
+                sync::atomic::AtomicU64,
+                time::{SystemTime, UNIX_EPOCH},
+            };
+
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+
+            let base = std::env::temp_dir();
+            let pid = std::process::id();
+            let builder = Self::private_dir_builder();
+            for attempt in 0..1024u64 {
+                let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let nonce = RandomState::new().hash_one((pid, seq, attempt, nanos));
+                let path = base.join(format!("{prefix}-{pid}-{seq}-{nanos:x}-{nonce:016x}"));
+                match builder.create(&path) {
+                    Ok(()) => return Self(path),
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => panic!(
+                        "failed to create temporary directory {}: {err}",
+                        path.display()
+                    ),
+                }
+            }
+            panic!(
+                "failed to create a unique temporary directory under {} after 1024 attempts",
+                base.display()
+            );
+        }
+
+        fn private_dir_builder() -> fs::DirBuilder {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            }
+            #[cfg(not(unix))]
+            {
+                fs::DirBuilder::new()
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_bitmap_matches_naive(region: &RegionFile) {
+        let mut naive = vec![false; region.used.len()];
+        naive[0..2].fill(true);
+        for i in 0..1024 {
+            let o = region.offsets[i];
+            if o != 0 {
+                let s = (o >> 8) as usize;
+                let c = (o & 255) as usize;
+                if naive.len() < s + c {
+                    naive.resize(s + c, false);
+                }
+                naive[s..s + c].fill(true);
+            }
+        }
+        assert_eq!(region.used, naive);
+        assert_eq!(region.first_free, naive_first_fit(&naive, 1));
+    }
+
+    fn sample_record(fill: u8, len: usize, timestamp: u32) -> ChunkRecord {
+        ChunkRecord {
+            compression: Compression::None,
+            compressed: vec![fill; len],
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn chunk_record_nbt_buffers_preserve_parity_and_cap_capacity() {
+        let small = NamedTag {
+            name: nbt::JavaString::default(),
+            tag: nbt::Tag::compound([
+                ("xPos", nbt::Tag::Int(3)),
+                ("zPos", nbt::Tag::Int(-7)),
+                ("ints", nbt::Tag::IntArray((0..128).collect())),
+                (
+                    "longs",
+                    nbt::Tag::LongArray((0..512).map(|i| i * 17 - 9).collect()),
+                ),
+            ]),
+        };
+        let oversized = NamedTag {
+            name: nbt::JavaString::default(),
+            tag: nbt::Tag::compound([(
+                "blob",
+                nbt::Tag::ByteArray(vec![0x5a; MAX_RETAINED_NBT_BUFFER + 128 * 1024]),
+            )]),
+        };
+        let limits = Limits::default();
+
+        for codec in [Compression::Zlib, Compression::None, Compression::Lz4] {
+            for tag in [&small, &oversized] {
+                let raw = nbt::write_named(tag, limits).unwrap();
+                let expected_compressed = codec.encode(&raw).unwrap();
+                let record = ChunkRecord::from_nbt(tag, codec, 42, limits).unwrap();
+                assert_eq!(record.compression, codec);
+                assert_eq!(record.timestamp, 42);
+                assert_eq!(record.compressed, expected_compressed);
+                assert_eq!(record.nbt(limits).unwrap(), *tag);
+            }
+        }
+
+        NBT_ENCODE_BUFFER.with_borrow(|buf| {
+            assert!(buf.is_empty());
+            assert!(buf.capacity() <= MAX_RETAINED_NBT_BUFFER);
+        });
+        NBT_DECODE_BUFFER.with_borrow(|buf| {
+            assert!(buf.is_empty());
+            assert!(buf.capacity() <= MAX_RETAINED_NBT_BUFFER);
+        });
+
+        let tight = Limits {
+            max_bytes: 16,
+            ..Limits::default()
+        };
+        assert!(ChunkRecord::from_nbt(&oversized, Compression::Zlib, 1, tight).is_err());
+        NBT_ENCODE_BUFFER.with_borrow(|buf| {
+            assert!(buf.is_empty());
+            assert!(buf.capacity() <= MAX_RETAINED_NBT_BUFFER);
+        });
+    }
+
+    #[test]
+    fn write_batch_matches_sequential_writes_clears_and_externals() {
+        let dir_seq = TempDirGuard::create("hz-region-seq");
+        let dir_batch = TempDirGuard::create("hz-region-batch");
+        let path_seq = dir_seq.path().join("r.-1.0.mca");
+        let path_batch = dir_batch.path().join("r.-1.0.mca");
+
+        let mut seq = RegionFile::open_writable(&path_seq, true).unwrap();
+        let mut batch = RegionFile::open_writable(&path_batch, true).unwrap();
+
+        // Empty batch and clears of absent chunks are no-ops.
+        assert!(!batch.write_batch(&[], 10).unwrap());
+        let absent = ChunkPos::new(-32, 0);
+        assert!(!batch.write_batch(&[(absent, None)], 10).unwrap());
+        assert_eq!(fs::metadata(&path_batch).unwrap().len(), 0);
+
+        // Batch 1: 64 contiguous inline chunks with varying sector counts (1..=4).
+        let records1: Vec<(ChunkPos, ChunkRecord)> = (0..64i32)
+            .map(|i| {
+                let pos = ChunkPos::new(-32 + (i % 32), i / 32);
+                let sectors = (i as usize % 4) + 1;
+                (
+                    pos,
+                    sample_record(
+                        (i as u8).wrapping_add(1),
+                        sectors * SECTOR - 5,
+                        100 + i as u32,
+                    ),
+                )
+            })
+            .collect();
+        for (pos, rec) in &records1 {
+            seq.write(*pos, rec).unwrap();
+        }
+        let ops1: Vec<(ChunkPos, Option<&ChunkRecord>)> = records1
+            .iter()
+            .map(|(pos, rec)| (*pos, Some(rec)))
+            .collect();
+        assert!(batch.write_batch(&ops1, 0).unwrap());
+        assert_bitmap_matches_naive(&batch);
+
+        // Batch 2: overwrite inline chunks, add two external chunks, and clear several.
+        let ext_a = ChunkPos::new(-30, 0);
+        let ext_b = ChunkPos::new(-1, 31);
+        let rec_ext_a = sample_record(0xaa, 256 * SECTOR, 200);
+        let rec_ext_b = sample_record(0xbb, 255 * SECTOR - 4, 201);
+        let rec_grow = sample_record(0xcc, 5 * SECTOR - 5, 202);
+        let clear_a = ChunkPos::new(-31, 0);
+        let clear_absent = ChunkPos::new(-2, 31);
+        let batch2_ops: [(ChunkPos, Option<&ChunkRecord>); 5] = [
+            (ext_a, Some(&rec_ext_a)),
+            (ext_b, Some(&rec_ext_b)),
+            (ChunkPos::new(-32, 0), Some(&rec_grow)),
+            (clear_a, None),
+            (clear_absent, None),
+        ];
+        for &(pos, rec) in &batch2_ops {
+            match rec {
+                Some(r) => seq.write(pos, r).unwrap(),
+                None => {
+                    seq.clear(pos, 250).unwrap();
+                }
+            }
+        }
+        assert!(batch.write_batch(&batch2_ops, 250).unwrap());
+        assert_bitmap_matches_naive(&batch);
+        assert!(dir_batch.path().join("c.-30.0.mcc").is_file());
+        assert!(dir_batch.path().join("c.-1.31.mcc").is_file());
+
+        // Batch 3: shrink ext_a back inline (removes .mcc), update ext_b externally.
+        let rec_inline_a = sample_record(0x11, 128, 300);
+        let rec_ext_b2 = sample_record(0xdd, 257 * SECTOR, 301);
+        let batch3_ops: [(ChunkPos, Option<&ChunkRecord>); 2] =
+            [(ext_a, Some(&rec_inline_a)), (ext_b, Some(&rec_ext_b2))];
+        for &(pos, rec) in &batch3_ops {
+            seq.write(pos, rec.unwrap()).unwrap();
+        }
+        assert!(batch.write_batch(&batch3_ops, 0).unwrap());
+        assert_bitmap_matches_naive(&batch);
+        assert!(!dir_batch.path().join("c.-30.0.mcc").exists());
+        assert!(dir_batch.path().join("c.-1.31.mcc").is_file());
+        assert!(batch.is_external(ext_b).unwrap());
+
+        // Reopen from disk so `maybe_external` is reconstructed from header stubs,
+        // then clear ext_b and ensure its `.mcc` is deleted.
+        batch.sync().unwrap();
+        seq.sync().unwrap();
+        drop(batch);
+        drop(seq);
+
+        let mut seq = RegionFile::open_writable(&path_seq, false).unwrap();
+        let mut batch = RegionFile::open_writable(&path_batch, false).unwrap();
+        assert!(seq.clear(ext_b, 400).unwrap());
+        assert!(batch.write_batch(&[(ext_b, None)], 400).unwrap());
+        assert_bitmap_matches_naive(&batch);
+        assert!(!dir_batch.path().join("c.-1.31.mcc").exists());
+        drop(seq);
+        drop(batch);
+
+        // Final verification after fresh reopen: exact chunk set, timestamps, and bytes.
+        let mut seq = RegionFile::open(&path_seq).unwrap();
+        let mut batch = RegionFile::open(&path_batch).unwrap();
+        let seq_chunks: Vec<_> = seq.chunks().collect();
+        let batch_chunks: Vec<_> = batch.chunks().collect();
+        assert_eq!(batch_chunks, seq_chunks);
+        for (pos, _) in batch_chunks {
+            let a = seq.read(pos).unwrap().unwrap();
+            let b = batch.read(pos).unwrap().unwrap();
+            assert_eq!(b.compression, a.compression);
+            assert_eq!(b.timestamp, a.timestamp);
+            assert_eq!(b.compressed, a.compressed);
+        }
+    }
+
+    #[test]
+    fn write_batch_coalesces_duplicates_and_preserves_state_on_errors() {
+        let dir = TempDirGuard::create("hz-region-edge");
+        let path = dir.path().join("r.0.0.mca");
+        let mut region = RegionFile::open_writable(&path, true).unwrap();
+
+        let a = ChunkPos::new(0, 0);
+        let b = ChunkPos::new(1, 0);
+        let c = ChunkPos::new(2, 0);
+        let r1 = sample_record(1, 300, 10);
+        let r2 = sample_record(2, 5000, 20);
+        let ext = sample_record(3, 256 * SECTOR, 30);
+
+        // Duplicate write + clear on absent chunk coalesces to a net no-op.
+        assert!(
+            !region
+                .write_batch(&[(c, Some(&r1)), (c, None)], 55)
+                .unwrap()
+        );
+        assert_bitmap_matches_naive(&region);
+        assert!(region.read(c).unwrap().is_none());
+
+        // Duplicate writes coalesce to last op; overridden external never creates `.mcc`.
+        assert!(
+            region
+                .write_batch(
+                    &[
+                        (a, Some(&r1)),
+                        (a, Some(&r2)),
+                        (b, Some(&ext)),
+                        (b, Some(&r1))
+                    ],
+                    0
+                )
+                .unwrap()
+        );
+        assert_bitmap_matches_naive(&region);
+        assert!(!dir.path().join("c.1.0.mcc").exists());
+        assert_eq!(region.read(a).unwrap().unwrap().compressed, r2.compressed);
+        assert_eq!(region.read(b).unwrap().unwrap().compressed, r1.compressed);
+
+        // Write then clear an existing chunk clears it; clear then write updates it.
+        assert!(
+            region
+                .write_batch(&[(a, Some(&r1)), (a, None), (b, None), (b, Some(&r2))], 77)
+                .unwrap()
+        );
+        assert_bitmap_matches_naive(&region);
+        assert!(region.read(a).unwrap().is_none());
+        assert_eq!(region.read(b).unwrap().unwrap().compressed, r2.compressed);
+
+        // Validation error (out-of-region or oversized) leaves region completely unchanged.
+        let offsets_before = region.offsets;
+        let timestamps_before = region.timestamps;
+        let used_before = region.used.clone();
+        let first_free_before = region.first_free;
+        assert!(
+            region
+                .write_batch(&[(c, Some(&r1)), (ChunkPos::new(32, 0), Some(&r1))], 0)
+                .is_err()
+        );
+        assert_eq!(region.offsets, offsets_before);
+        assert_eq!(region.timestamps, timestamps_before);
+        assert_eq!(region.used, used_before);
+        assert_eq!(region.first_free, first_free_before);
+
+        let too_large = ChunkRecord {
+            compression: Compression::None,
+            compressed: vec![0; MAX_COMPRESSED + 1],
+            timestamp: 99,
+        };
+        assert!(
+            region
+                .write_batch(&[(c, Some(&r1)), (a, Some(&too_large))], 0)
+                .is_err()
+        );
+        assert_eq!(region.offsets, offsets_before);
+        assert_eq!(region.timestamps, timestamps_before);
+        assert_eq!(region.used, used_before);
+        assert_eq!(region.first_free, first_free_before);
+
+        // Interleave `write` (external) with `write_batch` (inline) so `maybe_external` stays synced.
+        region.write(a, &ext).unwrap();
+        assert!(dir.path().join("c.0.0.mcc").is_file());
+        assert!(region.write_batch(&[(a, Some(&r1))], 0).unwrap());
+        assert!(!dir.path().join("c.0.0.mcc").exists());
+        assert_bitmap_matches_naive(&region);
+
+        // Read-only file: Phase 1b write failure and Phase 2 clear-only header write failure
+        // both roll back in-memory state cleanly.
+        region.sync().unwrap();
+        drop(region);
+        let mut ro = RegionFile::open(&path).unwrap();
+        let ro_offsets = ro.offsets;
+        let ro_timestamps = ro.timestamps;
+        let ro_first_free = ro.first_free;
+        assert!(ro.write_batch(&[(c, Some(&r1))], 0).is_err());
+        assert_eq!(ro.offsets, ro_offsets);
+        assert_eq!(ro.timestamps, ro_timestamps);
+        assert_eq!(ro.first_free, ro_first_free);
+        assert_bitmap_matches_naive(&ro);
+
+        // Clear-only batch reaches Phase 2 `write_header()` on a read-only fd.
+        assert!(ro.write_batch(&[(b, None)], 999).is_err());
+        assert_eq!(ro.offsets, ro_offsets);
+        assert_eq!(ro.timestamps, ro_timestamps);
+        assert_eq!(ro.first_free, ro_first_free);
+        assert_bitmap_matches_naive(&ro);
+    }
+
+    #[test]
+    fn write_batch_coalesces_across_buffer_limit_and_fragmented_holes() {
+        let dir = TempDirGuard::create("hz-region-coalesce");
+        let path = dir.path().join("r.0.0.mca");
+        let mut region = RegionFile::open_writable(&path, true).unwrap();
+
+        // 20 contiguous 8-sector chunks (640 KiB > MAX_COALESCED_WRITE) plus one
+        // max-inline 255-sector chunk (~1 MiB > MAX_COALESCED_WRITE).
+        let mut records: Vec<(ChunkPos, ChunkRecord)> = (0..20i32)
+            .map(|i| {
+                (
+                    ChunkPos::new(i, 0),
+                    sample_record(i as u8 + 10, 8 * SECTOR - 5, 10 + i as u32),
+                )
+            })
+            .collect();
+        records.push((
+            ChunkPos::new(25, 0),
+            sample_record(0xfe, 255 * SECTOR - 5, 99),
+        ));
+        let ops: Vec<(ChunkPos, Option<&ChunkRecord>)> =
+            records.iter().map(|(p, r)| (*p, Some(r))).collect();
+        assert!(region.write_batch(&ops, 0).unwrap());
+        assert_bitmap_matches_naive(&region);
+
+        // Fragment the region by clearing every even chunk, then refill with mixed sizes.
+        let clear_ops: Vec<(ChunkPos, Option<&ChunkRecord>)> = (0..20usize)
+            .filter(|i| i.is_multiple_of(2))
+            .map(|i| (ChunkPos::new(i as i32, 0), None))
+            .collect();
+        assert!(region.write_batch(&clear_ops, 500).unwrap());
+        assert_bitmap_matches_naive(&region);
+
+        let refill: Vec<(ChunkPos, ChunkRecord)> = (0..10usize)
+            .map(|i| {
+                let sectors = if i.is_multiple_of(2) { 3 } else { 10 };
+                (
+                    ChunkPos::new((i * 2) as i32, 0),
+                    sample_record(0x80 + i as u8, sectors * SECTOR - 5, 600 + i as u32),
+                )
+            })
+            .collect();
+        let refill_ops: Vec<(ChunkPos, Option<&ChunkRecord>)> =
+            refill.iter().map(|(p, r)| (*p, Some(r))).collect();
+        assert!(region.write_batch(&refill_ops, 0).unwrap());
+        assert_bitmap_matches_naive(&region);
+        drop(region);
+
+        let mut reopened = RegionFile::open(&path).unwrap();
+        for (pos, expected) in &refill {
+            let actual = reopened.read(*pos).unwrap().unwrap();
+            assert_eq!(actual.compressed, expected.compressed);
+            assert_eq!(actual.timestamp, expected.timestamp);
+        }
+        // Surviving odd chunks and the 255-sector chunk must be intact.
+        for (pos, expected) in records.iter().filter(|(p, _)| p.x == 25 || (p.x & 1) != 0) {
+            let actual = reopened.read(*pos).unwrap().unwrap();
+            assert_eq!(actual.compressed, expected.compressed);
+            assert_eq!(actual.timestamp, expected.timestamp);
+        }
     }
 }

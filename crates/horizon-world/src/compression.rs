@@ -1,5 +1,5 @@
 //! Region codecs, including lz4-java's block framing (not the LZ4 frame format).
-use flate2::{Compression as Level, Decompress, FlushDecompress, Status};
+use flate2::{Compress, Compression as Level, Decompress, FlushCompress, FlushDecompress, Status};
 use std::{
     io::{self, Read, Write},
     sync::atomic::{AtomicU8, Ordering},
@@ -105,19 +105,29 @@ impl Compression {
     }
 
     pub fn encode(self, bytes: &[u8]) -> io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        self.encode_into(bytes, &mut output)?;
+        Ok(output)
+    }
+
+    /// [`encode`](Self::encode) appended onto `output`.
+    pub fn encode_into(self, bytes: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
         match self {
-            Self::None => Ok(bytes.to_vec()),
+            Self::None => {
+                output.extend_from_slice(bytes);
+                Ok(())
+            }
             Self::Gzip => {
-                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Level::default());
+                let mut encoder = flate2::write::GzEncoder::new(output, Level::default());
                 encoder.write_all(bytes)?;
-                encoder.finish()
+                encoder.finish()?;
+                Ok(())
             }
-            Self::Zlib => {
-                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Level::default());
-                encoder.write_all(bytes)?;
-                encoder.finish()
+            Self::Zlib => zlib_encode_into(bytes, output),
+            Self::Lz4 => {
+                encode_lz4_into(bytes, output);
+                Ok(())
             }
-            Self::Lz4 => Ok(encode_lz4(bytes)),
         }
     }
 }
@@ -126,8 +136,43 @@ thread_local! {
     /// This thread's zlib inflater, reset for each chunk instead of a new
     /// one (and its window) allocated every time.
     static INFLATER: std::cell::RefCell<Option<Decompress>> = const { std::cell::RefCell::new(None) };
+    /// This thread's zlib deflater, reset for each chunk instead of a new
+    /// one (and its ~300 KiB window and hash tables) allocated every time.
+    static DEFLATER: std::cell::RefCell<Option<Compress>> = const { std::cell::RefCell::new(None) };
     /// This thread's LZ4 compressed-block scratch, retained between chunk reads.
     static LZ4_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `bytes` as one zlib stream at the default compression level, appended onto
+/// `output`: the same bytes a fresh `ZlibEncoder` writes, reusing this thread's
+/// deflater.
+fn zlib_encode_into(bytes: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+    DEFLATER.with_borrow_mut(|deflater| {
+        let encoder = deflater.get_or_insert_with(|| Compress::new(Level::default(), true));
+        encoder.reset();
+        let start = encoder.total_in();
+        let mut initial_reserve = Some((bytes.len() / 2).clamp(1024, 256 * 1024));
+        // ZlibEncoder's calls: the whole input without a flush, then finish.
+        let mut flush = FlushCompress::None;
+        loop {
+            let at = (encoder.total_in() - start) as usize;
+            if at == bytes.len() {
+                flush = FlushCompress::Finish;
+            }
+            if output.capacity() - output.len() < 64 {
+                output.reserve(initial_reserve.take().unwrap_or(32 << 10));
+            }
+            let before_in = encoder.total_in();
+            let before_out = output.len();
+            let status = encoder.compress_vec(&bytes[at..], output, flush)?;
+            if status == Status::StreamEnd {
+                return Ok(());
+            }
+            if encoder.total_in() == before_in && output.len() == before_out {
+                output.reserve((output.capacity() - output.len()).saturating_add(32 << 10));
+            }
+        }
+    })
 }
 
 /// The zlib stream in `bytes` decoded onto `output`, at most `max_output`
@@ -358,8 +403,7 @@ fn decompress_lz4_java(src: &[u8], dest: &mut [u8]) -> Option<usize> {
     }
 }
 
-fn encode_lz4(bytes: &[u8]) -> Vec<u8> {
-    let mut output = Vec::new();
+fn encode_lz4_into(bytes: &[u8], output: &mut Vec<u8>) {
     for block in bytes.chunks(65536) {
         let compressed = lz4_flex::block::compress(block);
         let (token, payload) = if compressed.len() < block.len() {
@@ -377,7 +421,6 @@ fn encode_lz4(bytes: &[u8]) -> Vec<u8> {
     output.extend_from_slice(MAGIC);
     output.push(0x16);
     output.extend_from_slice(&[0; 12]);
-    output
 }
 
 #[cfg(test)]
@@ -573,6 +616,97 @@ mod tests {
             };
             encoded[i] ^= 1;
             assert!(codec.decode(&encoded, 1000).is_err());
+        }
+    }
+
+    #[test]
+    fn zlib_tls_deflater_matches_fresh_encoder_byte_for_byte() {
+        let fresh_zlib = |bytes: &[u8]| -> Vec<u8> {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Level::default());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let mut inputs: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![42; 13],
+            (0..63u8).collect(),
+            (0..64u8).collect(),
+            (0..65u8).collect(),
+            vec![7; 8192],
+            vec![0; 131_073],
+        ];
+        for n in [1024usize, 32_768, 65_536, 131_072] {
+            inputs.push((0..n).map(|_| random() as u8).collect());
+        }
+        for n in [20_000usize, 100_000] {
+            inputs.push(
+                (0..n)
+                    .map(|i| {
+                        if i % 700 < 400 {
+                            7
+                        } else {
+                            random() as u8 & 31
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        // Interleave small/empty payloads after huge incompressible ones on the same thread
+        // to prove `DEFLATER.reset()` leaks no state across calls.
+        inputs.push(vec![]);
+        inputs.push(b"Horizon".to_vec());
+
+        for input in &inputs {
+            let expected = fresh_zlib(input);
+            let actual = Compression::Zlib.encode(input).unwrap();
+            assert_eq!(actual, expected, "zlib mismatch for len {}", input.len());
+            assert_eq!(
+                Compression::Zlib.decode(&actual, input.len()).unwrap(),
+                *input
+            );
+        }
+    }
+
+    #[test]
+    fn encode_into_appends_exact_bytes_for_all_codecs() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let incompressible: Vec<u8> = (0..40_000).map(|_| random() as u8).collect();
+        let payloads: [&[u8]; 4] = [&[], b"Horizon", &[11; 10_000], &incompressible];
+
+        for codec in [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Zlib,
+            Compression::Lz4,
+        ] {
+            let mut reused = Vec::new();
+            for payload in payloads {
+                let expected = codec.encode(payload).unwrap();
+
+                let mut prefixed = b"prefix".to_vec();
+                codec.encode_into(payload, &mut prefixed).unwrap();
+                assert_eq!(&prefixed[..6], b"prefix");
+                assert_eq!(&prefixed[6..], expected.as_slice());
+
+                reused.clear();
+                codec.encode_into(payload, &mut reused).unwrap();
+                assert_eq!(reused, expected);
+            }
         }
     }
 }
