@@ -33,12 +33,22 @@ pub(crate) fn attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttac
     }
 }
 
+pub(crate) fn clear_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        resolve_target: None,
+        depth_slice: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            store: wgpu::StoreOp::Store,
+        },
+    }
+}
+
 pub(crate) fn clear(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
-    let mut color = attachment(view);
-    color.ops.load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("HUD coverage reset"),
-        color_attachments: &[Some(color)],
+        color_attachments: &[Some(clear_attachment(view))],
         ..Default::default()
     });
 }
@@ -468,5 +478,42 @@ mod tests {
         };
         let names: Vec<_> = members.iter().map(|m| m.name.as_deref().unwrap()).collect();
         assert_eq!(names, ["color", "coverage"]);
+    }
+
+    #[test]
+    fn clear_attachment_clears_transparent_and_stores() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let instance = crate::gfx::test_gpu::instance();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            return;
+        };
+        let Ok((device, _)) = pollster::block_on(adapter.request_device(&Default::default()))
+        else {
+            return;
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let load = attachment(&view);
+        assert!(matches!(load.ops.load, wgpu::LoadOp::Load));
+        assert_eq!(load.ops.store, wgpu::StoreOp::Store);
+        let clear = clear_attachment(&view);
+        let wgpu::LoadOp::Clear(color) = clear.ops.load else {
+            panic!("expected LoadOp::Clear");
+        };
+        assert_eq!([color.r, color.g, color.b, color.a], [0.0; 4]);
+        assert_eq!(clear.ops.store, wgpu::StoreOp::Store);
     }
 }

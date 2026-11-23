@@ -8138,9 +8138,22 @@ impl Renderer {
         // once.
         let backstop = checks.is_none().then(|| GpuChecks::push(&self.device));
         let size = [self.config.width, self.config.height];
-        let target_texture = match (&surface_frame, &mut self.hdr) {
-            (_, Some(hdr)) => hdr.frame(&self.device, size),
-            _ if let Some((real, _)) = &fg_frames => real.clone(),
+        // Render directly into the layered HDR pre-tonemap world target when Horizon's tone curve
+        // will run (no world-icon capture before tonemap, and overlay shares the frame format),
+        // eliminating the full-screen `frame -> world` copy before `fs_tonemap`.
+        let pack_tonemap = self.executor.is_some_and(|c| c.tone_curve);
+        let direct_world_tonemap = self
+            .hdr
+            .as_ref()
+            .is_some_and(|hdr| horizon_tone_curve(hdr.layered(), !frame.title, pack_tonemap))
+            && self.output.frame.overlay_format == self.output.frame.format
+            && self.screenshot.as_ref().is_none_or(|r| r.size.is_none());
+        let (target_texture, hdr_view) = match (&surface_frame, &mut self.hdr) {
+            (_, Some(hdr)) => {
+                let (texture, view) = hdr.render_target(&self.device, size, direct_world_tonemap);
+                (texture, Some(view))
+            }
+            _ if let Some((real, _)) = &fg_frames => (real.clone(), None),
             // A screenshot of a swapchain without COPY_SRC (OpenGL), and a float frame
             // with HDR off, draw into a texture of their own, then onto the swapchain or
             // the offscreen target.
@@ -8149,14 +8162,16 @@ impl Renderer {
                     Some(f) => f.texture.clone(),
                     None => self.offscreen.clone().ok_or("no offscreen target")?,
                 };
-                self.readback
+                let texture = self
+                    .readback
                     .target(
                         &self.device,
                         &image,
                         self.output.frame.format,
                         self.screenshot.is_some(),
                     )
-                    .unwrap_or(image)
+                    .unwrap_or(image);
+                (texture, None)
             }
         };
         // The section copies staged since the last frame, in a command buffer of their own
@@ -10238,9 +10253,11 @@ impl Renderer {
             };
             section_draw_calls = mesh_calls + translucent_calls;
         }
-        let view_target = target_texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.output.frame.format),
-            ..Default::default()
+        let view_target = hdr_view.unwrap_or_else(|| {
+            target_texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.output.frame.format),
+                ..Default::default()
+            })
         });
         if let Some(timer) = &mut self.gpu_timer {
             timer.begin(&mut encoder);
@@ -12148,6 +12165,7 @@ impl Renderer {
                 real: false,
                 hand_drawn: !pack_draws_hand,
                 hand_view_proj,
+                direct_world_tonemap,
             };
             let onto = (&view_target, &target_texture, generated);
             fg_made = self.draw_generated(&mut encoder, frame, &camera, &overlay, onto);
@@ -12230,6 +12248,7 @@ impl Renderer {
             real: true,
             hand_drawn: !pack_draws_hand,
             hand_view_proj,
+            direct_world_tonemap,
         };
         let readback =
             self.draw_overlay(&mut encoder, frame, &view_target, &target_texture, &overlay);
@@ -12241,7 +12260,13 @@ impl Renderer {
             gpu.copy_stats(&mut encoder, serial, cpu);
         }
         if let Some(timer) = &mut self.gpu_timer {
-            timer.end(&self.device, &mut encoder, (&view_target, overlay_format));
+            let post_tonemap_view = self
+                .hdr
+                .as_ref()
+                .filter(|_| direct_world_tonemap)
+                .and_then(hdr::Hdr::frame_view);
+            let timer_view = post_tonemap_view.as_ref().unwrap_or(&view_target);
+            timer.end(&self.device, &mut encoder, (timer_view, overlay_format));
         }
         laps.lap("r_passes");
         // The clipped picture for offscreen SDR presentation. Layered screenshots reconstruct
@@ -12685,16 +12710,35 @@ impl Renderer {
             );
         }
         // The layered frame's light eases into the peak, before the camera overlays draw on it,
-        // unless a 0.2 pack's own `[tonemap]` did.
+        // unless a 0.2 pack's own `[tonemap]` did. When no screen overlays draw in between, fuse
+        // the tone curve, HUD backdrop, and coverage clear into a single MRT pass.
         let pack_tonemap = self.executor.is_some_and(|c| c.tone_curve);
-        if horizon_tone_curve(layered, !frame.title, pack_tonemap)
-            && let Some(hdr) = &self.hdr
-        {
-            hdr.tonemap(encoder, timing.as_mut());
+        let run_tonemap = horizon_tone_curve(layered, !frame.title, pack_tonemap);
+        let mut coverage_cleared = false;
+        if run_tonemap && let Some(hdr) = &self.hdr {
+            if frame.screen.is_empty() {
+                coverage_cleared = hdr.tonemap_and_backdrop(
+                    encoder,
+                    overlay.direct_world_tonemap,
+                    timing.as_mut(),
+                );
+            } else if overlay.direct_world_tonemap {
+                hdr.tonemap_from_world(encoder, timing.as_mut());
+            } else {
+                hdr.tonemap(encoder, timing.as_mut());
+            }
         }
+        // Once tonemap moves the active world into `frame`, subsequent passes target `frame`'s
+        // cached view instead of `world`'s.
+        let post_tonemap_view = self
+            .hdr
+            .as_ref()
+            .filter(|_| overlay.direct_world_tonemap)
+            .and_then(hdr::Hdr::frame_view);
+        let frame_view = post_tonemap_view.as_ref().unwrap_or(view_target);
         if !frame.screen.is_empty() {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
-                view: view_target,
+                view: frame_view,
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
@@ -12720,20 +12764,17 @@ impl Renderer {
                 pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
             }
         }
-        if let Some(hdr) = &self.hdr {
+        if !(run_tonemap && frame.screen.is_empty())
+            && let Some(hdr) = &self.hdr
+        {
             hdr.hud_backdrop(encoder, timing.as_mut());
+            coverage_cleared = hdr.layered();
         }
-        // What the HUD and menus draw on: the layered frame's HUD target, else the frame.
-        let hud = self
-            .hdr
-            .as_ref()
-            .and_then(|h| h.hud())
-            .map(|t| t.create_view(&Default::default()));
-        let hud_target = hud.as_ref().unwrap_or(view_target);
-        let coverage = self.hdr.as_ref().and_then(|h| h.coverage_view());
-        if let Some(view) = &coverage {
-            hud_coverage::clear(encoder, view);
-        }
+        // What the HUD and menus draw on: the layered frame's cached HUD view, else the frame.
+        let hud = self.hdr.as_ref().and_then(hdr::Hdr::hud_view);
+        let hud_target = hud.as_ref().unwrap_or(frame_view);
+        let coverage = self.hdr.as_ref().and_then(hdr::Hdr::coverage_view);
+        let mut clear_coverage = !coverage_cleared && coverage.is_some();
         // GameRenderer.render3dHud: the debug crosshair after the hand and
         // the screen effects.
         if overlay.crosshair > 0 {
@@ -12747,7 +12788,12 @@ impl Renderer {
                 },
             })];
             if let Some(view) = &coverage {
-                attachments.push(Some(hud_coverage::attachment(view)));
+                attachments.push(Some(if clear_coverage {
+                    clear_coverage = false;
+                    hud_coverage::clear_attachment(view)
+                } else {
+                    hud_coverage::attachment(view)
+                }));
             }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("3d crosshair"),
@@ -12774,6 +12820,9 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.debug_line_buffer.slice(..));
             let first = overlay.first_crosshair;
             pass.draw(0..4, first..first + overlay.crosshair);
+        }
+        if clear_coverage && let Some(view) = &coverage {
+            hud_coverage::clear(encoder, view);
         }
         let wants_blur = frame
             .menu_blur
@@ -12822,11 +12871,12 @@ impl Renderer {
                         device,
                         &self.queue,
                         encoder,
-                        view_target,
+                        frame_view,
                         size,
                         radius,
                         timing.as_mut(),
                     );
+                    // `hud_backdrop` also resets `coverage` via its masked 2nd attachment.
                     hdr.hud_backdrop(encoder, timing.as_mut());
                 }
                 None => blur.apply(
@@ -12834,14 +12884,11 @@ impl Renderer {
                     &self.queue,
                     encoder,
                     target_texture,
-                    view_target,
+                    frame_view,
                     size,
                     radius,
                     timing.as_mut(),
                 ),
-            }
-            if let Some(view) = &coverage {
-                hud_coverage::clear(encoder, view);
             }
         } else if wants_blur.is_none()
             && let Some(blur) = &mut self.menu_blur
@@ -13050,6 +13097,9 @@ struct Overlay {
     hand_drawn: bool,
     /// Camera-relative world to clip space for the hand: its own field of view and the bob.
     hand_view_proj: Mat4,
+    /// Pre-tonemap passes drew directly into `Hdr`'s `world` texture, so `tonemap` reads it
+    /// without copying `frame -> world` and post-tonemap passes switch to `frame`'s view.
+    direct_world_tonemap: bool,
 }
 
 pub(crate) fn world_projection(fov_degrees: f32, aspect: f32, far: f32) -> Mat4 {

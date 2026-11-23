@@ -230,11 +230,15 @@ fn named(name: Option<&str>) -> Option<Output> {
 struct Targets {
     size: [u32; 2],
     frame: wgpu::Texture,
-    /// The layered frame's tone curve's input: the frame as the post effects left it.
+    frame_view: wgpu::TextureView,
+    /// The layered frame's tone curve's input: rendered directly when Horizon's tone curve
+    /// runs without a pre-tonemap world-icon copy, or populated via copy otherwise.
     world: Option<wgpu::Texture>,
-    coverage: Option<wgpu::Texture>,
+    world_view: Option<wgpu::TextureView>,
+    coverage_view: Option<wgpu::TextureView>,
     /// The layered frame's HUD target: what the HUD draws on.
     hud: Option<wgpu::Texture>,
+    hud_view: Option<wgpu::TextureView>,
     group: wgpu::BindGroup,
     /// The layered frame's bindings for `tonemap`, `hud_backdrop` and `composite`.
     passes: Option<[wgpu::BindGroup; 3]>,
@@ -249,6 +253,11 @@ struct Targets {
 /// (`composite`).
 struct Layered {
     tonemap: (wgpu::BindGroupLayout, wgpu::RenderPipeline),
+    /// Fused `fs_tonemap_and_backdrop` (reusing `tonemap`'s layout): writes both `frame` and
+    /// `hud` in one pass when no screen overlays draw between them, and clears `coverage` via
+    /// a masked 3rd attachment when `tonemap_clears_coverage` is true.
+    tonemap_backdrop: wgpu::RenderPipeline,
+    tonemap_clears_coverage: bool,
     keep: (wgpu::BindGroupLayout, wgpu::RenderPipeline),
     composite: (wgpu::BindGroupLayout, wgpu::RenderPipeline),
     /// Compiled only when a screenshot needs it, for its readback format and HUD mode.
@@ -335,9 +344,18 @@ pub struct Hdr {
     pub gamut: Option<Matrix>,
 }
 
-/// hdr.wgsl's `Params` in floats: 7 scalars and a pad, `calibration`, `gamut`'s three columns
-/// of 16 bytes each, and `boost` padded to the struct's 16-byte alignment.
+/// hdr.wgsl's `Params` in floats: 8 scalars (including precomputed `ui_gamma`),
+/// `calibration`, `gamut`'s three columns of 16 bytes each, `boost`, precomputed `pq_top` and
+/// `pq_black`, and 4 bytes of trailing padding to the struct's 16-byte alignment.
 const PARAMS: usize = 28;
+
+/// SMPTE ST 2084: nits (up to 10 000) to the PQ signal, matching `hdr_look.wgsl`'s `pq`.
+fn pq_signal(nits: f32) -> f32 {
+    let y = (f64::from(nits) / 10_000.0)
+        .clamp(0.0, 1.0)
+        .powf(0.159_301_757_812_5);
+    ((0.835_937_5 + 18.851_562_5 * y) / (1.0 + 18.687_5 * y)).powf(78.843_75) as f32
+}
 
 /// `Params`' last 16 floats, from `gamut` on: its columns, each padded to 16 bytes, and
 /// `boost`, 1 with a matrix, 0 without.
@@ -438,9 +456,27 @@ impl Hdr {
                 entries: &entries,
             })
         };
-        // One full-screen pass of hdr.wgsl's `entry` into `format`, reading `layout`; `dither`
+        let color_target = |format| {
+            Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })
+        };
+        let clear_only = |format| {
+            Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            })
+        };
+        // One full-screen pass of hdr.wgsl's `entry` into `targets`, reading `layout`; `dither`
         // for the last pass into the HDR10 swapchain (`pq_dither`).
-        let pass = |label, layout: &wgpu::BindGroupLayout, entry, format, dither: bool| {
+        let pass_targets = |label,
+                            layout: &wgpu::BindGroupLayout,
+                            entry,
+                            targets: &[Option<wgpu::ColorTargetState>],
+                            dither: bool| {
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
                 bind_group_layouts: &[Some(layout)],
@@ -465,11 +501,7 @@ impl Hdr {
                         constants: &[("pq_dither", f64::from(u8::from(dither)))],
                         ..Default::default()
                     },
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    targets,
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -477,8 +509,15 @@ impl Hdr {
         };
         let layout_bindings: &[u32] = if coverage { &[0, 3, 4, 5] } else { &[0, 3] };
         let display = layout("Horizon HDR bindings", layout_bindings, true);
-        let pipeline_for =
-            |format, dither| pass("Horizon HDR", &display, entry_point, format, dither);
+        let pipeline_for = |format, dither| {
+            pass_targets(
+                "Horizon HDR",
+                &display,
+                entry_point,
+                &[color_target(format)],
+                dither,
+            )
+        };
         let params = || {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Horizon HDR parameters"),
@@ -488,22 +527,54 @@ impl Hdr {
             })
         };
         let layered = coverage.then(|| {
-            let with = |label, textures: &[u32], params, entry, format| {
-                let layout = layout(label, textures, params);
-                let pipeline = pass(label, &layout, entry, format, false);
-                (layout, pipeline)
-            };
             let hud = super::hud_coverage::HUD_FORMAT;
+            let cov = super::hud_coverage::FORMAT;
+            let tonemap_layout = layout("Horizon HDR tone curve", &[1], true);
+            let tonemap_pipeline = pass_targets(
+                "Horizon HDR tone curve",
+                &tonemap_layout,
+                "fs_tonemap",
+                &[color_target(format)],
+                false,
+            );
+            let limits = device.limits();
+            let tonemap_clears_coverage = limits.max_color_attachments >= 3
+                && limits.max_color_attachment_bytes_per_sample >= 16;
+            let fused_targets_all = [color_target(format), color_target(hud), clear_only(cov)];
+            let fused_targets = if tonemap_clears_coverage {
+                &fused_targets_all[..]
+            } else {
+                &fused_targets_all[..2]
+            };
+            let tonemap_backdrop = pass_targets(
+                "Horizon HDR tone curve + HUD backdrop",
+                &tonemap_layout,
+                "fs_tonemap_and_backdrop",
+                fused_targets,
+                false,
+            );
+            let keep_layout = layout("Horizon HDR HUD backdrop", &[0], false);
+            let keep_pipeline = pass_targets(
+                "Horizon HDR HUD backdrop",
+                &keep_layout,
+                "fs_keep",
+                &[color_target(hud), clear_only(cov)],
+                false,
+            );
+            let composite_layout = layout("Horizon HDR composite", &[0, 4, 5], true);
+            let composite_pipeline = pass_targets(
+                "Horizon HDR composite",
+                &composite_layout,
+                "fs_composite",
+                &[color_target(format)],
+                false,
+            );
             Layered {
-                tonemap: with("Horizon HDR tone curve", &[1], true, "fs_tonemap", format),
-                keep: with("Horizon HDR HUD backdrop", &[0], false, "fs_keep", hud),
-                composite: with(
-                    "Horizon HDR composite",
-                    &[0, 4, 5],
-                    true,
-                    "fs_composite",
-                    format,
-                ),
+                tonemap: (tonemap_layout, tonemap_pipeline),
+                tonemap_backdrop,
+                tonemap_clears_coverage,
+                keep: (keep_layout, keep_pipeline),
+                composite: (composite_layout, composite_pipeline),
                 screenshot: None,
                 params: params(),
             }
@@ -555,11 +626,41 @@ impl Hdr {
     }
 
     /// The frame every pass draws into this frame, sized like the window.
+    #[cfg(test)]
     pub fn frame(&mut self, device: &wgpu::Device, size: [u32; 2]) -> wgpu::Texture {
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
             self.targets = Some(self.targets_at(device, size));
         }
         self.targets.as_ref().unwrap().frame.clone()
+    }
+
+    /// The render target and its cached view for this frame: when `direct_world` is true on a
+    /// layered HDR frame, returns `world` so pre-tonemap passes render straight into the tone
+    /// curve's input texture with zero copy; otherwise returns `frame`.
+    pub(super) fn render_target(
+        &mut self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+        direct_world: bool,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        if self.targets.as_ref().is_none_or(|t| t.size != size) {
+            self.targets = Some(self.targets_at(device, size));
+        }
+        let t = self.targets.as_ref().unwrap();
+        if direct_world && let (Some(world), Some(world_view)) = (&t.world, &t.world_view) {
+            return (world.clone(), world_view.clone());
+        }
+        (t.frame.clone(), t.frame_view.clone())
+    }
+
+    /// Cached view of `frame` (the post-tonemap / swapchain-input float target).
+    pub(super) fn frame_view(&self) -> Option<wgpu::TextureView> {
+        Some(self.targets.as_ref()?.frame_view.clone())
+    }
+
+    /// Cached view of the layered frame's HUD target.
+    pub(super) fn hud_view(&self) -> Option<wgpu::TextureView> {
+        self.targets.as_ref()?.hud_view.clone()
     }
 
     /// Makes the window frame's targets at `size` where they are missing, the old ones let go
@@ -604,7 +705,9 @@ impl Hdr {
             texture(
                 "Horizon HDR world",
                 self.format,
-                wgpu::TextureUsages::COPY_DST,
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
             )
         });
         let coverage = layered.then(|| {
@@ -622,22 +725,24 @@ impl Hdr {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             )
         });
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let frame_view = view(&frame);
+        let world_view = world.as_ref().map(view);
+        let coverage_view = coverage.as_ref().map(view);
+        let hud_view = hud.as_ref().map(view);
         let group = self.group(
             device,
-            &frame,
-            coverage.as_ref(),
-            hud.as_ref(),
+            &frame_view,
+            coverage_view.as_ref(),
+            hud_view.as_ref(),
             &self.params,
         );
         let passes = self
             .layered
             .as_ref()
-            .zip(world.as_ref())
-            .zip(coverage.as_ref().zip(hud.as_ref()))
-            .map(|((l, world), (coverage, hud))| {
-                let view = |t: &wgpu::Texture| t.create_view(&Default::default());
-                let (frame, world, coverage, hud) =
-                    (view(&frame), view(world), view(coverage), view(hud));
+            .zip(world_view.as_ref())
+            .zip(coverage_view.as_ref().zip(hud_view.as_ref()))
+            .map(|((l, world_view), (coverage_view, hud_view))| {
                 let entry = |binding, view| wgpu::BindGroupEntry {
                     binding,
                     resource: wgpu::BindingResource::TextureView(view),
@@ -654,15 +759,15 @@ impl Hdr {
                     })
                 };
                 [
-                    group(&l.tonemap.0, &[entry(1, &world), params.clone()]),
-                    group(&l.keep.0, &[entry(0, &frame)]),
+                    group(&l.tonemap.0, &[entry(1, world_view), params.clone()]),
+                    group(&l.keep.0, &[entry(0, &frame_view)]),
                     group(
                         &l.composite.0,
                         &[
-                            entry(0, &frame),
+                            entry(0, &frame_view),
                             params,
-                            entry(4, &coverage),
-                            entry(5, &hud),
+                            entry(4, coverage_view),
+                            entry(5, hud_view),
                         ],
                     ),
                 ]
@@ -670,9 +775,12 @@ impl Hdr {
         Targets {
             size,
             frame,
+            frame_view,
             world,
-            coverage,
+            world_view,
+            coverage_view,
             hud,
+            hud_view,
             group,
             passes,
         }
@@ -746,20 +854,17 @@ impl Hdr {
         }
         let pipeline = &l.screenshot.as_ref()?.3;
         let views = [
-            (0, &t.frame),
-            (4, t.coverage.as_ref()?),
-            (5, t.hud.as_ref()?),
-        ]
-        .map(|(binding, texture)| (binding, texture.create_view(&Default::default())));
+            (0, &t.frame_view),
+            (4, t.coverage_view.as_ref()?),
+            (5, t.hud_view.as_ref()?),
+        ];
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("HDR SDR screenshot"),
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &views
-                .each_ref()
-                .map(|(binding, view)| wgpu::BindGroupEntry {
-                    binding: *binding,
-                    resource: wgpu::BindingResource::TextureView(view),
-                }),
+            entries: &views.map(|(binding, view)| wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::TextureView(view),
+            }),
         });
         let copy = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Horizon screenshot copy"),
@@ -813,11 +918,30 @@ impl Hdr {
     }
 
     /// On the layered frame, after the post effects and before the camera overlays: the tone
-    /// curve eases the light into the peak (`fs_tonemap`).
+    /// curve eases the light into the peak (`fs_tonemap`), copying `frame` into `world` first.
     pub fn tonemap(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         timing: Option<&mut super::pack_timing::PassTiming>,
+    ) {
+        self.tonemap_inner(encoder, timing, false);
+    }
+
+    /// Like `tonemap`, reading `world` directly without copying `frame -> world` when the
+    /// pre-tonemap passes rendered straight into `world`.
+    pub(super) fn tonemap_from_world(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timing: Option<&mut super::pack_timing::PassTiming>,
+    ) {
+        self.tonemap_inner(encoder, timing, true);
+    }
+
+    fn tonemap_inner(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timing: Option<&mut super::pack_timing::PassTiming>,
+        from_world: bool,
     ) {
         let (Some(l), Some(t)) = (&self.layered, &self.targets) else {
             return;
@@ -825,20 +949,76 @@ impl Hdr {
         let (Some([group, ..]), Some(world)) = (&t.passes, &t.world) else {
             return;
         };
-        encoder.copy_texture_to_texture(
-            t.frame.as_image_copy(),
-            world.as_image_copy(),
-            t.frame.size(),
-        );
-        let view = t.frame.create_view(&Default::default());
+        if !from_world {
+            encoder.copy_texture_to_texture(
+                t.frame.as_image_copy(),
+                world.as_image_copy(),
+                t.frame.size(),
+            );
+        }
         Self::draw(
             encoder,
             &l.tonemap.1,
             group,
-            &view,
+            &t.frame_view,
             "HDR tone curve",
             timing,
         );
+    }
+
+    /// Fused `tonemap` + `hud_backdrop` when no screen overlays draw between them: writes both
+    /// `frame` and `hud` in a single MRT pass (and clears `coverage` via a masked 3rd attachment
+    /// when the device supports 3+ color attachments). Returns `true` if `coverage` was cleared.
+    pub(super) fn tonemap_and_backdrop(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        from_world: bool,
+        timing: Option<&mut super::pack_timing::PassTiming>,
+    ) -> bool {
+        let (Some(l), Some(t)) = (&self.layered, &self.targets) else {
+            return false;
+        };
+        let (Some([group, ..]), Some(world), Some(hud_view), Some(coverage_view)) =
+            (&t.passes, &t.world, &t.hud_view, &t.coverage_view)
+        else {
+            return false;
+        };
+        if !from_world {
+            encoder.copy_texture_to_texture(
+                t.frame.as_image_copy(),
+                world.as_image_copy(),
+                t.frame.size(),
+            );
+        }
+        if l.tonemap_clears_coverage {
+            let attachments = [
+                Self::clear_black(&t.frame_view),
+                Self::clear_black(hud_view),
+                Some(super::hud_coverage::clear_attachment(coverage_view)),
+            ];
+            Self::draw_into(
+                encoder,
+                &l.tonemap_backdrop,
+                group,
+                &attachments,
+                "HDR tone curve",
+                timing,
+            );
+        } else {
+            let attachments = [
+                Self::clear_black(&t.frame_view),
+                Self::clear_black(hud_view),
+            ];
+            Self::draw_into(
+                encoder,
+                &l.tonemap_backdrop,
+                group,
+                &attachments,
+                "HDR tone curve",
+                timing,
+            );
+        }
+        l.tonemap_clears_coverage
     }
 
     /// On the layered frame: the picture so far (`fs_composite`), as the frame stores light,
@@ -869,13 +1049,7 @@ impl Hdr {
     }
 
     pub fn coverage_view(&self) -> Option<wgpu::TextureView> {
-        Some(
-            self.targets
-                .as_ref()?
-                .coverage
-                .as_ref()?
-                .create_view(&Default::default()),
-        )
+        self.targets.as_ref()?.coverage_view.clone()
     }
 
     /// The peak the HDR metadata gives: while calibration's peak step runs, PQ's own
@@ -896,8 +1070,9 @@ impl Hdr {
     }
 
     /// On the layered frame, which holds the world, the hand and the camera overlays as light:
-    /// makes the HUD's backdrop from it, clipped to white, alpha 0 (`fs_keep`). The HUD and the
-    /// menus draw on it from here on.
+    /// makes the HUD's backdrop from it, clipped to white, alpha 0 (`fs_keep`), and clears the
+    /// HUD coverage target via a masked 2nd attachment. The HUD and the menus draw on it from
+    /// here on.
     pub fn hud_backdrop(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -906,14 +1081,25 @@ impl Hdr {
         if let (
             Some(l),
             Some(Targets {
-                hud: Some(hud),
+                hud_view: Some(hud_view),
+                coverage_view: Some(coverage_view),
                 passes: Some([_, group, _]),
                 ..
             }),
         ) = (&self.layered, &self.targets)
         {
-            let view = hud.create_view(&Default::default());
-            Self::draw(encoder, &l.keep.1, group, &view, "HDR HUD backdrop", timing);
+            let attachments = [
+                Self::clear_black(hud_view),
+                Some(super::hud_coverage::clear_attachment(coverage_view)),
+            ];
+            Self::draw_into(
+                encoder,
+                &l.keep.1,
+                group,
+                &attachments,
+                "HDR HUD backdrop",
+                timing,
+            );
         }
     }
 
@@ -994,9 +1180,9 @@ impl Hdr {
         });
         let group = self.group(
             device,
-            &t.frame,
-            t.coverage.as_ref(),
-            t.hud.as_ref(),
+            &t.frame_view,
+            t.coverage_view.as_ref(),
+            t.hud_view.as_ref(),
             &self.capture_params,
         );
         queue.write_buffer(
@@ -1019,27 +1205,24 @@ impl Hdr {
     fn group(
         &self,
         device: &wgpu::Device,
-        frame: &wgpu::Texture,
-        coverage: Option<&wgpu::Texture>,
-        hud: Option<&wgpu::Texture>,
+        frame: &wgpu::TextureView,
+        coverage: Option<&wgpu::TextureView>,
+        hud: Option<&wgpu::TextureView>,
         params: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
-        let frame = view(frame);
-        let layered = coverage.zip(hud).map(|(c, h)| (view(c), view(h)));
         let texture = |binding, view| wgpu::BindGroupEntry {
             binding,
             resource: wgpu::BindingResource::TextureView(view),
         };
         let mut entries = vec![
-            texture(0, &frame),
+            texture(0, frame),
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: params.as_entire_binding(),
             },
             texture(3, &self.logo),
         ];
-        if let Some((coverage, hud)) = &layered {
+        if let Some((coverage, hud)) = coverage.zip(hud) {
             entries.extend([texture(4, coverage), texture(5, hud)]);
         }
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1067,6 +1250,9 @@ impl Hdr {
     /// hdr.wgsl's `Params`.
     fn params(&self, world: bool, pq: bool) -> [f32; PARAMS] {
         let paper = self.paper_white.max(1.0);
+        let headroom = self.headroom();
+        let black = self.black.clamp(0.0, paper);
+        let ui_gamma = self.ui.max(0.0).powf(1.0 / 2.2);
         // Only Horizon's lifted world is known to end at the look's scene peak; elsewhere (the
         // Vanilla look, a pack's own light, the title) the curve's source follows the display.
         let look = f32::from(u8::from(world && self.lighting));
@@ -1074,9 +1260,9 @@ impl Hdr {
         let mut params = [0.0; PARAMS];
         params[..12].copy_from_slice(&[
             paper / 80.0,
-            self.headroom(),
+            headroom,
             f32::from(u8::from(pq)),
-            self.black.clamp(0.0, paper),
+            black,
             self.ui,
             look,
             if pq {
@@ -1084,15 +1270,28 @@ impl Hdr {
             } else {
                 surface_scale(self.output, self.reference_80)
             },
-            // Pad `calibration` to its 16-byte alignment.
-            0.0,
+            ui_gamma,
             c.map_or(0.0, |c| c.step as f32),
             c.map_or(0.0, |c| c.nits),
             c.map_or(0.0, |c| c.band),
             0.0,
         ]);
         params[12..].copy_from_slice(&gamut_params(self.gamut));
+        params[PARAMS - 3] = pq_signal(headroom * paper);
+        params[PARAMS - 2] = pq_signal(black);
         params
+    }
+
+    fn clear_black(view: &wgpu::TextureView) -> Option<wgpu::RenderPassColorAttachment<'_>> {
+        Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })
     }
 
     /// One full-screen pass of `pipeline` into `view`.
@@ -1104,19 +1303,23 @@ impl Hdr {
         label: &'static str,
         timing: Option<&mut super::pack_timing::PassTiming>,
     ) {
-        let attachments = [Some(wgpu::RenderPassColorAttachment {
-            view,
-            resolve_target: None,
-            depth_slice: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                store: wgpu::StoreOp::Store,
-            },
-        })];
+        let attachments = [Self::clear_black(view)];
+        Self::draw_into(encoder, pipeline, group, &attachments, label, timing);
+    }
+
+    /// One full-screen pass of `pipeline` into `attachments`.
+    fn draw_into(
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        group: &wgpu::BindGroup,
+        attachments: &[Option<wgpu::RenderPassColorAttachment<'_>>],
+        label: &'static str,
+        timing: Option<&mut super::pack_timing::PassTiming>,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             timestamp_writes: timing.and_then(|t| t.writes(label)),
-            color_attachments: &attachments,
+            color_attachments: attachments,
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
@@ -1294,8 +1497,8 @@ var<private> params: ReferenceParams;
                 assert_eq!(hdr.coverage_view().is_some(), enabled);
                 hdr.frame(&device, [4, 2]);
                 let t = hdr.targets.as_ref().unwrap();
-                if let Some(coverage) = &t.coverage {
-                    assert_eq!(coverage.size(), t.frame.size());
+                if let Some(coverage_view) = &t.coverage_view {
+                    assert_eq!(coverage_view.texture().size(), t.frame.size());
                 }
                 let mut encoder = device.create_command_encoder(&Default::default());
                 let frame_view = t.frame.create_view(&Default::default());
@@ -1334,7 +1537,7 @@ var<private> params: ReferenceParams;
                 if let Some(view) = hdr.coverage_view() {
                     let mut encoder = device.create_command_encoder(&Default::default());
                     super::super::hud_coverage::clear(&mut encoder, &view);
-                    let coverage = hdr.targets.as_ref().unwrap().coverage.as_ref().unwrap();
+                    let coverage = view.texture();
                     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                         label: None,
                         size: 512,
@@ -1521,11 +1724,18 @@ var<private> params: ReferenceParams;
         assert_ne!(clamped[0], wide[0]);
     }
 
-    /// hdr.wgsl's `Params` is laid out as `params` writes it: `gamut` after `calibration`, its
-    /// columns 16 bytes apart, then `boost`, the whole as large as the buffer.
+    /// hdr.wgsl's `Params` is laid out as `params` writes it: `ui_gamma` fills the slot before
+    /// `calibration`, `gamut`'s columns sit 16 bytes apart, then `boost`, `pq_top`, and
+    /// `pq_black`, the whole as large as the buffer.
     #[test]
     fn the_params_struct_matches_the_floats_written() {
         let module = naga::front::wgsl::parse_str(&super::shader()).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
         let (_, ty) = module
             .types
             .iter()
@@ -1541,9 +1751,12 @@ var<private> params: ReferenceParams;
                 .find(|m| m.name.as_deref() == Some(name))
                 .map(|m| m.offset as usize / 4)
         };
+        assert_eq!(offset("ui_gamma"), Some(7));
         assert_eq!(offset("calibration"), Some(8));
         assert_eq!(offset("gamut"), Some(super::PARAMS - 16));
         assert_eq!(offset("boost"), Some(super::PARAMS - 4));
+        assert_eq!(offset("pq_top"), Some(super::PARAMS - 3));
+        assert_eq!(offset("pq_black"), Some(super::PARAMS - 2));
     }
 
     /// Mesa's drivers (RADV, ANV, NVK on an NVIDIA card) leave a Wayland scRGB surface at the
@@ -2124,7 +2337,11 @@ var<private> params: ReferenceParams;
                 t.hud.as_ref().unwrap(),
                 [hud[0], hud[1], hud[2], 0.0],
             );
-            fill(&mut encoder, t.coverage.as_ref().unwrap(), [c; 4]);
+            fill(
+                &mut encoder,
+                t.coverage_view.as_ref().unwrap().texture(),
+                [c; 4],
+            );
             // Read half-floats so 8-bit quantization cannot conceal the curve or RGB ratios.
             let copy = hdr
                 .sdr_screenshot(&device, &mut encoder, F::Rgba16Float, icon)
@@ -2231,7 +2448,11 @@ var<private> params: ReferenceParams;
             t.hud.as_ref().unwrap(),
             [r.min(1.0), g.min(1.0), b.min(1.0), 0.0],
         );
-        fill(&mut encoder, t.coverage.as_ref().unwrap(), [0.0; 4]);
+        fill(
+            &mut encoder,
+            t.coverage_view.as_ref().unwrap().texture(),
+            [0.0; 4],
+        );
         let copy = hdr
             .sdr_screenshot(device, &mut encoder, F::Rgba16Float, false)
             .unwrap();
@@ -2328,7 +2549,11 @@ var<private> params: ReferenceParams;
             let mut encoder = device.create_command_encoder(&Default::default());
             fill(&mut encoder, &frame, [world, world, world, 1.0]);
             fill(&mut encoder, t.hud.as_ref().unwrap(), [hud, hud, hud, 0.0]);
-            fill(&mut encoder, t.coverage.as_ref().unwrap(), [coverage; 4]);
+            fill(
+                &mut encoder,
+                t.coverage_view.as_ref().unwrap().texture(),
+                [coverage; 4],
+            );
             hdr.begin(&queue, true);
             hdr.composite(&mut encoder, &target.create_view(&Default::default()), None);
             let got = texel(&device, &queue, encoder, &target);
@@ -2467,6 +2692,343 @@ var<private> params: ReferenceParams;
         assert_eq!(named(Some("scrgb")), Some(Output::ScRgb));
         assert_eq!(named(Some("hdr10")), None);
         assert_eq!(named(None), None);
+    }
+
+    #[test]
+    fn fused_tonemap_and_backdrop_wgsl_interface_validates() {
+        let module = naga::front::wgsl::parse_str(&super::shader()).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let entry = module
+            .entry_points
+            .iter()
+            .find(|e| e.name == "fs_tonemap_and_backdrop")
+            .expect("fs_tonemap_and_backdrop entry point");
+        assert_eq!(entry.stage, naga::ShaderStage::Fragment);
+        let result = entry
+            .function
+            .result
+            .as_ref()
+            .expect("fs_tonemap_and_backdrop return type");
+        let naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner else {
+            panic!("fs_tonemap_and_backdrop must return a 2-target MRT struct");
+        };
+        assert_eq!(members.len(), 2);
+        for (loc, (member, want_name)) in members.iter().zip(["frame", "hud"]).enumerate() {
+            assert_eq!(member.name.as_deref(), Some(want_name));
+            assert!(matches!(
+                member.binding,
+                Some(naga::Binding::Location { location, .. }) if location == loc as u32
+            ));
+            assert!(matches!(
+                module.types[member.ty].inner,
+                naga::TypeInner::Vector {
+                    size: naga::VectorSize::Quad,
+                    scalar: naga::Scalar::F32,
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn pq_signal_matches_st2084_reference_and_clamps_bounds() {
+        let (m1, m2) = (2610.0 / 16384.0, 2523.0 / 4096.0 * 128.0);
+        let (c1, c2, c3) = (3424.0 / 4096.0, 2413.0 / 128.0, 2392.0 / 128.0);
+        let reference = |nits: f64| -> f32 {
+            let y = (nits / 10_000.0).clamp(0.0, 1.0).powf(m1);
+            ((c1 + c2 * y) / (1.0 + c3 * y)).powf(m2) as f32
+        };
+        for nits in [
+            -10.0_f32, 0.0, 0.001, 0.005, 0.05, 0.5, 80.0, 203.0, 400.0, 1000.0, 4000.0, 10_000.0,
+            20_000.0,
+        ] {
+            let got = super::pq_signal(nits);
+            let want = reference(f64::from(nits));
+            assert!(
+                (got - want).abs() <= 1e-6,
+                "pq_signal({nits}): got {got}, want {want}"
+            );
+        }
+        assert_eq!(super::pq_signal(10_000.0), 1.0);
+        assert_eq!(super::pq_signal(20_000.0), 1.0);
+    }
+
+    /// Zero-copy `tonemap_from_world`, fused MRT `tonemap_and_backdrop` (both zero-copy and
+    /// copy-fallback), and merged coverage clear produce bit-exact `frame`, `hud`, `coverage`,
+    /// and `composite` output compared to the separate `tonemap` + `hud_backdrop` + `clear` path.
+    #[test]
+    fn fused_tonemap_and_backdrop_matches_separate_passes_to_the_bit() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((device, queue)) = gpu() else {
+            eprintln!("HDR fused MRT GPU unavailable");
+            return;
+        };
+        let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+        hdr.ui = 2.0;
+        let composite_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("HDR fused composite check"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: F::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let composite_view = composite_tex.create_view(&Default::default());
+        let read_all = |encoder: &mut wgpu::CommandEncoder,
+                        frame: &wgpu::Texture,
+                        hud: &wgpu::Texture,
+                        coverage: &wgpu::Texture,
+                        comp: &wgpu::Texture|
+         -> wgpu::Buffer {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 1024,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let copy = |encoder: &mut wgpu::CommandEncoder, tex: &wgpu::Texture, offset: u64| {
+                encoder.copy_texture_to_buffer(
+                    tex.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset,
+                            bytes_per_row: Some(256),
+                            rows_per_image: None,
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            };
+            copy(encoder, frame, 0);
+            copy(encoder, hud, 256);
+            copy(encoder, coverage, 512);
+            copy(encoder, comp, 768);
+            buffer
+        };
+        let collect = |encoder: wgpu::CommandEncoder, buffer: wgpu::Buffer| {
+            queue.submit([encoder.finish()]);
+            buffer.map_async(wgpu::MapMode::Read, .., |r| r.unwrap());
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let bytes = buffer.get_mapped_range(..).unwrap();
+            let frame: [u8; 8] = bytes[0..8].try_into().unwrap();
+            let hud: [u8; 4] = bytes[256..260].try_into().unwrap();
+            let cov = bytes[512];
+            let comp: [u8; 8] = bytes[768..776].try_into().unwrap();
+            (frame, hud, cov, comp)
+        };
+        // Includes [2.0, 0.55615234375, 0.2], where EETF under 400/203 nits produces a green
+        // f32 (0.37848) whose unquantised Rgba8Unorm (97) diverges from its f16-stored Rgba8Unorm
+        // (96), proving `f16_rgb` eliminates phantom HUD leak in the fused MRT pass.
+        let colors: [[f64; 4]; 10] = [
+            [0.0, 0.0, 0.0, 1.0],
+            [0.25, 0.5, 0.75, 1.0],
+            [0.51185, 0.51185, 0.51185, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [1.5, 0.9, 0.2, 1.0],
+            [2.0, 0.55615234375, 0.2, 1.0],
+            [2.4, 1.2, 0.3, 1.0],
+            [3.0, 1.5, 0.4, 1.0],
+            [6.0, 6.0, 6.0, 1.0],
+            [12.0, 4.0, 0.1, 1.0],
+        ];
+        for (paper, peak, lighting) in [
+            (203.0, 400.0, true),
+            (203.0, 1000.0, true),
+            (203.0, 2000.0, true),
+            (203.0, 203.0, false),
+            (203.0, 600.0, false),
+        ] {
+            hdr.paper_white = paper;
+            hdr.peak = peak;
+            hdr.lighting = lighting;
+            // Verify hoisted Params slots match CPU reference for this display setup.
+            let written = hdr.params(true, true);
+            assert!((written[7] - hdr.ui.powf(1.0 / 2.2)).abs() <= 1e-6);
+            assert!(
+                (written[super::PARAMS - 3] - super::pq_signal(hdr.headroom() * paper)).abs()
+                    <= 1e-6
+            );
+            assert!((written[super::PARAMS - 2] - super::pq_signal(0.0)).abs() <= 1e-6);
+
+            let (world, _) = hdr.render_target(&device, [1, 1], true);
+            let frame = hdr.frame(&device, [1, 1]);
+            let hud = hdr.hud().unwrap().clone();
+            let coverage = hdr.coverage_view().unwrap().texture().clone();
+            hdr.begin(&queue, true);
+
+            for color in colors {
+                // Path A: legacy separate tonemap (copy) + hud_backdrop (clears pre-dirtied cov).
+                let (ref_frame, ref_hud, ref_cov, ref_comp) = {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    fill(&mut encoder, &coverage, [1.0, 1.0, 1.0, 1.0]);
+                    fill(&mut encoder, &hud, [0.9, 0.8, 0.7, 1.0]);
+                    fill(&mut encoder, &frame, color);
+                    hdr.tonemap(&mut encoder, None);
+                    hdr.hud_backdrop(&mut encoder, None);
+                    hdr.composite(&mut encoder, &composite_view, None);
+                    let buf = read_all(&mut encoder, &frame, &hud, &coverage, &composite_tex);
+                    collect(encoder, buf)
+                };
+                assert_eq!(ref_cov, 0, "hud_backdrop must clear coverage");
+                assert_eq!(ref_comp, ref_frame, "zero phantom HUD on reference path");
+
+                // Path B: zero-copy tonemap_from_world + hud_backdrop (screen-effects path).
+                let (sep_frame, sep_hud, sep_cov, sep_comp) = {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    fill(&mut encoder, &frame, [9.0, 9.0, 9.0, 1.0]);
+                    fill(&mut encoder, &hud, [0.9, 0.8, 0.7, 1.0]);
+                    fill(&mut encoder, &coverage, [1.0, 1.0, 1.0, 1.0]);
+                    fill(&mut encoder, &world, color);
+                    hdr.tonemap_from_world(&mut encoder, None);
+                    hdr.hud_backdrop(&mut encoder, None);
+                    hdr.composite(&mut encoder, &composite_view, None);
+                    let buf = read_all(&mut encoder, &frame, &hud, &coverage, &composite_tex);
+                    collect(encoder, buf)
+                };
+                assert_eq!(
+                    sep_frame, ref_frame,
+                    "zero-copy frame mismatch for {color:?}"
+                );
+                assert_eq!(sep_hud, ref_hud, "zero-copy hud mismatch for {color:?}");
+                assert_eq!(
+                    sep_cov, 0,
+                    "hud_backdrop must clear coverage on zero-copy path"
+                );
+                assert_eq!(sep_comp, ref_comp);
+
+                // Path C: zero-copy fused MRT tonemap_and_backdrop (normal gameplay path).
+                let (mrt_frame, mrt_hud, mrt_cov, mrt_comp) = {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    fill(&mut encoder, &frame, [9.0, 9.0, 9.0, 1.0]);
+                    fill(&mut encoder, &hud, [0.9, 0.8, 0.7, 1.0]);
+                    fill(&mut encoder, &coverage, [1.0, 1.0, 1.0, 1.0]);
+                    fill(&mut encoder, &world, color);
+                    let cleared = hdr.tonemap_and_backdrop(&mut encoder, true, None);
+                    if !cleared {
+                        super::super::hud_coverage::clear(
+                            &mut encoder,
+                            &hdr.coverage_view().unwrap(),
+                        );
+                    }
+                    hdr.composite(&mut encoder, &composite_view, None);
+                    let buf = read_all(&mut encoder, &frame, &hud, &coverage, &composite_tex);
+                    collect(encoder, buf)
+                };
+                assert_eq!(
+                    mrt_frame, ref_frame,
+                    "fused MRT frame mismatch at ({paper}, {peak}, {lighting}) for {color:?}"
+                );
+                assert_eq!(
+                    mrt_hud, ref_hud,
+                    "fused MRT hud mismatch at ({paper}, {peak}, {lighting}) for {color:?}"
+                );
+                assert_eq!(mrt_cov, 0, "fused MRT must clear coverage");
+                assert_eq!(
+                    mrt_comp, ref_frame,
+                    "fused MRT composite leaked phantom HUD at ({paper}, {peak}, {lighting}) for {color:?}"
+                );
+
+                // Path D: copy-fallback fused MRT tonemap_and_backdrop(from_world=false).
+                let (copy_frame, copy_hud, copy_cov, copy_comp) = {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    fill(&mut encoder, &world, [9.0, 9.0, 9.0, 1.0]);
+                    fill(&mut encoder, &hud, [0.9, 0.8, 0.7, 1.0]);
+                    fill(&mut encoder, &coverage, [1.0, 1.0, 1.0, 1.0]);
+                    fill(&mut encoder, &frame, color);
+                    let cleared = hdr.tonemap_and_backdrop(&mut encoder, false, None);
+                    if !cleared {
+                        super::super::hud_coverage::clear(
+                            &mut encoder,
+                            &hdr.coverage_view().unwrap(),
+                        );
+                    }
+                    hdr.composite(&mut encoder, &composite_view, None);
+                    let buf = read_all(&mut encoder, &frame, &hud, &coverage, &composite_tex);
+                    collect(encoder, buf)
+                };
+                assert_eq!(copy_frame, ref_frame);
+                assert_eq!(copy_hud, ref_hud);
+                assert_eq!(copy_cov, 0);
+                assert_eq!(copy_comp, ref_frame);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_target_views_reuse_until_resize_and_clear_on_release() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((device, queue)) = gpu() else {
+            eprintln!("HDR cached view GPU unavailable");
+            return;
+        };
+        let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+        let (world1, world_view1) = hdr.render_target(&device, [4, 2], true);
+        let (world2, world_view2) = hdr.render_target(&device, [4, 2], true);
+        assert_eq!(world1, world2);
+        assert_eq!(world_view1, world_view2);
+        assert!(world1.usage().contains(
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::TEXTURE_BINDING
+        ));
+
+        let (frame1, frame_view1) = hdr.render_target(&device, [4, 2], false);
+        assert_ne!(frame1, world1);
+        assert_eq!(hdr.frame_view(), Some(frame_view1.clone()));
+        let hud_view1 = hdr.hud_view().expect("cached hud view");
+        let hud_view2 = hdr.hud_view().expect("cached hud view");
+        assert_eq!(hud_view1, hud_view2);
+        let cov_view1 = hdr.coverage_view().expect("cached coverage view");
+        let cov_view2 = hdr.coverage_view().expect("cached coverage view");
+        assert_eq!(cov_view1, cov_view2);
+
+        // Resize allocates fresh targets and views.
+        let (world3, world_view3) = hdr.render_target(&device, [8, 4], true);
+        assert_eq!([world3.width(), world3.height()], [8, 4]);
+        assert_ne!(world_view3, world_view1);
+        assert_ne!(hdr.frame_view(), Some(frame_view1));
+
+        // Out-of-memory target creation (#13624) clears every cached view and recovers on retry.
+        crate::gfx::frame_targets::begin_frame();
+        crate::gfx::frame_targets::NO_ROOM.set(1);
+        assert!(!hdr.ready(&device, [6, 3]));
+        assert!(
+            hdr.frame_view().is_none() && hdr.hud_view().is_none() && hdr.coverage_view().is_none()
+        );
+        crate::gfx::frame_targets::begin_frame();
+        assert!(hdr.ready(&device, [6, 3]));
+        assert!(
+            hdr.frame_view().is_some() && hdr.hud_view().is_some() && hdr.coverage_view().is_some()
+        );
+
+        // Release clears every cached view.
+        hdr.release_targets();
+        assert!(
+            hdr.frame_view().is_none() && hdr.hud_view().is_none() && hdr.coverage_view().is_none()
+        );
+
+        // Non-layered HDR falls back to `frame` even if `direct_world` is requested.
+        let mut plain = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, false, None);
+        let (plain_tex, plain_view) = plain.render_target(&device, [4, 2], true);
+        assert_eq!(plain_tex, plain.frame(&device, [4, 2]));
+        assert_eq!(plain.frame_view(), Some(plain_view));
+        assert!(plain.hud_view().is_none() && plain.coverage_view().is_none());
     }
 }
 

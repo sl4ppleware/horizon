@@ -23,6 +23,8 @@ struct Params {
     // What scRGB written to the swapchain is multiplied by: 80 / 203 where the surface's 1.0 is
     // the compositor's reference white (hdr::surface_scale), else 1.
     scrgb_gain: f32,
+    // Precomputed `pow(ui, 1.0 / 2.2)` for `layered`, hoisted off the per-pixel path.
+    ui_gamma: f32,
     // HDR calibration (hdr_calibration.rs): x its step (0 none, 1 black level,
     // 2 peak, 3 paper white), y the slider in nits, z where its controls start,
     // a share of the height.
@@ -31,6 +33,10 @@ struct Params {
     // toward the display's, used where `boost` is 1 (display_boosted). At 0 nothing reads it.
     gamut: mat3x3<f32>,
     boost: f32,
+    // Precomputed `pq(vec3(peak * paper * 80.0)).x` and `pq(vec3(black)).x` for `lift_black`,
+    // hoisted off the per-pixel path.
+    pq_top: f32,
+    pq_black: f32,
 };
 @group(0) @binding(2) var<uniform> params: Params;
 // Horizon's logo, 1 inside, 0 outside, for calibration's test pictures.
@@ -62,9 +68,10 @@ const BT2020_TO_BT709 = mat3x3<f32>(
 // outputs lift each of BT.2020's channels, as HDR10 carries them: black rises to the
 // display's neutral floor, and a shadow shows the same light in HDR10 and scRGB.
 fn lift_black(e: vec3<f32>) -> vec3<f32> {
-    let top = pq(vec3(params.peak * params.paper * 80.0)).x;
-    let n = min(e / top, vec3(1.0));
-    return e + pq(vec3(params.black)).x * pow(vec3(1.0) - n, vec3(4.0));
+    let n = min(e / params.pq_top, vec3(1.0));
+    let d = vec3(1.0) - n;
+    let d2 = d * d;
+    return e + params.pq_black * (d2 * d2);
 }
 
 // Whether `p` falls on the logo drawn `size` pixels wide around `centre`.
@@ -173,8 +180,10 @@ fn display(light: vec3<f32>, pos: vec4<f32>) -> vec4<f32> {
     }
     let scrgb = light * params.paper;
     if params.pq > 0.5 {
-        let e = pq(BT709_TO_BT2020 * scrgb * 80.0);
-        let lifted = select(e, lift_black(e), params.black > 0.0);
+        var lifted = pq(BT709_TO_BT2020 * scrgb * 80.0);
+        if params.black > 0.0 {
+            lifted = lift_black(lifted);
+        }
         if pq_dither {
             return vec4(dithered(lifted, pos.xy), 1.0);
         }
@@ -193,14 +202,19 @@ fn display(light: vec3<f32>, pos: vec4<f32>) -> vec4<f32> {
 fn display_boosted(light: vec3<f32>, pos: vec4<f32>) -> vec4<f32> {
     let nits = params.gamut * (light * params.paper) * 80.0;
     if params.pq > 0.5 {
-        let e = pq(nits);
-        let lifted = select(e, lift_black(e), params.black > 0.0);
+        var lifted = pq(nits);
+        if params.black > 0.0 {
+            lifted = lift_black(lifted);
+        }
         if pq_dither {
             return vec4(dithered(lifted, pos.xy), 1.0);
         }
         return vec4(lifted, 1.0);
     }
-    let lifted = select(nits, pq_nits(lift_black(pq(nits))), params.black > 0.0);
+    var lifted = nits;
+    if params.black > 0.0 {
+        lifted = pq_nits(lift_black(pq(nits)));
+    }
     return vec4(BT2020_TO_BT709 * lifted / 80.0 * params.scrgb_gain, 1.0);
 }
 
@@ -223,14 +237,51 @@ fn display_boosted(light: vec3<f32>, pos: vec4<f32>) -> vec4<f32> {
 // `params.look`, so the peak stays a value the shader compiler meets at run time. As a bare
 // constant DX12's compiler folds it into PQ's constants, and a display below the scene's peak
 // rounds a few pixels a step apart.
-@fragment fn fs_tonemap(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let g = textureLoad(world, vec2<i32>(pos.xy), 0).rgb;
+fn tonemap_color(g: vec3<f32>) -> vec3<f32> {
     if params.look == 0.0 && params.peak <= 1.0 {
-        return vec4(min(g, vec3(1.0)), 1.0);
+        return min(g, vec3(1.0));
     }
     let top = pow(max(max(g.r, max(g.g, g.b)), 0.0), 2.2);
     let s = hdr_tone_scale(top, params.look * HDR_SCENE_PEAK, params.peak, params.paper * 80.0);
-    return vec4(select(g * pow(s, 1.0 / 2.2), g, s == 1.0), 1.0);
+    return select(g * pow(s, 1.0 / 2.2), g, s == 1.0);
+}
+
+// Quantise `v` (in 0..1) to IEEE-754 binary16 as the `Rgba16Float` `frame` target stores it, so
+// the fused HUD backdrop matches `fs_keep` reading `frame` back to the bit and `p == backdrop(w)`
+// holds wherever no HUD draws.
+// Quantise a non-negative `f32` to exact IEEE-754 binary16 (round-to-nearest-even) using
+// integer bit operations so shader compilers (e.g. NVVM on NVIDIA Vulkan) cannot elide
+// `unpack2x16float(pack2x16float(x))` back to `x` inside the fused MRT pass.
+fn f16_channel(x: f32) -> f32 {
+    let c = clamp(x, 0.0, 65504.0);
+    if c < 6.103515625e-5 {
+        return round(c * 16777216.0) * 5.960464477539063e-8;
+    }
+    let u = bitcast<u32>(c);
+    let bias = 0x0fffu + ((u >> 13u) & 1u);
+    return bitcast<f32>((u + bias) & 0xffffe000u);
+}
+
+fn f16_rgb(v: vec3<f32>) -> vec3<f32> {
+    return vec3(f16_channel(v.r), f16_channel(v.g), f16_channel(v.b));
+}
+
+@fragment fn fs_tonemap(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let g = textureLoad(world, vec2<i32>(pos.xy), 0).rgb;
+    return vec4(f16_rgb(tonemap_color(g)), 1.0);
+}
+
+struct TonemapBackdrop {
+    @location(0) frame: vec4<f32>,
+    @location(1) hud: vec4<f32>,
+};
+
+// Fused Hdr::tonemap + Hdr::hud_backdrop when no screen overlays draw between them: writes
+// the tone-mapped float frame and the clamped 8-bit HUD backdrop in one full-screen pass.
+@fragment fn fs_tonemap_and_backdrop(@builtin(position) pos: vec4<f32>) -> TonemapBackdrop {
+    let g = textureLoad(world, vec2<i32>(pos.xy), 0).rgb;
+    let q = f16_rgb(tonemap_color(g));
+    return TonemapBackdrop(vec4(q, 1.0), vec4(clamp(q, vec3(0.0), vec3(1.0)), 0.0));
 }
 
 // Hdr::hud_backdrop: the world clipped to white with alpha 0, the frame as the HUD finds it
@@ -255,7 +306,7 @@ fn layered(at: vec2<i32>) -> vec3<f32> {
     let p = textureLoad(hud, at, 0).rgb;
     let c = textureLoad(coverage, at, 0).r;
     let h = max(p - (1.0 - c) * backdrop(w), vec3(0.0));
-    return h * pow(params.ui, 1.0 / 2.2) + (1.0 - c) * w;
+    return h * params.ui_gamma + (1.0 - c) * w;
 }
 
 // Hdr::composite: the picture so far, stored as the frame stores light, for the menu blur.
