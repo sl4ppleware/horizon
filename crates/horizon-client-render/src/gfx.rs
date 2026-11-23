@@ -3878,7 +3878,7 @@ impl Renderer {
             bias: Default::default(),
             blend: alpha_blend,
             clouds: false,
-            vertex: "vs_entity",
+            vertex: "vs_water_mask",
             fragment: "fs_water_mask",
             write_mask: wgpu::ColorWrites::empty(),
         });
@@ -3917,7 +3917,7 @@ impl Renderer {
             },
             blend: alpha_blend,
             clouds: false,
-            vertex: "vs_entity",
+            vertex: "vs_entity_shadow",
             fragment: "fs_entity_shadow",
             write_mask: wgpu::ColorWrites::ALL,
         });
@@ -3936,15 +3936,18 @@ impl Renderer {
             alpha_blend,
             false,
         );
-        let cloud_pipeline = entity_pipeline(
-            "Clouds",
-            Some(wgpu::Face::Back),
-            true,
-            wgpu::CompareFunction::GreaterEqual,
-            Default::default(),
-            alpha_blend,
-            true,
-        );
+        let cloud_pipeline = entity_pipeline_with(EntityPipelineOptions {
+            label: "Clouds",
+            cull_mode: Some(wgpu::Face::Back),
+            depth_write: true,
+            compare: wgpu::CompareFunction::GreaterEqual,
+            bias: Default::default(),
+            blend: alpha_blend,
+            clouds: true,
+            vertex: "vs_cloud",
+            fragment: "fs_cloud",
+            write_mask: wgpu::ColorWrites::ALL,
+        });
         // RenderPipelines.TEXT_SEE_THROUGH: translucent, no depth test or
         // writes, culled like every world text pipeline (TEXT_SNIPPET keeps
         // RenderPipeline.Builder's default): a name tag or text display hides
@@ -14346,6 +14349,397 @@ mod tests {
         )
         .validate(&module)
         .unwrap();
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct StageLocation {
+        location: u32,
+        kind: naga::ScalarKind,
+        width: u8,
+        components: u8,
+        flat: bool,
+    }
+
+    fn stage_locations(
+        module: &naga::Module,
+        entry_name: &str,
+        stage: naga::ShaderStage,
+    ) -> Vec<StageLocation> {
+        let entry = module
+            .entry_points
+            .iter()
+            .find(|e| e.stage == stage && e.name == entry_name)
+            .unwrap_or_else(|| panic!("missing {stage:?} entry point {entry_name}"));
+        let mut out = Vec::new();
+        let mut push_ty = |ty: naga::Handle<naga::Type>, binding: Option<&naga::Binding>| {
+            if let Some(naga::Binding::Location {
+                location,
+                interpolation,
+                ..
+            }) = binding
+            {
+                let (kind, width, components) = match module.types[ty].inner {
+                    naga::TypeInner::Scalar(s) => (s.kind, s.width, 1u8),
+                    naga::TypeInner::Vector { size, scalar } => {
+                        (scalar.kind, scalar.width, size as u8)
+                    }
+                    ref other => panic!("unexpected IO type at location {location}: {other:?}"),
+                };
+                out.push(StageLocation {
+                    location: *location,
+                    kind,
+                    width,
+                    components,
+                    flat: matches!(interpolation, Some(naga::Interpolation::Flat)),
+                });
+            } else if let naga::TypeInner::Struct { members, .. } = &module.types[ty].inner {
+                for m in members {
+                    if let Some(naga::Binding::Location {
+                        location,
+                        interpolation,
+                        ..
+                    }) = &m.binding
+                    {
+                        let (kind, width, components) = match module.types[m.ty].inner {
+                            naga::TypeInner::Scalar(s) => (s.kind, s.width, 1u8),
+                            naga::TypeInner::Vector { size, scalar } => {
+                                (scalar.kind, scalar.width, size as u8)
+                            }
+                            ref other => {
+                                panic!(
+                                    "unexpected struct IO type at location {location}: {other:?}"
+                                )
+                            }
+                        };
+                        out.push(StageLocation {
+                            location: *location,
+                            kind,
+                            width,
+                            components,
+                            flat: matches!(interpolation, Some(naga::Interpolation::Flat)),
+                        });
+                    }
+                }
+            }
+        };
+        match stage {
+            naga::ShaderStage::Vertex => {
+                if let Some(result) = &entry.function.result {
+                    push_ty(result.ty, result.binding.as_ref());
+                }
+            }
+            naga::ShaderStage::Fragment => {
+                for arg in &entry.function.arguments {
+                    push_ty(arg.ty, arg.binding.as_ref());
+                }
+            }
+            other => panic!("unexpected stage {other:?}"),
+        }
+        out.sort_by_key(|loc| loc.location);
+        out
+    }
+
+    fn collect_called_functions(
+        module: &naga::Module,
+        block: &naga::Block,
+        seen: &mut std::collections::HashSet<naga::Handle<naga::Function>>,
+    ) {
+        for stmt in block {
+            match stmt {
+                naga::Statement::Call { function, .. } => {
+                    if seen.insert(*function) {
+                        collect_called_functions(module, &module.functions[*function].body, seen);
+                    }
+                }
+                naga::Statement::Block(inner) => collect_called_functions(module, inner, seen),
+                naga::Statement::If { accept, reject, .. } => {
+                    collect_called_functions(module, accept, seen);
+                    collect_called_functions(module, reject, seen);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        collect_called_functions(module, &case.body, seen);
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    collect_called_functions(module, body, seen);
+                    collect_called_functions(module, continuing, seen);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn count_auto_samples_of_global(
+        module: &naga::Module,
+        entry_name: &str,
+        stage: naga::ShaderStage,
+        global_name: &str,
+    ) -> usize {
+        let entry = module
+            .entry_points
+            .iter()
+            .find(|e| e.stage == stage && e.name == entry_name)
+            .unwrap_or_else(|| panic!("missing {stage:?} entry point {entry_name}"));
+        let target_global = module
+            .global_variables
+            .iter()
+            .find_map(|(h, g)| (g.name.as_deref() == Some(global_name)).then_some(h))
+            .unwrap_or_else(|| panic!("missing global {global_name}"));
+        let mut called = std::collections::HashSet::new();
+        collect_called_functions(module, &entry.function.body, &mut called);
+        let count_in = |func: &naga::Function| -> usize {
+            func.expressions
+                .iter()
+                .filter(|(_, expr)| {
+                    let naga::Expression::ImageSample { image, level, .. } = expr else {
+                        return false;
+                    };
+                    matches!(level, naga::SampleLevel::Auto)
+                        && matches!(
+                            func.expressions[*image],
+                            naga::Expression::GlobalVariable(h) if h == target_global
+                        )
+                })
+                .count()
+        };
+        let mut total = count_in(&entry.function);
+        for handle in called {
+            total += count_in(&module.functions[handle]);
+        }
+        total
+    }
+
+    #[test]
+    fn specialized_entity_pipelines_match_compact_varying_interfaces() {
+        let check_pairs = |source: &str, pairs: &[(&str, &str, usize, usize)]| {
+            let module = naga::front::wgsl::parse_str(source).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+            for &(vertex, fragment, expected_locs, expected_bytes) in pairs {
+                let vs_out = stage_locations(&module, vertex, naga::ShaderStage::Vertex);
+                let fs_in = stage_locations(&module, fragment, naga::ShaderStage::Fragment);
+                assert_eq!(
+                    vs_out, fs_in,
+                    "varying interface mismatch between {vertex} and {fragment}"
+                );
+                let bytes: usize = vs_out
+                    .iter()
+                    .map(|loc| usize::from(loc.width) * usize::from(loc.components))
+                    .sum();
+                assert_eq!(
+                    vs_out.len(),
+                    expected_locs,
+                    "{vertex} -> {fragment} location count"
+                );
+                assert_eq!(
+                    bytes, expected_bytes,
+                    "{vertex} -> {fragment} varying bytes"
+                );
+            }
+        };
+        check_pairs(
+            &super::entity_shader(),
+            &[
+                ("vs_cloud", "fs_cloud", 2, 20),
+                ("vs_entity_shadow", "fs_entity_shadow", 3, 32),
+                ("vs_weather", "fs_weather", 4, 48),
+                ("vs_outline", "fs_outline", 2, 24),
+                ("vs_water_mask", "fs_water_mask", 0, 0),
+                ("vs_entity", "fs_entity", 6, 80),
+                ("vs_entity", "fs_entity_clipped", 6, 80),
+                ("vs_entity", "fs_entity_unmarked", 6, 80),
+                ("vs_entity", "fs_celestial", 6, 80),
+                ("vs_entity", "fs_sky_celestial", 6, 80),
+                ("vs_entity", "fs_sky_sun", 6, 80),
+                ("vs_entity", "fs_sky_sun_clip", 6, 80),
+                ("vs_entity", "fs_energy_swirl", 6, 80),
+                ("vs_lightning", "fs_celestial", 6, 80),
+            ],
+        );
+        check_pairs(
+            &super::static_entity_shader(),
+            &[("vs_static_entity", "fs_entity_unmarked", 6, 80)],
+        );
+        check_pairs(
+            &(super::entity_shader() + include_str!("prepared_model.wgsl")),
+            &[("vs_prepared_model", "fs_entity", 6, 80)],
+        );
+    }
+
+    #[test]
+    fn specialized_entity_shaders_eliminate_unused_fetches_and_translate_all_backends() {
+        let base = super::entity_shader();
+        let hdr = base.replace(
+            "override HDR_WRITE_LIGHT: bool = false;",
+            "override HDR_WRITE_LIGHT: bool = true;",
+        );
+        for (label, source) in [("sdr", &base), ("hdr", &hdr)] {
+            let module = naga::front::wgsl::parse_str(source).unwrap();
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+            let global = |name: &str| {
+                module
+                    .global_variables
+                    .iter()
+                    .find_map(|(h, g)| (g.name.as_deref() == Some(name)).then_some(h))
+                    .unwrap_or_else(|| panic!("missing global {name}"))
+            };
+            let atlas = global("atlas");
+            let lightmap = global("lightmap");
+            let ep_info = |stage: naga::ShaderStage, name: &str| {
+                let idx = module
+                    .entry_points
+                    .iter()
+                    .position(|e| e.stage == stage && e.name == name)
+                    .unwrap_or_else(|| panic!("missing {stage:?} {name}"));
+                info.get_entry_point(idx)
+            };
+            // Clouds, outlines and water mask never touch lightmap; clouds and water mask never touch atlas.
+            for (stage, name) in [
+                (naga::ShaderStage::Vertex, "vs_cloud"),
+                (naga::ShaderStage::Fragment, "fs_cloud"),
+                (naga::ShaderStage::Vertex, "vs_outline"),
+                (naga::ShaderStage::Vertex, "vs_water_mask"),
+                (naga::ShaderStage::Fragment, "fs_water_mask"),
+            ] {
+                assert!(
+                    ep_info(stage, name)[lightmap].is_empty(),
+                    "{label} {name} must not reference lightmap"
+                );
+            }
+            for (stage, name) in [
+                (naga::ShaderStage::Vertex, "vs_cloud"),
+                (naga::ShaderStage::Fragment, "fs_cloud"),
+                (naga::ShaderStage::Vertex, "vs_water_mask"),
+                (naga::ShaderStage::Fragment, "fs_water_mask"),
+            ] {
+                let fi = ep_info(stage, name);
+                assert!(
+                    fi[atlas].is_empty() && fi.sampling_set.is_empty(),
+                    "{label} {name} must perform zero atlas/texture fetches"
+                );
+            }
+            // HDR entities, celestials and the sun sample the atlas at most once per fragment
+            // (eliminating the former second `textureSample(atlas)` inside `hdr_entity_mark`).
+            for frag in [
+                "fs_entity",
+                "fs_entity_clipped",
+                "fs_entity_unmarked",
+                "fs_celestial",
+                "fs_sky_celestial",
+                "fs_sky_sun",
+            ] {
+                assert_eq!(
+                    count_auto_samples_of_global(
+                        &module,
+                        frag,
+                        naga::ShaderStage::Fragment,
+                        "atlas"
+                    ),
+                    1,
+                    "{label} {frag} must issue exactly one atlas textureSample"
+                );
+            }
+            // Translate every specialized entry point across HLSL, GLSL 330/400, MSL and SPIR-V.
+            for (stage, name) in [
+                (naga::ShaderStage::Vertex, "vs_entity"),
+                (naga::ShaderStage::Vertex, "vs_lightning"),
+                (naga::ShaderStage::Vertex, "vs_cloud"),
+                (naga::ShaderStage::Vertex, "vs_entity_shadow"),
+                (naga::ShaderStage::Vertex, "vs_outline"),
+                (naga::ShaderStage::Vertex, "vs_water_mask"),
+                (naga::ShaderStage::Vertex, "vs_weather"),
+                (naga::ShaderStage::Fragment, "fs_entity"),
+                (naga::ShaderStage::Fragment, "fs_entity_clipped"),
+                (naga::ShaderStage::Fragment, "fs_entity_unmarked"),
+                (naga::ShaderStage::Fragment, "fs_cloud"),
+                (naga::ShaderStage::Fragment, "fs_entity_shadow"),
+                (naga::ShaderStage::Fragment, "fs_outline"),
+                (naga::ShaderStage::Fragment, "fs_water_mask"),
+                (naga::ShaderStage::Fragment, "fs_celestial"),
+                (naga::ShaderStage::Fragment, "fs_sky_celestial"),
+                (naga::ShaderStage::Fragment, "fs_sky_sun"),
+                (naga::ShaderStage::Fragment, "fs_sky_sun_clip"),
+                (naga::ShaderStage::Fragment, "fs_energy_swirl"),
+                (naga::ShaderStage::Fragment, "fs_weather"),
+            ] {
+                let (compact, compact_info) = naga::back::pipeline_constants::process_overrides(
+                    &module,
+                    &info,
+                    Some((stage, name)),
+                    &Default::default(),
+                )
+                .unwrap_or_else(|e| panic!("{label} {name} overrides: {e}"));
+                let mut hlsl = String::new();
+                naga::back::hlsl::Writer::new(
+                    &mut hlsl,
+                    &naga::back::hlsl::Options::default(),
+                    &naga::back::hlsl::PipelineOptions {
+                        entry_point: Some((stage, name.to_owned())),
+                    },
+                )
+                .write(&compact, &compact_info, None)
+                .unwrap_or_else(|e| panic!("{label} {name} HLSL: {e}"));
+                assert!(!hlsl.is_empty());
+                for version in [330, 400] {
+                    let mut glsl = String::new();
+                    naga::back::glsl::Writer::new(
+                        &mut glsl,
+                        &compact,
+                        &compact_info,
+                        &naga::back::glsl::Options {
+                            version: naga::back::glsl::Version::Desktop(version),
+                            ..Default::default()
+                        },
+                        &naga::back::glsl::PipelineOptions {
+                            shader_stage: stage,
+                            entry_point: name.to_owned(),
+                            multiview: None,
+                        },
+                        Default::default(),
+                    )
+                    .and_then(|mut w| w.write())
+                    .unwrap_or_else(|e| panic!("{label} {name} GLSL {version}: {e}"));
+                    assert!(!glsl.is_empty());
+                }
+                let (msl, _) = naga::back::msl::write_string(
+                    &compact,
+                    &compact_info,
+                    &naga::back::msl::Options {
+                        fake_missing_bindings: true,
+                        ..Default::default()
+                    },
+                    &naga::back::msl::PipelineOptions {
+                        entry_point: Some((stage, name.to_owned())),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {name} MSL: {e}"));
+                assert!(!msl.is_empty());
+                let spv = naga::back::spv::write_vec(
+                    &compact,
+                    &compact_info,
+                    &naga::back::spv::Options::default(),
+                    Some(&naga::back::spv::PipelineOptions {
+                        shader_stage: stage,
+                        entry_point: name.to_owned(),
+                    }),
+                )
+                .unwrap_or_else(|e| panic!("{label} {name} SPIR-V: {e}"));
+                assert!(!spv.is_empty());
+            }
+        }
     }
     #[test]
     fn chunk_fade_is_vanillas_get_visibility() {

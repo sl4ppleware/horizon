@@ -37,20 +37,34 @@ override TEST_OVERLAY: u32 = 0u;
 const ENTITY_VERTEX: &str = r#"
 override TEST_TIER: u32 = 0u;
 override TEST_OVERLAY: u32 = 0u;
-@vertex fn test_vertex(@builtin(vertex_index) i: u32) -> Out {
+override TEST_CLOUD_ALPHA: f32 = 1.0;
+@vertex fn test_vertex(@builtin(vertex_index) i: u32) -> EntityOut {
     let p = vec2(f32((i << 1u) & 2u), f32(i & 2u));
-    var o: Out;
+    var o: EntityOut;
+    o.clip = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    o.color = vec4(0.8, 0.9, 0.7, 1.0);
+    o.uv_glint = vec4(0.5, 0.5, 0.0, 0.0);
+    o.fog_proj = vec4(globals.misc.x, globals.misc.x, 0.4, 0.6);
+    o.back_light_r = vec4(0.8, 0.9, 0.7, 0.7);
+    o.light_gb = vec2(0.8, 0.9);
+    o.packed_meta = vec2(entity_pack_flags(TEST_OVERLAY, 0u, TEST_TIER), 0xffff0000u);
+    return o;
+}
+@vertex fn test_shadow_vertex(@builtin(vertex_index) i: u32) -> ShadowOut {
+    let p = vec2(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: ShadowOut;
     o.clip = vec4(p * 2.0 - 1.0, 0.0, 1.0);
     o.uv = vec2(0.5);
-    o.color = vec4(0.8, 0.9, 0.7, 1.0);
-    o.back_color = o.color;
-    o.light_color = vec4(0.7, 0.8, 0.9, 1.0);
-    o.overlay_color = vec4(1.0);
-    o.tier = TEST_TIER;
-    o.overlay = TEST_OVERLAY;
-    o.wrap = vec2(0.0, 1.0);
-    o.proj = vec4(0.4, 0.6, 0.0, 1.0);
+    o.color = vec4(0.8, 0.9, 0.7, 1.0) * vec4(0.7, 0.8, 0.9, 1.0);
     o.fog_distance = vec2(globals.misc.x);
+    return o;
+}
+@vertex fn test_cloud_vertex(@builtin(vertex_index) i: u32) -> CloudOut {
+    let p = vec2(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: CloudOut;
+    o.clip = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    o.color = vec4(0.8, 0.9, 0.7, TEST_CLOUD_ALPHA);
+    o.fog_dist = globals.misc.x;
     return o;
 }
 "#;
@@ -104,6 +118,7 @@ struct Draw<'a> {
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
     terrain: bool,
+    alpha: u8,
     shader: wgpu::ShaderModule,
     layout: wgpu::PipelineLayout,
     bindings: wgpu::BindGroupLayout,
@@ -295,6 +310,19 @@ impl<'a> Draw<'a> {
                 stage_targets([Stage::DepthBounds, Stage::Transmittance, Stage::Accumulate][stage])
             };
             let shader = if stage == 3 { &screen_shader } else { &shader };
+            let vertex = if stage == 3 {
+                "test_vertex"
+            } else if !self.terrain && kind == "cloud" {
+                "test_cloud_vertex"
+            } else if !self.terrain && kind == "shadow" {
+                "test_shadow_vertex"
+            } else {
+                "test_vertex"
+            };
+            let mut stage_constants = constants.to_vec();
+            if vertex == "test_cloud_vertex" {
+                stage_constants.push(("TEST_CLOUD_ALPHA", f64::from(self.alpha) / 255.0));
+            }
             let pipeline = self
                 .device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -302,9 +330,9 @@ impl<'a> Draw<'a> {
                     layout: Some(&layout),
                     vertex: wgpu::VertexState {
                         module: shader,
-                        entry_point: Some("test_vertex"),
+                        entry_point: Some(vertex),
                         compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &constants,
+                            constants: &stage_constants,
                             ..Default::default()
                         },
                         buffers: &[],
@@ -322,7 +350,7 @@ impl<'a> Draw<'a> {
                         module: shader,
                         entry_point: Some(&entry),
                         compilation_options: wgpu::PipelineCompilationOptions {
-                            constants: &constants,
+                            constants: &stage_constants,
                             ..Default::default()
                         },
                         targets: &targets,
@@ -540,6 +568,7 @@ impl<'a> Draw<'a> {
             device,
             queue,
             terrain,
+            alpha,
             shader,
             layout,
             bindings,
@@ -641,8 +670,13 @@ impl<'a> Draw<'a> {
             "fs_sunrise" => "test_sunrise",
             "fs_native_model" => "test_model",
             "fs_native_fluid" => "test_fluid",
+            "fs_entity_shadow" => "test_shadow_vertex",
+            "fs_cloud" => "test_cloud_vertex",
             _ => "test_vertex",
         };
+        if vertex == "test_cloud_vertex" {
+            constants.push(("TEST_CLOUD_ALPHA", f64::from(self.alpha) / 255.0));
+        }
         let format = F::Rgba16Float;
         let key = PipelineKey {
             entry: entry.to_owned(),
@@ -1153,6 +1187,7 @@ fn actual_translucent_writers_blend_their_own_light() {
         (true, "fs_translucent", 0, 0, 1.0, 100),
         (false, "fs_entity", 0, 3, 1.0, 180),
         (false, "fs_entity", 4, 0, 1.0, 180),
+        (false, "fs_cloud", 4, 0, 1.0, 180),
     ] {
         let mut globals = globals;
         globals.misc[2] = if tint_alpha < 1.0 { 1.0 } else { 0.0 };
@@ -1447,6 +1482,7 @@ fn unmarked_entity_users_keep_their_source_gain() {
     for (entry, overlay) in [
         ("fs_entity_unmarked", 0),
         ("fs_entity_shadow", 0),
+        ("fs_cloud", 4),
         ("fs_energy_swirl", 0),
         ("fs_entity", 11),
         ("fs_entity", 12),
@@ -1528,6 +1564,8 @@ fn check_oit_writer(terrain: bool, kind: &str, overlay: u32, tier: u32, alphas: 
             "fs_translucent"
         } else if kind == "lightning" {
             "fs_celestial"
+        } else if kind == "cloud" {
+            "fs_cloud"
         } else {
             "fs_entity"
         };
@@ -1583,4 +1621,102 @@ fn actual_oit_cloud_writes_its_own_light() {
 fn actual_oit_additive_adds_converted_light_without_coverage() {
     let _gpu = crate::gfx::test_gpu::lock();
     check_oit_writer(false, "lightning", 0, 4, &[180]);
+}
+
+#[test]
+fn hdr_entity_and_celestial_single_fetch_matches_tier_zero_and_lifted_reference() {
+    let _gpu = crate::gfx::test_gpu::lock();
+    let Some((device, queue)) = gpu() else {
+        return;
+    };
+    let hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+    let settings = hdr.draw_params(true);
+    let debug_settings = [settings[0], settings[1], settings[2], 1.0];
+    let texel = [200.0_f32 / 255.0, 100.0 / 255.0, 50.0 / 255.0];
+    let v_color = [0.8_f32, 0.9, 0.7];
+    let v_light = [0.7_f32, 0.8, 0.9];
+    let fog_color = [0.2_f32, 0.3, 0.4];
+    let brightness = |c: [f32; 3]| {
+        let l = c.map(|v| v.max(0.0).powf(2.2));
+        0.5 * (0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2] + l[0].max(l[1]).max(l[2]))
+    };
+    let smoothstep = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let expected_lifted = |drawn: [f32; 3], tier: u32, fogged: f32| -> [f32; 3] {
+        if tier == 0 {
+            return drawn;
+        }
+        let y = brightness([
+            texel[0] * v_color[0],
+            texel[1] * v_color[1],
+            texel[2] * v_color[2],
+        ]) * (1.0 - fogged);
+        let t = (tier.clamp(1, 4) - 1) as usize;
+        let start = [0.08_f32, 0.14, 0.14, 0.14][t];
+        let full = [0.09_f32, 0.38, 0.38, 0.38][t];
+        let mark = 0.175 * (3 - t) as f32 + 0.165 * (1.0 - smoothstep(start, full, y));
+        let q = (mark.clamp(0.0, 1.0) * 255.0).round() / 255.0;
+        let band = ((q + 0.005) / 0.175).floor().clamp(0.0, 3.0) as usize;
+        let lift = 1.0 - ((q - 0.175 * band as f32) / 0.165).clamp(0.0, 1.0);
+        let gain = 1.0 + (GAINS[3 - band] - 1.0) * lift;
+        drawn.map(|c| (c.clamp(0.0, 1.0).powf(2.2) * gain.max(1.0)).powf(1.0 / 2.2))
+    };
+    for fog_dist in [0.0_f32, 50.0] {
+        let fogged = fog_dist / 100.0;
+        let globals = super::super::Globals {
+            fog_color: [fog_color[0], fog_color[1], fog_color[2], 1.0],
+            fog: [0.0, 100.0, 0.0, 100.0],
+            fog_ends: [100.0, 100.0, 0.0, 0.0],
+            misc: [fog_dist, 1.0, 0.0, 0.0],
+            hdr_light: [0.0, 0.0, 1.0, 1.0],
+            hdr_settings: settings,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        let mut draw = Draw::new(&device, &queue, false, &globals, 255);
+        draw.raw = true;
+        let base = [
+            texel[0] * v_color[0] * v_light[0],
+            texel[1] * v_color[1] * v_light[1],
+            texel[2] * v_color[2] * v_light[2],
+        ];
+        let fogged_rgb = [
+            base[0] * (1.0 - fogged) + fog_color[0] * fogged,
+            base[1] * (1.0 - fogged) + fog_color[1] * fogged,
+            base[2] * (1.0 - fogged) + fog_color[2] * fogged,
+        ];
+        for (entry, overlay, drawn) in [
+            ("fs_entity", 0, fogged_rgb),
+            ("fs_entity", 6, fogged_rgb),
+            ("fs_celestial", 0, base),
+            ("fs_celestial", 45, fogged_rgb),
+        ] {
+            for tier in [0_u32, 1, 2, 3, 4] {
+                let got = draw.render(true, entry, tier, overlay, [0.0; 4]);
+                let want = expected_lifted(drawn, tier, fogged);
+                for c in 0..3 {
+                    assert!(
+                        (got[c] - want[c]).abs() < 0.004,
+                        "{entry} overlay {overlay} tier {tier} fog {fog_dist}: got {got:?}, want {want:?}"
+                    );
+                }
+                assert!((got[3] - 1.0).abs() < 0.001, "{entry}: {got:?}");
+            }
+        }
+        // HDR debug mode still desaturates unmarked (`tier == 0`) entities, celestials and clouds.
+        let debug_globals = super::super::Globals {
+            hdr_settings: debug_settings,
+            ..globals
+        };
+        let mut debug_draw = Draw::new(&device, &queue, false, &debug_globals, 255);
+        debug_draw.raw = true;
+        for (entry, overlay) in [("fs_entity", 0), ("fs_celestial", 0), ("fs_cloud", 4)] {
+            let grey = debug_draw.render(true, entry, 0, overlay, [0.0; 4]);
+            assert!(
+                (grey[0] - grey[1]).abs() < 0.002 && (grey[1] - grey[2]).abs() < 0.002,
+                "{entry} debug tier=0 must desaturate via hdr_written(..., 1.0): {grey:?}"
+            );
+        }
+    }
 }

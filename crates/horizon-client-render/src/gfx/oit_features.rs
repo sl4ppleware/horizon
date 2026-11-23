@@ -205,12 +205,13 @@ impl Features {
                 &entity_module,
                 entities,
                 &entity_buffers,
-                kind(
-                    "entity shadows",
-                    "shadow",
-                    Some(wgpu::Face::Back),
-                    shadow_bias,
-                ),
+                Kind {
+                    label: "entity shadows",
+                    name: "shadow",
+                    vertex: "vs_entity_shadow",
+                    cull: Some(wgpu::Face::Back),
+                    bias: shadow_bias,
+                },
             ),
             swirl: set(
                 &entity_module,

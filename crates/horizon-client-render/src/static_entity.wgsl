@@ -10,12 +10,8 @@ struct StaticEntityUniform {
 @vertex fn vs_static_entity(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>,
     @location(2) overlay: u32, @location(3) color: vec4<f32>, @location(4) light: vec4<u32>,
     @location(5) normal: vec4<f32>, @location(6) glint_uv: vec2<f32>,
-    @location(7) section_origin: vec3<i32>) -> Out {
+    @location(7) section_origin: vec3<i32>) -> EntityOut {
     let block_delta = section_origin - static_entity.camera_block.xyz;
     let camera_relative = vec3<f32>(block_delta) + position - static_entity.camera_fraction.xyz;
-    var out = entity_vertex(camera_relative,
-        uv, overlay & 0xffffu, color, light, normal);
-    out.glint_uv = glint_uv;
-    out.tier = (overlay >> 16u) & 0xffu;
-    return out;
+    return entity_out(camera_relative, uv, overlay, color, light, normal, glint_uv);
 }

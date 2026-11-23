@@ -38,7 +38,7 @@ pub(super) struct EntityOutline {
 }
 
 impl EntityOutline {
-    /// `entity` draws the silhouettes with the entity shader's vertex stage and
+    /// `entity` draws the silhouettes with the entity shader's `vs_outline` and
     /// `fs_outline`; `format` is what it draws onto (`Renderer::overlay_format`).
     pub(super) fn new(
         device: &wgpu::Device,
@@ -56,7 +56,7 @@ impl EntityOutline {
             layout: Some(entity_layout),
             vertex: wgpu::VertexState {
                 module: entity_shader,
-                entry_point: Some("vs_entity"),
+                entry_point: Some("vs_outline"),
                 compilation_options: Default::default(),
                 buffers: entity_vertex,
             },

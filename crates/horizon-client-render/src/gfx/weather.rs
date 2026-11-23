@@ -204,11 +204,10 @@ struct HorizonWeatherOut {
     @location(6) light: vec4<u32>, @location(7) snow: u32) -> HorizonWeatherOut {
     let phase = horizon_entity_weather_phase(animation, bases, snow,
         horizon_entity_weather_time.values);
-    let v = horizon_entity_entity_vertex(position, uv + phase, 0u, color, light, vec4(0.0));
     var out: HorizonWeatherOut;
-    out.clip = v.clip;
-    out.uv = v.uv;
-    out.color = v.color;
+    out.clip = horizon_entity_globals.view_proj * vec4(position, 1.0);
+    out.uv = uv + phase;
+    out.color = color;
     out.rect = rect;
     // entity_vertex's light: block in y, sky in x, 0..240.
     out.light = min(vec2(f32(light.y), f32(light.x)) / 240.0, vec2(1.0));
@@ -341,6 +340,54 @@ mod tests {
         )
         .validate(&module)
         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
+    }
+
+    #[test]
+    fn weather_shader_uses_compact_weather_out_interface() {
+        let source = crate::gfx::entity_shader();
+        let module = naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let vs = module
+            .entry_points
+            .iter()
+            .find(|e| e.stage == naga::ShaderStage::Vertex && e.name == "vs_weather")
+            .unwrap();
+        let fs = module
+            .entry_points
+            .iter()
+            .find(|e| e.stage == naga::ShaderStage::Fragment && e.name == "fs_weather")
+            .unwrap();
+        let vs_ty = vs.function.result.as_ref().unwrap().ty;
+        let fs_ty = fs.function.arguments[0].ty;
+        assert_eq!(
+            vs_ty, fs_ty,
+            "vs_weather and fs_weather must share WeatherOut"
+        );
+        let naga::TypeInner::Struct { members, .. } = &module.types[vs_ty].inner else {
+            panic!("WeatherOut must be a struct");
+        };
+        let mut locs = 0usize;
+        let mut bytes = 0usize;
+        for m in members {
+            if matches!(m.binding, Some(naga::Binding::Location { .. })) {
+                locs += 1;
+                bytes += match module.types[m.ty].inner {
+                    naga::TypeInner::Scalar(s) => usize::from(s.width),
+                    naga::TypeInner::Vector { size, scalar } => {
+                        usize::from(scalar.width) * (size as usize)
+                    }
+                    ref other => panic!("unexpected WeatherOut field: {other:?}"),
+                };
+            }
+        }
+        assert_eq!(locs, 4);
+        assert_eq!(bytes, 48);
     }
     use crate::weather::{Parameters, Time};
     use wgpu::util::DeviceExt;

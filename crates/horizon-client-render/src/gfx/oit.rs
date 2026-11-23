@@ -1145,7 +1145,7 @@ mod tests {
         let stages = |name: &str| {
             ["bounds", "transmittance", "accumulate"].map(|s| format!("fs_oit_{name}_{s}"))
         };
-        let entity = ["entity", "shadow", "weather", "swirl"]
+        let entity = ["entity", "shadow", "weather", "swirl", "lightning"]
             .map(stages)
             .concat();
         validate(
@@ -1161,6 +1161,160 @@ mod tests {
                 + include_str!("../oit_border.wgsl")),
             &border.iter().map(String::as_str).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn oit_cloud_and_feature_shaders_match_compact_interfaces_and_skip_cloud_atlas_fetches() {
+        let locations = |module: &naga::Module, stage: naga::ShaderStage, name: &str| {
+            let entry = module
+                .entry_points
+                .iter()
+                .find(|e| e.stage == stage && e.name == name)
+                .unwrap_or_else(|| panic!("missing {stage:?} {name}"));
+            let mut locs = Vec::new();
+            let mut add = |ty: naga::Handle<naga::Type>, binding: Option<&naga::Binding>| {
+                if let Some(naga::Binding::Location {
+                    location,
+                    interpolation,
+                    ..
+                }) = binding
+                {
+                    let bytes = match module.types[ty].inner {
+                        naga::TypeInner::Scalar(s) => usize::from(s.width),
+                        naga::TypeInner::Vector { size, scalar } => {
+                            usize::from(scalar.width) * (size as usize)
+                        }
+                        ref other => panic!("unexpected IO type: {other:?}"),
+                    };
+                    locs.push((
+                        *location,
+                        bytes,
+                        matches!(interpolation, Some(naga::Interpolation::Flat)),
+                    ));
+                } else if let naga::TypeInner::Struct { members, .. } = &module.types[ty].inner {
+                    for m in members {
+                        if let Some(naga::Binding::Location {
+                            location,
+                            interpolation,
+                            ..
+                        }) = &m.binding
+                        {
+                            let bytes = match module.types[m.ty].inner {
+                                naga::TypeInner::Scalar(s) => usize::from(s.width),
+                                naga::TypeInner::Vector { size, scalar } => {
+                                    usize::from(scalar.width) * (size as usize)
+                                }
+                                ref other => panic!("unexpected IO type: {other:?}"),
+                            };
+                            locs.push((
+                                *location,
+                                bytes,
+                                matches!(interpolation, Some(naga::Interpolation::Flat)),
+                            ));
+                        }
+                    }
+                }
+            };
+            match stage {
+                naga::ShaderStage::Vertex => {
+                    if let Some(res) = &entry.function.result {
+                        add(res.ty, res.binding.as_ref());
+                    }
+                }
+                naga::ShaderStage::Fragment => {
+                    for arg in &entry.function.arguments {
+                        add(arg.ty, arg.binding.as_ref());
+                    }
+                }
+                other => panic!("unexpected stage {other:?}"),
+            }
+            locs.sort_by_key(|l| l.0);
+            locs
+        };
+
+        let cloud_src = super::super::entity_shader()
+            + include_str!("../oit.wgsl")
+            + include_str!("../oit_clouds.wgsl");
+        let cloud_mod = naga::front::wgsl::parse_str(&cloud_src).unwrap();
+        let cloud_info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&cloud_mod)
+        .unwrap();
+        let atlas = cloud_mod
+            .global_variables
+            .iter()
+            .find_map(|(h, g)| (g.name.as_deref() == Some("atlas")).then_some(h))
+            .unwrap();
+        let lightmap = cloud_mod
+            .global_variables
+            .iter()
+            .find_map(|(h, g)| (g.name.as_deref() == Some("lightmap")).then_some(h))
+            .unwrap();
+        let vs_cloud = locations(&cloud_mod, naga::ShaderStage::Vertex, "vs_cloud");
+        assert_eq!(vs_cloud.len(), 2);
+        assert_eq!(vs_cloud.iter().map(|l| l.1).sum::<usize>(), 20);
+        for frag in [
+            "fs_oit_cloud_bounds",
+            "fs_oit_cloud_transmittance",
+            "fs_oit_cloud_accumulate",
+        ] {
+            assert_eq!(
+                vs_cloud,
+                locations(&cloud_mod, naga::ShaderStage::Fragment, frag),
+                "vs_cloud -> {frag}"
+            );
+            let idx = cloud_mod
+                .entry_points
+                .iter()
+                .position(|e| e.stage == naga::ShaderStage::Fragment && e.name == frag)
+                .unwrap();
+            let fi = cloud_info.get_entry_point(idx);
+            assert!(
+                fi[atlas].is_empty() && fi[lightmap].is_empty() && fi.sampling_set.is_empty(),
+                "{frag} must perform zero atlas/lightmap fetches"
+            );
+        }
+
+        let feat_src = super::super::entity_shader()
+            + include_str!("../oit.wgsl")
+            + include_str!("../oit_features.wgsl");
+        let feat_mod = naga::front::wgsl::parse_str(&feat_src).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&feat_mod)
+        .unwrap();
+        for (vertex, fragment, expected_locs, expected_bytes) in [
+            ("vs_entity", "fs_oit_entity_bounds", 6, 80),
+            ("vs_entity", "fs_oit_entity_transmittance", 6, 80),
+            ("vs_entity", "fs_oit_entity_accumulate", 6, 80),
+            ("vs_entity", "fs_oit_text_accumulate", 6, 80),
+            ("vs_entity_shadow", "fs_oit_shadow_bounds", 3, 32),
+            ("vs_entity_shadow", "fs_oit_shadow_transmittance", 3, 32),
+            ("vs_entity_shadow", "fs_oit_shadow_accumulate", 3, 32),
+            ("vs_weather", "fs_oit_weather_bounds", 4, 48),
+            ("vs_weather", "fs_oit_weather_transmittance", 4, 48),
+            ("vs_weather", "fs_oit_weather_accumulate", 4, 48),
+            ("vs_entity", "fs_oit_swirl_bounds", 6, 80),
+            ("vs_entity", "fs_oit_swirl_transmittance", 6, 80),
+            ("vs_entity", "fs_oit_swirl_accumulate", 6, 80),
+            ("vs_lightning", "fs_oit_lightning_bounds", 6, 80),
+            ("vs_lightning", "fs_oit_lightning_transmittance", 6, 80),
+            ("vs_lightning", "fs_oit_lightning_accumulate", 6, 80),
+        ] {
+            let vs = locations(&feat_mod, naga::ShaderStage::Vertex, vertex);
+            let fs = locations(&feat_mod, naga::ShaderStage::Fragment, fragment);
+            assert_eq!(vs, fs, "{vertex} -> {fragment}");
+            assert_eq!(vs.len(), expected_locs, "{vertex} -> {fragment}");
+            assert_eq!(
+                vs.iter().map(|l| l.1).sum::<usize>(),
+                expected_bytes,
+                "{vertex} -> {fragment}"
+            );
+        }
     }
 
     #[test]

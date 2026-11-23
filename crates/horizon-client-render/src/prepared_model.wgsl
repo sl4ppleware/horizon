@@ -14,7 +14,7 @@
     @location(10) nrow2: vec4<f32>,
     @location(11) tint: vec4<f32>,
     @location(12) light: u32,
-) -> Out {
+) -> EntityOut {
     let model = mat4x4(col0, col1, col2, col3);
     let nmat = mat3x3(nrow0.xyz, nrow1.xyz, nrow2.xyz);
     let world = (model * vec4(position.xyz, 1.0)).xyz;
@@ -26,5 +26,5 @@
     let color = select(vec4(1.0), tint, flags.x != 0u);
     let sky = light & 0xffu;
     let block = max((light >> 8u) & 0xffu, flags.y * 16u);
-    return entity_vertex(world, uv.xy, 0u, color, vec4<u32>(sky, block, 0u, 0u), sn);
+    return entity_out(world, uv.xy, 0u, color, vec4<u32>(sky, block, 0u, 0u), sn, vec2(0.0));
 }
