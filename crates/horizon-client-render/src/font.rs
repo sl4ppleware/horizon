@@ -16,7 +16,7 @@ use ab_glyph::{Font as _, ScaleFont as _};
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::{
         Arc,
@@ -1544,6 +1544,14 @@ impl Font {
     pub fn epoch(&self) -> u64 {
         self.generation.get() << 2 | u64::from(self.uniform) << 1 | u64::from(self.japanese)
     }
+    #[inline]
+    fn set_index(cache: &Cache, id: &str) -> Option<usize> {
+        cache.sets.iter().position(|(k, _)| k == id)
+    }
+    #[inline]
+    fn style_set_index(cache: &Cache, style: &Style) -> Option<usize> {
+        Self::set_index(cache, style.font.as_deref().unwrap_or(DEFAULT))
+    }
     /// The glyph for a character in the default font (FontSet.getGlyph).
     pub fn glyph(&self, c: char) -> Glyph {
         self.glyph_of(DEFAULT, c)
@@ -1558,24 +1566,36 @@ impl Font {
         if id.contains(':') {
             self.glyph_of(id, c)
         } else {
-            self.glyph_of(&format!("minecraft:{id}"), c)
+            let mut cache = self.cache.borrow_mut();
+            let Some(idx) = cache
+                .sets
+                .iter()
+                .position(|(k, _)| k.strip_prefix("minecraft:") == Some(id))
+            else {
+                return self.missing;
+            };
+            self.glyph_at(&mut cache, idx, c)
         }
     }
     /// The first active provider's glyph, else the missing glyph.
     fn glyph_of(&self, id: &str, c: char) -> Glyph {
         let mut cache = self.cache.borrow_mut();
+        let Some(idx) = Self::set_index(&cache, id) else {
+            return self.missing;
+        };
+        self.glyph_at(&mut cache, idx, c)
+    }
+    /// The first active provider's glyph in `sets[set_idx]`, else the missing glyph.
+    #[inline]
+    fn glyph_at(&self, cache: &mut Cache, set_idx: usize, c: char) -> Glyph {
         let Cache {
             sets,
             region,
             strips,
             unihex,
             ..
-        } = &mut *cache;
-        // FontManager.getFontSetRaw: a font that doesn't exist draws every
-        // character as the missing glyph.
-        let Some((_, set)) = sets.iter_mut().find(|(k, _)| k == id) else {
-            return self.missing;
-        };
+        } = cache;
+        let set = &mut sets[set_idx].1;
         if let Some(g) = set.glyphs.get(&c) {
             return *g;
         }
@@ -1592,25 +1612,41 @@ impl Font {
         set.glyphs.insert(c, glyph);
         glyph
     }
+    /// Advance of `c` in `set_idx` under an already-held `cache` borrow.
+    #[inline]
+    fn advance_in(
+        &self,
+        cache: &mut Cache,
+        set_idx: Option<usize>,
+        c: char,
+        bold: bool,
+        has_inline: bool,
+    ) -> f32 {
+        if c == '\u{fffc}' && has_inline {
+            return 8.0;
+        }
+        let Some(idx) = set_idx else {
+            return self.missing.advance + if bold { self.missing.offset } else { 0.0 };
+        };
+        let g = self.glyph_at(cache, idx, c);
+        g.advance + if bold { g.offset } else { 0.0 }
+    }
     /// `FontSet.getRandomGlyph`'s `SelectedGlyphs.nonFishy`: the glyph of the first provider whose
     /// advance is not fishy, else the missing glyph. A character whose first glyph is fine has
     /// the same one for both.
-    fn glyph_non_fishy(&self, id: &str, c: char) -> Glyph {
-        let any = self.glyph_of(id, c);
+    fn glyph_non_fishy_at(&self, cache: &mut Cache, set_idx: usize, c: char) -> Glyph {
+        let any = self.glyph_at(cache, set_idx, c);
         if !fishy_advance(any.advance) {
             return any;
         }
-        let mut cache = self.cache.borrow_mut();
         let Cache {
             sets,
             region,
             strips,
             unihex,
             ..
-        } = &mut *cache;
-        let Some((_, set)) = sets.iter_mut().find(|(k, _)| k == id) else {
-            return self.missing;
-        };
+        } = cache;
+        let set = &mut sets[set_idx].1;
         if let Some(g) = set.non_fishy.get(&c) {
             return *g;
         }
@@ -1761,19 +1797,19 @@ impl Font {
     /// glyphs below U+0250.
     pub fn random_glyph(&self, style: &Style, advance: f32) -> Glyph {
         use horizon_core::random::RandomSource;
-        let id = style.font.as_deref().unwrap_or(DEFAULT);
         let width = advance.ceil() as i32;
+        let mut cache = self.cache.borrow_mut();
+        let Some(set_idx) = Self::style_set_index(&cache, style) else {
+            return self.missing;
+        };
         let pick = {
-            let mut cache = self.cache.borrow_mut();
             let Cache {
                 sets,
                 unihex,
                 random,
                 ..
             } = &mut *cache;
-            let Some((_, set)) = sets.iter_mut().find(|(k, _)| k == id) else {
-                return self.missing;
-            };
+            let set = &mut sets[set_idx].1;
             if set.by_width.is_none() {
                 set.by_width = Some(self.glyphs_by_width(set, unihex));
             }
@@ -1785,7 +1821,9 @@ impl Font {
                     chars.get(i as usize).copied()
                 })
         };
-        pick.map_or(self.missing, |c| self.glyph_non_fishy(id, c))
+        pick.map_or(self.missing, |c| {
+            self.glyph_non_fishy_at(&mut cache, set_idx, c)
+        })
     }
     fn glyphs_by_width(
         &self,
@@ -1875,39 +1913,105 @@ impl Font {
         if c == '\u{fffc}' && style.inline_object.is_some() {
             return 8.0;
         }
-        let g = self.glyph_styled(c, style);
-        g.advance + if style.is_bold() { g.offset } else { 0.0 }
+        let mut cache = self.cache.borrow_mut();
+        let set_idx = Self::style_set_index(&cache, style);
+        self.advance_in(&mut cache, set_idx, c, style.is_bold(), false)
     }
     /// Font.width of plain text (legacy codes are formatting, not glyphs).
     pub fn width(&self, s: &str) -> f32 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let rtl = crate::lang::bidirectional();
+        if !rtl && s.is_ascii() {
+            let mut cache = self.cache.borrow_mut();
+            let Some(idx) = Self::set_index(&cache, DEFAULT) else {
+                return (self.missing.advance * s.len() as f32).ceil();
+            };
+            let mut total = 0.0f32;
+            for b in s.bytes() {
+                total += self.glyph_at(&mut cache, idx, b as char).advance;
+            }
+            return total.ceil();
+        }
         if s.contains('§') {
+            if !rtl && !s.chars().any(|c| c as u32 >= 0x0590) {
+                let mut cache = self.cache.borrow_mut();
+                let set_idx = Self::set_index(&cache, DEFAULT);
+                let mut total = 0.0f32;
+                let mut bold = false;
+                let mut chars = s.chars();
+                while let Some(c) = chars.next() {
+                    if c == '§' {
+                        let Some(code) = chars.next() else { break };
+                        match code.to_ascii_lowercase() {
+                            '0'..='9' | 'a'..='f' | 'r' => bold = false,
+                            'l' => bold = true,
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    total += self.advance_in(&mut cache, set_idx, c, bold, false);
+                }
+                return total.ceil();
+            }
             return self.width_text(&Text::legacy(s));
         }
-        crate::bidi::visual_str(s)
-            .chars()
-            .map(|c| self.glyph(c).advance)
-            .sum::<f32>()
-            .ceil()
+        let visual = crate::bidi::visual_str(s);
+        let mut cache = self.cache.borrow_mut();
+        let set_idx = Self::set_index(&cache, DEFAULT);
+        let mut total = 0.0f32;
+        for c in visual.chars() {
+            total += self.advance_in(&mut cache, set_idx, c, false, false);
+        }
+        total.ceil()
+    }
+    /// Measure every span of `t` under a single cache borrow without cloning styles.
+    fn measure_spans(&self, t: &Text) -> f32 {
+        let mut cache = self.cache.borrow_mut();
+        let mut total = 0.0f32;
+        for span in &t.spans {
+            if span.text.is_empty() {
+                continue;
+            }
+            let set_idx = Self::style_set_index(&cache, &span.style);
+            let bold = span.style.is_bold();
+            let has_inline = span.style.inline_object.is_some();
+            if !bold
+                && !has_inline
+                && span.text.is_ascii()
+                && let Some(idx) = set_idx
+            {
+                for b in span.text.bytes() {
+                    total += self.glyph_at(&mut cache, idx, b as char).advance;
+                }
+            } else {
+                for c in span.text.chars() {
+                    total += self.advance_in(&mut cache, set_idx, c, bold, has_inline);
+                }
+            }
+        }
+        total.ceil()
     }
     /// Font.width of a component: `§` codes in the spans are formatting,
     /// not glyphs. Right-to-left text is measured as it is drawn, shaped.
     pub fn width_text(&self, t: &Text) -> f32 {
+        if !crate::lang::bidirectional() && t.spans.iter().all(|s| s.text.is_ascii()) {
+            return self.measure_spans(t);
+        }
         let t = t.resolved();
-        crate::bidi::visual(&t)
-            .chars()
-            .map(|(c, s)| self.advance(c, s))
-            .sum::<f32>()
-            .ceil()
+        let visual = crate::bidi::visual(&t);
+        self.measure_spans(&visual)
     }
     /// `Font.width(FormattedCharSequence)` of a sequence a component built
     /// with `FormattedCharSequence.forward`: every character is a glyph, a
     /// `§` included (`StringDecomposer.iterate`, not `iterateFormatted`).
     pub fn width_drawn(&self, t: &Text) -> f32 {
-        crate::bidi::visual(t)
-            .chars()
-            .map(|(c, s)| self.advance(c, s))
-            .sum::<f32>()
-            .ceil()
+        if !crate::lang::bidirectional() && t.spans.iter().all(|s| s.text.is_ascii()) {
+            return self.measure_spans(t);
+        }
+        let visual = crate::bidi::visual(t);
+        self.measure_spans(&visual)
     }
     /// `StringSplitter.splitLines`: each line and whether it continues a
     /// wrapped one. A line breaks at a `\n`, or once a character overflows
@@ -1915,41 +2019,65 @@ impl Font {
     /// before that character; the `\n` or space at the break is dropped.
     pub fn split_lines(&self, t: &Text, max_width: f32) -> Vec<(Text, bool)> {
         let max_width = max_width.max(1.0);
-        let chars: Vec<(char, &Style)> = t.chars().collect();
-        let n = chars.len();
+        let spans = &t.spans;
+        let end_pos = SpanPos {
+            span: spans.len(),
+            byte: 0,
+        };
         let mut out = Vec::new();
-        let (mut start, mut wrapped, mut force_new_line) = (0, false, false);
+        let mut start = next_non_empty_pos(spans, SpanPos { span: 0, byte: 0 });
+        let (mut wrapped, mut force_new_line) = (false, false);
+        let mut cache = self.cache.borrow_mut();
         loop {
             // LineBreakFinder over what is left.
-            let (mut width, mut had_visible, mut last_space) = (0.0f32, false, None);
-            let mut split = None;
-            for (i, &(c, style)) in chars.iter().enumerate().skip(start) {
-                if c == '\n' {
-                    split = Some(i);
-                    break;
+            let (mut width, mut had_visible) = (0.0f32, false);
+            let mut last_space: Option<(SpanPos, SpanPos)> = None;
+            let mut split: Option<(SpanPos, SpanPos, bool)> = None;
+            let (mut si, mut byte) = (start.span, start.byte);
+            'scan: while si < spans.len() {
+                let span = &spans[si];
+                let set_idx = Self::style_set_index(&cache, &span.style);
+                let bold = span.style.is_bold();
+                let has_inline = span.style.inline_object.is_some();
+                for (rel, c) in span.text[byte..].char_indices() {
+                    let pos = SpanPos {
+                        span: si,
+                        byte: byte + rel,
+                    };
+                    let after = SpanPos {
+                        span: si,
+                        byte: byte + rel + c.len_utf8(),
+                    };
+                    if c == '\n' {
+                        split = Some((pos, after, true));
+                        break 'scan;
+                    }
+                    if c == ' ' {
+                        last_space = Some((pos, after));
+                    }
+                    let advance = self.advance_in(&mut cache, set_idx, c, bold, has_inline);
+                    width += advance;
+                    if !had_visible || width <= max_width {
+                        had_visible |= advance != 0.0;
+                    } else {
+                        let (at, next) = last_space.unwrap_or((pos, pos));
+                        split = Some((at, next, false));
+                        break 'scan;
+                    }
                 }
-                if c == ' ' {
-                    last_space = Some(i);
-                }
-                let advance = self.advance(c, style);
-                width += advance;
-                if !had_visible || width <= max_width {
-                    had_visible |= advance != 0.0;
-                } else {
-                    split = Some(last_space.unwrap_or(i));
-                    break;
-                }
+                si += 1;
+                byte = 0;
             }
-            let Some(at) = split else { break };
-            let new_line = chars[at].0 == '\n';
-            let skip = usize::from(new_line || chars[at].0 == ' ');
+            let Some((at, next, new_line)) = split else {
+                break;
+            };
             force_new_line = new_line;
-            out.push((t.slice(start, at), wrapped));
+            out.push((slice_spans(spans, start, at), wrapped));
             wrapped = !new_line;
-            start = at + skip;
+            start = next_non_empty_pos(spans, next);
         }
-        if start < n {
-            out.push((t.slice(start, n), wrapped));
+        if start < end_pos {
+            out.push((slice_spans(spans, start, end_pos), wrapped));
         } else if force_new_line {
             out.push((Text::empty(), false));
         }
@@ -1961,29 +2089,39 @@ impl Font {
     /// goes on in the style at the break. Lines keep their codes for drawing.
     pub fn split_formatted(&self, t: &Text, max_width: f32) -> Vec<Text> {
         let max_width = max_width.max(1.0);
-        let mut parts: Vec<(Vec<char>, Span)> = t
+        let mut parts: VecDeque<(&str, &Span, Option<Style>)> = t
             .spans
             .iter()
             .filter(|s| !s.text.is_empty())
-            .map(|s| (s.text.chars().collect(), s.with_text(String::new())))
+            .map(|s| (s.text.as_str(), s, None))
             .collect();
-        let mut flat: Vec<char> = parts.iter().flat_map(|p| p.0.iter().copied()).collect();
         let mut out = Vec::new();
         let mut force_new_line = false;
+        let mut cache = self.cache.borrow_mut();
         // One LineBreakFinder per line, over the parts left.
-        while let Some((at, split_style)) = self.line_break(&parts, max_width) {
-            let tail = flat[at];
-            let new_line = tail == '\n';
-            let skip = usize::from(new_line || tail == ' ');
+        while let Some((part_idx, byte_idx, new_line, skip_bytes, split_style)) =
+            self.line_break_formatted(&mut cache, &parts, max_width)
+        {
             force_new_line = new_line;
-            out.push(split_at(&mut parts, at, skip, &split_style));
-            flat.drain(..at + skip);
+            out.push(split_at_formatted(
+                &mut parts,
+                part_idx,
+                byte_idx,
+                skip_bytes,
+                split_style,
+            ));
         }
         if !parts.is_empty() {
             out.push(Text::from_spans(
                 parts
                     .into_iter()
-                    .map(|(text, span)| span.with_text(text.into_iter().collect::<String>()))
+                    .map(|(text, orig, style_override)| {
+                        let mut span = orig.with_text(text);
+                        if let Some(st) = style_override {
+                            span.style = st;
+                        }
+                        span
+                    })
                     .collect(),
             ));
         } else if force_new_line {
@@ -1992,40 +2130,53 @@ impl Font {
         out
     }
     /// `StringSplitter.LineBreakFinder` fed by `StringDecomposer.iterateFormatted`:
-    /// where the parts break (a character index) and the style there.
-    fn line_break(&self, parts: &[(Vec<char>, Span)], max_width: f32) -> Option<(usize, Style)> {
-        let (mut width, mut had_visible, mut last_space) = (0.0f32, false, None);
-        let mut offset = 0;
-        for (contents, part_style) in parts {
-            let mut style = part_style.style.clone();
-            let mut i = 0;
-            while i < contents.len() {
-                let c = contents[i];
+    /// where the parts break `(part_idx, byte_idx)`, whether it was a `\n`,
+    /// bytes to skip at the break (0 or 1), and any `§`-modified style active there.
+    fn line_break_formatted(
+        &self,
+        cache: &mut Cache,
+        parts: &VecDeque<(&str, &Span, Option<Style>)>,
+        max_width: f32,
+    ) -> Option<(usize, usize, bool, usize, Option<Style>)> {
+        let (mut width, mut had_visible) = (0.0f32, false);
+        let mut last_space: Option<(usize, usize, Option<Style>)> = None;
+        for (part_idx, (contents, orig_span, style_override)) in parts.iter().enumerate() {
+            let base_style = style_override.as_ref().unwrap_or(&orig_span.style);
+            let mut owned_style: Option<Style> = None;
+            let mut set_idx = Self::style_set_index(cache, base_style);
+            let mut bold = base_style.is_bold();
+            let mut has_inline = base_style.inline_object.is_some();
+            let mut iter = contents.char_indices();
+            while let Some((byte_idx, c)) = iter.next() {
                 if c == '§' {
                     // A `§` that ends its part ends only that part.
-                    let Some(&code) = contents.get(i + 1) else {
+                    let Some((_, code)) = iter.next() else {
                         break;
                     };
-                    style = legacy_format(&style, code, &Style::default());
-                    i += 2;
+                    let cur = owned_style.as_ref().unwrap_or(base_style);
+                    let next = legacy_format(cur, code, &Style::default());
+                    set_idx = Self::style_set_index(cache, &next);
+                    bold = next.is_bold();
+                    has_inline = next.inline_object.is_some();
+                    owned_style = Some(next);
                     continue;
                 }
-                let at = offset + i;
                 if c == '\n' {
-                    return Some((at, style));
+                    return Some((part_idx, byte_idx, true, 1, owned_style));
                 }
                 if c == ' ' {
-                    last_space = Some((at, style.clone()));
+                    last_space = Some((part_idx, byte_idx, owned_style.clone()));
                 }
-                let advance = self.advance(c, &style);
+                let advance = self.advance_in(cache, set_idx, c, bold, has_inline);
                 width += advance;
                 if had_visible && width > max_width {
-                    return Some(last_space.unwrap_or((at, style)));
+                    return Some(match last_space {
+                        Some((pi, bi, st)) => (pi, bi, false, 1, st),
+                        None => (part_idx, byte_idx, false, 0, owned_style),
+                    });
                 }
                 had_visible |= advance != 0.0;
-                i += 1;
             }
-            offset += contents.len();
         }
         None
     }
@@ -2054,41 +2205,65 @@ impl Font {
     /// StringSplitter.splitLines: wrap at the last space that fits (or
     /// mid-word when none does); `\n` always breaks. Styles are kept.
     pub fn split(&self, t: &Text, max_width: f32) -> Vec<Text> {
-        let chars: Vec<(char, Style)> = t.chars().map(|(c, s)| (c, s.clone())).collect();
+        let spans = &t.spans;
+        let end_pos = SpanPos {
+            span: spans.len(),
+            byte: 0,
+        };
         let mut lines = Vec::new();
-        let mut start = 0;
-        while start < chars.len() {
-            let mut width = 0.0;
-            let mut end = chars.len();
-            let mut next = chars.len();
-            let mut last_space = None;
-            for (i, (c, style)) in chars.iter().enumerate().skip(start) {
-                if *c == '\n' {
-                    end = i;
-                    next = i + 1;
-                    break;
-                }
-                if *c == ' ' {
-                    last_space = Some(i);
-                }
-                width += self.advance(*c, style);
-                if width > max_width {
-                    match last_space {
-                        Some(s) if s > start => {
-                            end = s;
-                            next = s + 1;
-                        }
-                        _ => {
-                            end = i.max(start + 1);
-                            next = end;
-                        }
+        let mut start = next_non_empty_pos(spans, SpanPos { span: 0, byte: 0 });
+        let mut cache = self.cache.borrow_mut();
+        while start < end_pos {
+            let mut width = 0.0f32;
+            let mut end = end_pos;
+            let mut next = end_pos;
+            let mut last_space: Option<(SpanPos, SpanPos)> = None;
+            let mut ended_with_newline = false;
+            let (mut si, mut byte) = (start.span, start.byte);
+            'scan: while si < spans.len() {
+                let span = &spans[si];
+                let set_idx = Self::style_set_index(&cache, &span.style);
+                let bold = span.style.is_bold();
+                let has_inline = span.style.inline_object.is_some();
+                for (rel, c) in span.text[byte..].char_indices() {
+                    let pos = SpanPos {
+                        span: si,
+                        byte: byte + rel,
+                    };
+                    let after = SpanPos {
+                        span: si,
+                        byte: byte + rel + c.len_utf8(),
+                    };
+                    if c == '\n' {
+                        end = pos;
+                        next = after;
+                        ended_with_newline = true;
+                        break 'scan;
                     }
-                    break;
+                    if c == ' ' {
+                        last_space = Some((pos, after));
+                    }
+                    width += self.advance_in(&mut cache, set_idx, c, bold, has_inline);
+                    if width > max_width {
+                        match last_space {
+                            Some((s, s_after)) if s > start => {
+                                end = s;
+                                next = s_after;
+                            }
+                            _ => {
+                                end = if pos > start { pos } else { after };
+                                next = end;
+                            }
+                        }
+                        break 'scan;
+                    }
                 }
+                si += 1;
+                byte = 0;
             }
-            lines.push(t.slice(start, end));
-            start = next;
-            if start == chars.len() && chars.last().is_some_and(|c| c.0 == '\n') {
+            lines.push(slice_spans(spans, start, end));
+            start = next_non_empty_pos(spans, next);
+            if start == end_pos && ended_with_newline {
                 lines.push(Text::empty());
             }
         }
@@ -2099,67 +2274,136 @@ impl Font {
     }
     /// Characters of `s` that fit in `width` (Font.plainSubstrByWidth).
     pub fn fit(&self, s: &str, width: f32) -> usize {
-        let mut w = 0.0;
+        let mut cache = self.cache.borrow_mut();
+        let set_idx = Self::set_index(&cache, DEFAULT);
+        let mut w = 0.0f32;
+        if s.is_ascii()
+            && let Some(idx) = set_idx
+        {
+            for (i, b) in s.bytes().enumerate() {
+                w += self.glyph_at(&mut cache, idx, b as char).advance;
+                if w > width {
+                    return i;
+                }
+            }
+            return s.len();
+        }
+        let mut count = 0usize;
         for (i, c) in s.chars().enumerate() {
-            w += self.glyph(c).advance;
+            w += self.advance_in(&mut cache, set_idx, c, false, false);
             if w > width {
                 return i;
             }
+            count = i + 1;
         }
-        s.chars().count()
+        count
     }
     /// Characters of `s` that fit in `width`, measured from the end.
     pub fn fit_reverse(&self, s: &str, width: f32) -> usize {
-        let mut w = 0.0;
+        let mut cache = self.cache.borrow_mut();
+        let set_idx = Self::set_index(&cache, DEFAULT);
+        let mut w = 0.0f32;
+        if s.is_ascii()
+            && let Some(idx) = set_idx
+        {
+            for (i, b) in s.bytes().rev().enumerate() {
+                w += self.glyph_at(&mut cache, idx, b as char).advance;
+                if w > width {
+                    return i;
+                }
+            }
+            return s.len();
+        }
+        let mut count = 0usize;
         for (i, c) in s.chars().rev().enumerate() {
-            w += self.glyph(c).advance;
+            w += self.advance_in(&mut cache, set_idx, c, false, false);
             if w > width {
                 return i;
             }
+            count = i + 1;
         }
-        s.chars().count()
+        count
     }
     pub fn white(&self) -> Rect {
         self.white
     }
 }
 
-/// `StringSplitter.FlatComponents.splitAt`: the parts before `at` as a line,
-/// `skip` characters dropped, and the part it ends in restyled as `style`.
-fn split_at(parts: &mut Vec<(Vec<char>, Span)>, at: usize, skip: usize, style: &Style) -> Text {
+/// Byte cursor inside `Text::spans` (avoids flattening to `Vec<char>` per wrap).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SpanPos {
+    span: usize,
+    byte: usize,
+}
+fn next_non_empty_pos(spans: &[Span], mut pos: SpanPos) -> SpanPos {
+    while pos.span < spans.len() && pos.byte >= spans[pos.span].text.len() {
+        pos.span += 1;
+        pos.byte = 0;
+    }
+    pos
+}
+fn slice_spans(spans: &[Span], from: SpanPos, to: SpanPos) -> Text {
+    if from >= to {
+        return Text::empty();
+    }
+    let last = to.span.min(spans.len().saturating_sub(1));
+    let mut out = Vec::new();
+    for si in from.span..=last {
+        let Some(span) = spans.get(si) else { break };
+        let lo = if si == from.span { from.byte } else { 0 };
+        let hi = if si == to.span {
+            to.byte
+        } else {
+            span.text.len()
+        };
+        if lo < hi {
+            out.push(span.with_text(&span.text[lo..hi]));
+        }
+    }
+    Text::from_spans(out)
+}
+/// `StringSplitter.FlatComponents.splitAt` over borrowed `&str` parts.
+fn split_at_formatted(
+    parts: &mut VecDeque<(&str, &Span, Option<Style>)>,
+    part_idx: usize,
+    byte_idx: usize,
+    skip_bytes: usize,
+    style_override: Option<Style>,
+) -> Text {
     let mut line = Vec::new();
-    let mut push = |text: &[char], span: &Span| {
-        line.push(span.with_text(text.iter().collect::<String>()));
+    for _ in 0..part_idx {
+        if let Some((text, orig, current_style)) = parts.pop_front() {
+            let mut span = orig.with_text(text);
+            if let Some(st) = current_style {
+                span.style = st;
+            }
+            line.push(span);
+        }
+    }
+    let pop_front = if let Some((text, orig, current_style)) = parts.front_mut() {
+        let s = *text;
+        if byte_idx > 0 {
+            let mut span = orig.with_text(&s[..byte_idx]);
+            if let Some(st) = current_style.as_ref() {
+                span.style = st.clone();
+            }
+            line.push(span);
+        }
+        let rest_start = byte_idx + skip_bytes;
+        if rest_start >= s.len() {
+            true
+        } else {
+            *text = &s[rest_start..];
+            if style_override.is_some() {
+                *current_style = style_override;
+            }
+            false
+        }
+    } else {
+        false
     };
-    // Each part done is removed, so the one at hand is always the first.
-    let (mut position, mut in_skip) = (at, false);
-    while let Some((text, part_style)) = parts.first() {
-        let size = text.len();
-        if !in_skip {
-            if position > size {
-                push(text, part_style);
-                parts.remove(0);
-                position -= size;
-                continue;
-            }
-            if position > 0 {
-                push(&text[..position], part_style);
-            }
-            position += skip;
-            in_skip = true;
-        }
-        if position <= size {
-            if position == size {
-                parts.remove(0);
-            } else {
-                let mut span = part_style.clone();
-                span.style = style.clone();
-                parts[0] = (text[position..].to_vec(), span);
-            }
-            break;
-        }
-        parts.remove(0);
-        position -= size;
+    if pop_front {
+        parts.pop_front();
     }
     Text::from_spans(line)
 }
@@ -2487,6 +2731,13 @@ mod tests {
             std::fs::write(path, bytes).unwrap();
         }
         root
+    }
+    fn glyph_non_fishy(font: &Font, id: &str, c: char) -> Glyph {
+        let mut cache = font.cache.borrow_mut();
+        let Some(idx) = Font::set_index(&cache, id) else {
+            return font.missing;
+        };
+        font.glyph_non_fishy_at(&mut cache, idx, c)
     }
     fn white() -> Rect {
         Rect {
@@ -2876,7 +3127,7 @@ mod tests {
         let c = char::from_u32(0xe000 + 19).unwrap();
         assert_eq!(font.glyph(c).advance, 512.0);
         assert_eq!(
-            font.glyph_non_fishy(DEFAULT, c).advance,
+            glyph_non_fishy(&font, DEFAULT, c).advance,
             6.0,
             "the missing glyph"
         );
@@ -2903,7 +3154,7 @@ mod tests {
         assert!(g.rect.is_some(), "drawn, not the missing glyph");
         assert!(fishy_advance(g.advance));
         assert_eq!(
-            font.glyph_non_fishy(DEFAULT, 'a').advance,
+            glyph_non_fishy(&font, DEFAULT, 'a').advance,
             6.0,
             "excluded from what obfuscated text draws"
         );
@@ -4363,5 +4614,689 @@ mod tests {
         };
         assert!(!Arc::ptr_eq(partial_table, full_table));
         assert!(Arc::ptr_eq(full_table, alt_table));
+    }
+
+    #[test]
+    fn ascii_cache_width_fit_and_filter_invalidation() {
+        let sheet_normal = png(16, 8, |x, _| x < 2 || (8..14).contains(&x));
+        let sheet_uniform = png(16, 8, |x, _| x < 1 || (8..10).contains(&x));
+        let sheet_jp = png(16, 8, |x, _| x < 4 || (8..12).contains(&x));
+        let def = br#"{"providers":[
+            {"type":"space","advances":{" ":4}},
+            {"type":"bitmap","file":"minecraft:font/u.png","ascent":7,"chars":["ab"],"filter":{"uniform":true}},
+            {"type":"bitmap","file":"minecraft:font/j.png","ascent":7,"chars":["ab"],"filter":{"jp":true}},
+            {"type":"bitmap","file":"minecraft:font/n.png","ascent":7,"chars":["ab"]}
+        ]}"#;
+        let alt = br#"{"providers":[{"type":"space","advances":{"a":5,"b":2," ":4}}]}"#;
+        let root = root(
+            "ascii-cache",
+            &[
+                ("assets/minecraft/font/default.json", def),
+                ("assets/minecraft/font/alt.json", alt),
+                ("assets/minecraft/textures/font/n.png", &sheet_normal),
+                ("assets/minecraft/textures/font/u.png", &sheet_uniform),
+                ("assets/minecraft/textures/font/j.png", &sheet_jp),
+            ],
+        );
+        let mut font = load(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Empty string returns +0.0 (not -0.0) across all measurement APIs.
+        for empty_w in [
+            font.width(""),
+            font.width_text(&Text::empty()),
+            font.width_drawn(&Text::empty()),
+        ] {
+            assert_eq!(empty_w, 0.0);
+            assert!(!empty_w.is_sign_negative());
+        }
+
+        // Normal filter: 'a' = 3.0, 'b' = 7.0, ' ' = 4.0, bold adds 1.0.
+        assert_eq!(font.width("ab"), 10.0);
+        // Repeat call hits the populated FontSet::glyphs cache.
+        assert_eq!(font.width("a b a"), 21.0);
+        assert_eq!(font.width("§la§rb"), 11.0);
+        assert_eq!(font.width("§la§ab"), 11.0);
+        assert_eq!(font.width("§z§la§"), 4.0);
+        assert_eq!(font.width_text(&Text::literal("a b")), 14.0);
+        assert_eq!(font.width_text(&Text::literal("§lab")), 12.0);
+        assert_eq!(font.width_drawn(&Text::literal("a b")), 14.0);
+
+        let alt_style = Style {
+            font: Some("minecraft:alt".into()),
+            ..Style::default()
+        };
+        let mixed = Text::literal("a")
+            .append(Text::styled("ab", alt_style))
+            .append(Text::literal("b").bold());
+        // default 'a'(3) + alt 'a'(5) + alt 'b'(2) + default bold 'b'(8) = 18.
+        assert_eq!(font.width_text(&mixed), 18.0);
+        assert_eq!(font.width_drawn(&mixed), 18.0);
+        assert_eq!(font.glyph_in("alt", 'a').advance, 5.0);
+        assert_eq!(font.glyph_in("minecraft:alt", 'b').advance, 2.0);
+        assert_eq!(font.glyph_in("missing:font", 'a').advance, 6.0);
+
+        assert_eq!(font.fit("aba", 10.0), 2);
+        assert_eq!(font.fit("aba", 13.0), 3);
+        assert_eq!(font.fit_reverse("aba", 10.0), 2);
+        assert_eq!(font.fit_reverse("aba", 13.0), 3);
+
+        // Flipping uniform + reset_cache must invalidate cached glyphs ('a' = 2.0, 'b' = 3.0).
+        font.uniform = true;
+        font.reset_cache();
+        assert_eq!(font.width("ab"), 5.0);
+        assert_eq!(font.width("ab"), 5.0);
+        assert_eq!(font.fit("aba", 7.0), 3);
+
+        // Flipping japanese + reset_cache must invalidate cached glyphs ('a' = 5.0, 'b' = 5.0).
+        font.uniform = false;
+        font.japanese = true;
+        font.reset_cache();
+        assert_eq!(font.width("ab"), 10.0);
+        assert_eq!(font.width("a"), 5.0);
+    }
+
+    #[test]
+    fn wrapping_and_splitting_table_matches_hand_computed_hard_cases() {
+        // Exact integer advances (all offset = 1.0, missing = 6.0):
+        // ' '=4, 'a'=3, 'b'=7, 'é'=3 (2B), '中'=5 (3B), '😀'=5 (4B),
+        // 'א'=3 (RTL), 'ב'=4 (RTL), '('=2, ')'=5.
+        let sheet = png(16, 8, |x, _| x < 2 || (8..14).contains(&x));
+        let def = br#"{"providers":[
+            {"type":"space","advances":{
+                " ":4,"\u00e9":3,"\u4e2d":5,"\ud83d\ude00":5,
+                "\u05d0":3,"\u05d1":4,"(":2,")":5
+            }},
+            {"type":"bitmap","file":"minecraft:font/a.png","ascent":7,"chars":["ab"]}
+        ]}"#;
+        let root = root(
+            "wrap-table",
+            &[
+                ("assets/minecraft/font/default.json", def),
+                ("assets/minecraft/textures/font/a.png", &sheet),
+            ],
+        );
+        let font = load(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let spans_text = |parts: &[(&str, Style)]| -> Text {
+            Text::from_spans(
+                parts
+                    .iter()
+                    .map(|(text, style)| Span::new(*text, style.clone()))
+                    .collect(),
+            )
+        };
+        let plain = Style::default();
+        let red = Style::color(crate::text::RED);
+        let red_bold = Style {
+            color: Some(crate::text::RED),
+            bold: Some(true),
+            ..Style::default()
+        };
+        let bold_only = Style {
+            bold: Some(true),
+            ..Style::default()
+        };
+        let green_unbold = Style {
+            color: Some(crate::text::GREEN),
+            bold: Some(false),
+            italic: Some(false),
+            underlined: Some(false),
+            strikethrough: Some(false),
+            obfuscated: Some(false),
+            ..Style::default()
+        };
+
+        struct LineCase<'a> {
+            name: &'a str,
+            spans: Vec<(&'a str, Style)>,
+            max_width: f32,
+            want_lines: &'a [(&'a str, bool)],
+            want_split: &'a [&'a str],
+        }
+
+        // 1. Hand-computed table for `split_lines` and `split`.
+        let line_cases = [
+            // Empty text & empty spans only
+            LineCase {
+                name: "empty",
+                spans: vec![],
+                max_width: 10.0,
+                want_lines: &[],
+                want_split: &[""],
+            },
+            LineCase {
+                name: "empty_spans_only",
+                spans: vec![("", plain.clone()), ("", plain.clone())],
+                max_width: 10.0,
+                want_lines: &[],
+                want_split: &[""],
+            },
+            // Multi-byte UTF-8 (2B/3B/4B) crossing TextSpan boundaries
+            LineCase {
+                name: "multibyte_cross_spans",
+                spans: vec![("aé", plain.clone()), ("中😀b", plain.clone())],
+                max_width: 11.0,
+                want_lines: &[("aé中", false), ("😀", true), ("b", true)],
+                want_split: &["aé中", "😀", "b"],
+            },
+            LineCase {
+                name: "multibyte_space_wrap",
+                spans: vec![("aé ", plain.clone()), ("中 😀", plain.clone())],
+                max_width: 11.0,
+                want_lines: &[("aé", false), ("中", true), ("😀", true)],
+                want_split: &["aé", "中", "😀"],
+            },
+            // Leading space as first character of input and after newline:
+            // `split_lines` breaks at last_space even when at start; `split` requires s > start.
+            LineCase {
+                name: "leading_space_first_char",
+                spans: vec![(" aa", plain.clone())],
+                max_width: 6.0,
+                want_lines: &[("", false), ("aa", true)],
+                want_split: &[" ", "aa"],
+            },
+            LineCase {
+                name: "leading_space_narrow",
+                spans: vec![(" aa", plain.clone())],
+                max_width: 2.0,
+                want_lines: &[("", false), ("a", true), ("a", true)],
+                want_split: &[" ", "a", "a"],
+            },
+            LineCase {
+                name: "leading_space_after_newline",
+                spans: vec![("a\n aa", plain.clone())],
+                max_width: 6.0,
+                want_lines: &[("a", false), ("", false), ("aa", true)],
+                want_split: &["a", " ", "aa"],
+            },
+            // Line break immediately after a span boundary (overflow, \n, space, empty span)
+            LineCase {
+                name: "break_after_span_boundary",
+                spans: vec![("aa", plain.clone()), ("aa", plain.clone())],
+                max_width: 6.0,
+                want_lines: &[("aa", false), ("aa", true)],
+                want_split: &["aa", "aa"],
+            },
+            LineCase {
+                name: "newline_at_span_boundary",
+                spans: vec![("aa", plain.clone()), ("\na", plain.clone())],
+                max_width: 10.0,
+                want_lines: &[("aa", false), ("a", false)],
+                want_split: &["aa", "a"],
+            },
+            LineCase {
+                name: "space_at_span_boundary",
+                spans: vec![("aa", plain.clone()), (" a", plain.clone())],
+                max_width: 10.0,
+                want_lines: &[("aa", false), ("a", true)],
+                want_split: &["aa", "a"],
+            },
+            LineCase {
+                name: "empty_span_at_boundary",
+                spans: vec![
+                    ("aa", plain.clone()),
+                    ("", plain.clone()),
+                    ("aa", plain.clone()),
+                ],
+                max_width: 6.0,
+                want_lines: &[("aa", false), ("aa", true)],
+                want_split: &["aa", "aa"],
+            },
+            LineCase {
+                name: "trailing_newline_own_span",
+                spans: vec![("aa", plain.clone()), ("\n", plain.clone())],
+                max_width: 10.0,
+                want_lines: &[("aa", false), ("", false)],
+                want_split: &["aa", ""],
+            },
+            LineCase {
+                name: "space_overflow_own_span",
+                spans: vec![("a", plain.clone()), (" ", plain.clone())],
+                max_width: 5.0,
+                want_lines: &[("a", false)],
+                want_split: &["a"],
+            },
+            // Non-ASCII RTL characters across spans
+            LineCase {
+                name: "rtl_cross_span",
+                spans: vec![("אב", plain.clone()), (" א", plain.clone())],
+                max_width: 7.0,
+                want_lines: &[("אב", false), ("א", true)],
+                want_split: &["אב", "א"],
+            },
+        ];
+
+        for case in &line_cases {
+            let text = spans_text(&case.spans);
+            let got_lines: Vec<(String, bool)> = font
+                .split_lines(&text, case.max_width)
+                .into_iter()
+                .map(|(line, wrapped)| (line.plain(), wrapped))
+                .collect();
+            let expected_lines: Vec<(String, bool)> = case
+                .want_lines
+                .iter()
+                .map(|(s, w)| ((*s).to_owned(), *w))
+                .collect();
+            assert_eq!(got_lines, expected_lines, "split_lines case {}", case.name);
+
+            let got_split: Vec<String> = font
+                .split(&text, case.max_width)
+                .into_iter()
+                .map(|line| line.plain())
+                .collect();
+            let expected_split: Vec<String> =
+                case.want_split.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(got_split, expected_split, "split case {}", case.name);
+        }
+
+        struct FormattedCase<'a> {
+            name: &'a str,
+            spans: Vec<(&'a str, Style)>,
+            max_width: f32,
+            want: Vec<Vec<(&'a str, Style)>>,
+        }
+
+        // 2. Hand-computed table for `split_formatted`, verifying both text and carried styles.
+        let formatted_cases = [
+            // Empty text
+            FormattedCase {
+                name: "empty",
+                spans: vec![],
+                max_width: 10.0,
+                want: vec![],
+            },
+            // Multi-byte UTF-8 crossing spans
+            FormattedCase {
+                name: "multibyte_cross_spans",
+                spans: vec![("aé", plain.clone()), ("中😀b", plain.clone())],
+                max_width: 11.0,
+                want: vec![
+                    vec![("aé", plain.clone()), ("中", plain.clone())],
+                    vec![("😀", plain.clone())],
+                    vec![("b", plain.clone())],
+                ],
+            },
+            // Unknown multi-byte § code followed by space wrap
+            FormattedCase {
+                name: "section_with_multibyte_code",
+                spans: vec![("a§é b", plain.clone())],
+                max_width: 8.0,
+                want: vec![vec![("a§é", plain.clone())], vec![("b", plain.clone())]],
+            },
+            // § formatting code immediately before an overflow line break
+            FormattedCase {
+                name: "section_before_overflow_break",
+                spans: vec![("aa§laa", plain.clone())],
+                max_width: 8.0,
+                want: vec![
+                    vec![("aa§l", plain.clone())],
+                    vec![("aa", bold_only.clone())],
+                ],
+            },
+            // § formatting code immediately before an explicit newline
+            FormattedCase {
+                name: "section_before_newline",
+                spans: vec![("a§l\naa", plain.clone())],
+                max_width: 8.0,
+                want: vec![vec![("a§l", plain.clone())], vec![("aa", bold_only)]],
+            },
+            // Trailing § alone and across a span boundary
+            FormattedCase {
+                name: "trailing_section_single",
+                spans: vec![("aa§", plain.clone())],
+                max_width: 10.0,
+                want: vec![vec![("aa§", plain.clone())]],
+            },
+            FormattedCase {
+                name: "trailing_section_cross_span",
+                spans: vec![("aa§", plain.clone()), ("aa", plain.clone())],
+                max_width: 6.0,
+                want: vec![vec![("aa§", plain.clone())], vec![("aa", plain.clone())]],
+            },
+            // §l at end of span 0 does not leak into span 1
+            FormattedCase {
+                name: "section_does_not_leak_across_spans",
+                spans: vec![("a§l", plain.clone()), ("aa", plain.clone())],
+                max_width: 5.0,
+                want: vec![
+                    vec![("a§l", plain.clone())],
+                    vec![("a", plain.clone())],
+                    vec![("a", plain.clone())],
+                ],
+            },
+            // Leading space as first character of input and after newline
+            FormattedCase {
+                name: "leading_space_first_char",
+                spans: vec![(" aa", plain.clone())],
+                max_width: 6.0,
+                want: vec![vec![], vec![("aa", plain.clone())]],
+            },
+            FormattedCase {
+                name: "leading_space_after_newline",
+                spans: vec![("a\n aa", plain.clone())],
+                max_width: 6.0,
+                want: vec![
+                    vec![("a", plain.clone())],
+                    vec![],
+                    vec![("aa", plain.clone())],
+                ],
+            },
+            // Break immediately after a span boundary
+            FormattedCase {
+                name: "break_after_span_boundary",
+                spans: vec![("aa", plain.clone()), ("aa", plain.clone())],
+                max_width: 6.0,
+                want: vec![vec![("aa", plain.clone())], vec![("aa", plain.clone())]],
+            },
+            FormattedCase {
+                name: "space_at_span_boundary",
+                spans: vec![("aa", plain.clone()), (" a", plain.clone())],
+                max_width: 10.0,
+                want: vec![vec![("aa", plain.clone())], vec![("a", plain.clone())]],
+            },
+            // Bold (§l) toggle + §r reset across wrap boundaries on a colored span
+            FormattedCase {
+                name: "bold_and_reset_across_wraps",
+                spans: vec![("§laa aa§raa aa", red.clone())],
+                max_width: 8.0,
+                want: vec![
+                    vec![("§laa", red)],
+                    vec![("aa§r", red_bold)],
+                    vec![("aa", plain.clone())],
+                    vec![("aa", plain.clone())],
+                ],
+            },
+            // Bold (§l) cleared by color code (§a) across wrap boundaries
+            FormattedCase {
+                name: "bold_then_color_reset_across_wraps",
+                spans: vec![("§laa§aaa aa", plain.clone())],
+                max_width: 8.0,
+                want: vec![
+                    vec![("§laa§a", plain)],
+                    vec![("aa", green_unbold.clone())],
+                    vec![("aa", green_unbold)],
+                ],
+            },
+        ];
+
+        for case in &formatted_cases {
+            let text = spans_text(&case.spans);
+            let got: Vec<Vec<(String, Style)>> = font
+                .split_formatted(&text, case.max_width)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| (s.text.clone(), s.style.clone()))
+                        .collect()
+                })
+                .collect();
+            let expected: Vec<Vec<(String, Style)>> = case
+                .want
+                .iter()
+                .map(|line| {
+                    line.iter()
+                        .map(|(t, st)| ((*t).to_owned(), st.clone()))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(got, expected, "split_formatted case {}", case.name);
+        }
+
+        // 3. Multi-byte fit / fit_reverse and non-ASCII / bidi fallback verification.
+        assert_eq!(font.fit("", 10.0), 0);
+        assert_eq!(font.fit_reverse("", 10.0), 0);
+        assert_eq!(font.fit("aé中😀", 11.0), 3);
+        assert_eq!(font.fit_reverse("aé中😀", 10.0), 2);
+        assert_eq!(font.fit_reverse("aé中😀", 11.0), 2);
+        // RTL Hebrew with '(' between two RTL letters mirrors '(' (2.0) -> ')' (5.0):
+        // 'ב'(4) + ')'(5) + 'א'(3) = 12.0 (proves bidi fallback runs rather than ASCII/LTR skip).
+        assert_eq!(font.width("אב"), 7.0);
+        assert_eq!(font.width("§lאב"), 9.0);
+        assert_eq!(font.width("א(ב"), 12.0);
+        assert_eq!(font.width("§lא(ב"), 15.0);
+        assert_eq!(font.width("§lא§r(ב"), 13.0);
+        assert_eq!(font.width_text(&Text::literal("א(ב")), 12.0);
+        assert_eq!(font.width_text(&Text::literal("§lא(ב")), 15.0);
+        assert_eq!(font.width_drawn(&Text::literal("א(ב")), 12.0);
+    }
+
+    #[test]
+    fn font_set_glyphs_map_is_authoritative_for_ascii() {
+        let sheet = png(16, 8, |x, _| x < 2 || (8..11).contains(&x));
+        let def = br#"{"providers":[
+            {"type":"space","advances":{" ":4}},
+            {"type":"bitmap","file":"minecraft:font/ab.png","ascent":7,"chars":["AB"]}
+        ]}"#;
+        let root = root(
+            "ascii-glyphs-authoritative",
+            &[
+                ("assets/minecraft/font/default.json", def),
+                ("assets/minecraft/textures/font/ab.png", &sheet),
+            ],
+        );
+        let font = load(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Initial metrics: 'A' = 3.0, 'B' = 4.0, ' ' = 4.0 (offset = 1.0).
+        assert_eq!(font.width("A B"), 11.0);
+        assert_eq!(font.fit("ABB", 12.0), 3);
+
+        // Resolving ASCII glyphs populates FontSet::glyphs directly.
+        let default_idx = {
+            let cache = font.cache.borrow();
+            let idx = Font::set_index(&cache, DEFAULT).unwrap();
+            let set = &cache.sets[idx].1;
+            assert_eq!(set.glyphs.get(&'A').map(|g| g.advance), Some(3.0));
+            assert_eq!(set.glyphs.get(&'B').map(|g| g.advance), Some(4.0));
+            assert_eq!(set.glyphs.get(&' ').map(|g| g.advance), Some(4.0));
+            idx
+        };
+
+        // Native mod replaces 'A' directly in FontSet::glyphs with a custom glyph/advance.
+        let custom = Glyph {
+            rect: Some(Rect {
+                u0: 0.25,
+                v0: 0.25,
+                u1: 0.5,
+                v1: 0.5,
+                w: 9,
+                h: 11,
+            }),
+            left: 1.5,
+            top: -2.0,
+            right: 10.5,
+            bottom: 9.0,
+            advance: 13.0,
+            offset: 2.5,
+        };
+        font.cache.borrow_mut().sets[default_idx]
+            .1
+            .glyphs
+            .insert('A', custom);
+
+        // glyph_at and every public lookup/measurement/wrapping API immediately honor it.
+        let via_at = {
+            let mut cache = font.cache.borrow_mut();
+            font.glyph_at(&mut cache, default_idx, 'A')
+        };
+        assert_eq!(via_at.advance, 13.0);
+        assert_eq!(via_at.offset, 2.5);
+        assert_eq!(via_at.left, 1.5);
+        assert_eq!(via_at.top, -2.0);
+        assert_eq!(via_at.right, 10.5);
+        assert_eq!(via_at.bottom, 9.0);
+        assert_eq!(via_at.rect.map(|r| (r.w, r.h)), Some((9, 11)));
+        assert_eq!(font.glyph('A').advance, 13.0);
+        assert_eq!(font.glyph_styled('A', &Style::default()).advance, 13.0);
+        assert_eq!(font.glyph_in(DEFAULT, 'A').advance, 13.0);
+        assert_eq!(font.glyph_in("default", 'A').advance, 13.0);
+
+        let bold = Style {
+            bold: Some(true),
+            ..Style::default()
+        };
+        assert_eq!(font.advance('A', &Style::default()), 13.0);
+        assert_eq!(font.advance('A', &bold), 15.5);
+
+        // 'A'(13) + 'B'(4) = 17; bold 'A'(15.5) + bold 'B'(5) = 20.5 -> ceil 21.
+        assert_eq!(font.width("AB"), 17.0);
+        assert_eq!(font.width("§lAB"), 21.0);
+        assert_eq!(font.width_text(&Text::literal("AB")), 17.0);
+        assert_eq!(font.width_drawn(&Text::literal("AB")), 17.0);
+
+        // fit / fit_reverse reflect 'A' = 13.0 immediately.
+        assert_eq!(font.fit("ABB", 12.0), 0);
+        assert_eq!(font.fit("ABB", 13.0), 1);
+        assert_eq!(font.fit("ABB", 17.0), 2);
+        assert_eq!(font.fit_reverse("BBA", 12.0), 0);
+        assert_eq!(font.fit_reverse("BBA", 13.0), 1);
+        assert_eq!(font.fit_reverse("BBA", 17.0), 2);
+
+        // split_lines / split / split_formatted wrap because 'A'(13) + ' '(4) > 16.
+        let text = Text::literal("A B");
+        let lines: Vec<(String, bool)> = font
+            .split_lines(&text, 16.0)
+            .into_iter()
+            .map(|(line, wrapped)| (line.plain(), wrapped))
+            .collect();
+        assert_eq!(lines, vec![("A".to_owned(), false), ("B".to_owned(), true)]);
+        let split: Vec<String> = font
+            .split(&text, 16.0)
+            .into_iter()
+            .map(|line| line.plain())
+            .collect();
+        assert_eq!(split, vec!["A".to_owned(), "B".to_owned()]);
+        let split_fmt: Vec<String> = font
+            .split_formatted(&text, 16.0)
+            .into_iter()
+            .map(|line| line.plain())
+            .collect();
+        assert_eq!(split_fmt, vec!["A".to_owned(), "B".to_owned()]);
+
+        // Removing 'A' from FontSet::glyphs resolves it again from the providers.
+        font.cache.borrow_mut().sets[default_idx]
+            .1
+            .glyphs
+            .remove(&'A');
+        assert_eq!(font.width("AB"), 7.0);
+        assert_eq!(font.glyph('A').advance, 3.0);
+    }
+
+    #[test]
+    fn default_font_lookup_follows_live_cache_sets_order() {
+        let def = br#"{"providers":[{"type":"space","advances":{"a":3,"b":4,"\u00e9":3," ":4}}]}"#;
+        let alt = br#"{"providers":[{"type":"space","advances":{"a":9,"b":2,"\u00e9":9," ":4}}]}"#;
+        let root = root(
+            "live-cache-sets-order",
+            &[
+                ("assets/minecraft/font/default.json", def),
+                ("assets/minecraft/font/alt.json", alt),
+            ],
+        );
+        let font = load(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Warm default font at its initial index 0 ('a' = 3.0, 'b' = 4.0, 'é' = 3.0).
+        assert_eq!(font.width("ab"), 7.0);
+        assert_eq!(font.width("aé"), 6.0);
+        assert_eq!(font.glyph('a').advance, 3.0);
+        assert_eq!(font.fit("aa", 8.0), 2);
+
+        // 1. Reorder Cache::sets so minecraft:default moves away from index 0.
+        font.cache.borrow_mut().sets.reverse();
+        assert_ne!(font.cache.borrow().sets[0].0.as_str(), DEFAULT);
+        assert_eq!(font.glyph('a').advance, 3.0);
+        assert_eq!(font.glyph_styled('a', &Style::default()).advance, 3.0);
+        assert_eq!(font.glyph_in(DEFAULT, 'a').advance, 3.0);
+        assert_eq!(font.glyph_in("default", 'a').advance, 3.0);
+        assert_eq!(font.advance('a', &Style::default()), 3.0);
+        assert_eq!(font.width("ab"), 7.0);
+        assert_eq!(font.width("aé"), 6.0);
+        assert_eq!(font.width("§lab"), 9.0);
+        assert_eq!(font.width_text(&Text::literal("ab")), 7.0);
+        assert_eq!(font.width_drawn(&Text::literal("ab")), 7.0);
+        assert_eq!(font.fit("aa", 8.0), 2);
+        assert_eq!(font.fit_reverse("aa", 8.0), 2);
+        assert_eq!(font.fit("aé", 8.0), 2);
+        assert_eq!(font.fit_reverse("aé", 8.0), 2);
+        let kept_lines: Vec<(String, bool)> = font
+            .split_lines(&Text::literal("a b"), 12.0)
+            .into_iter()
+            .map(|(line, wrapped)| (line.plain(), wrapped))
+            .collect();
+        assert_eq!(kept_lines, vec![("a b".to_owned(), false)]);
+
+        // 2. Prepend a mod-supplied minecraft:default ahead of the original one:
+        //    lookup must follow live Cache::sets order (first matching entry wins).
+        let override_set = FontSet {
+            providers: vec![Provider::Space(HashMap::from([
+                ('a', 11.0),
+                ('b', 5.0),
+                ('é', 11.0),
+                (' ', 4.0),
+            ]))],
+            glyphs: Default::default(),
+            non_fishy: Default::default(),
+            by_width: None,
+        };
+        font.cache
+            .borrow_mut()
+            .sets
+            .insert(0, (DEFAULT.to_owned(), override_set));
+
+        assert_eq!(font.glyph('a').advance, 11.0);
+        assert_eq!(font.glyph_styled('a', &Style::default()).advance, 11.0);
+        assert_eq!(font.glyph_in(DEFAULT, 'a').advance, 11.0);
+        assert_eq!(font.glyph_in("default", 'a').advance, 11.0);
+        assert_eq!(font.advance('a', &Style::default()), 11.0);
+        assert_eq!(font.width("ab"), 16.0);
+        assert_eq!(font.width("aé"), 22.0);
+        assert_eq!(font.width("§lab"), 18.0);
+        assert_eq!(font.width_text(&Text::literal("ab")), 16.0);
+        assert_eq!(font.width_drawn(&Text::literal("ab")), 16.0);
+        assert_eq!(font.fit("aa", 15.0), 1);
+        assert_eq!(font.fit_reverse("aa", 15.0), 1);
+        assert_eq!(font.fit("aé", 15.0), 1);
+        assert_eq!(font.fit_reverse("aé", 15.0), 1);
+        let text = Text::literal("a b");
+        let wrapped_lines: Vec<(String, bool)> = font
+            .split_lines(&text, 14.0)
+            .into_iter()
+            .map(|(line, wrapped)| (line.plain(), wrapped))
+            .collect();
+        assert_eq!(
+            wrapped_lines,
+            vec![("a".to_owned(), false), ("b".to_owned(), true)]
+        );
+        let wrapped_split: Vec<String> = font
+            .split(&text, 14.0)
+            .into_iter()
+            .map(|line| line.plain())
+            .collect();
+        assert_eq!(wrapped_split, vec!["a".to_owned(), "b".to_owned()]);
+        let wrapped_fmt: Vec<String> = font
+            .split_formatted(&text, 14.0)
+            .into_iter()
+            .map(|line| line.plain())
+            .collect();
+        assert_eq!(wrapped_fmt, vec!["a".to_owned(), "b".to_owned()]);
+
+        // 3. Remove all minecraft:default entries: every default lookup falls back to missing (6.0).
+        font.cache.borrow_mut().sets.retain(|(id, _)| id != DEFAULT);
+        assert_eq!(font.glyph('a').advance, 6.0);
+        assert_eq!(font.advance('a', &Style::default()), 6.0);
+        assert_eq!(font.width("ab"), 12.0);
+        assert_eq!(font.width("aé"), 12.0);
+        assert_eq!(font.width("§lab"), 14.0);
+        assert_eq!(font.width_text(&Text::literal("ab")), 12.0);
+        assert_eq!(font.width_drawn(&Text::literal("ab")), 12.0);
+        assert_eq!(font.fit("aa", 11.0), 1);
+        assert_eq!(font.fit_reverse("aa", 11.0), 1);
+        assert_eq!(font.fit("aé", 11.0), 1);
+        assert_eq!(font.fit_reverse("aé", 11.0), 1);
     }
 }
