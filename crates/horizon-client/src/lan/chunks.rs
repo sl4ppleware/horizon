@@ -2,7 +2,10 @@
 //! (sections with their paletted containers, block entities and the sky and
 //! block DataLayers) and the section block-change batches.
 use crate::{
-    chunk::{Chunk, ColumnLayout, LevelShape, Light, Section},
+    chunk::{
+        Chunk, ColumnLayout, LevelShape, Light, Section, block_strategy, known_block_state,
+        shared_generation,
+    },
     containers::{BlockEntity, ModBlockEntity},
     fast_hash::FxHashMap,
     mobs::spawner::{SpawnDataExt, SpawnerExt},
@@ -10,7 +13,7 @@ use crate::{
 };
 use horizon_core::nbt::{Compound, Tag};
 use horizon_protocol::{
-    buf::{BitSet, Codec, List, Writer, check_network_nbt, set_bit},
+    buf::{BitSet, Codec, List, Writer, check_network_nbt, set_bit, write_varint},
     chunk::{
         BIOMES, BLOCKS, BlockEntityInfo, ChunkData, Heightmaps, LightData, Paletted, Strategy,
     },
@@ -133,10 +136,22 @@ pub struct ChunkEncoder {
     column: ColumnLayout,
     /// Whether the level has sky light (`DimensionType.hasSkyLight`).
     sky: bool,
+    /// Liveness token for single-player `DirectColumn` offers produced by this
+    /// encoder (`None` for detached encoders). Dropping the encoder sweeps its
+    /// unconsumed direct offers without touching any other live encoder.
+    direct_owner: Option<Arc<()>>,
+}
+
+impl Drop for ChunkEncoder {
+    fn drop(&mut self) {
+        if self.direct_owner.take().is_some() {
+            super::handoff::sweep_dead_direct();
+        }
+    }
 }
 
 /// Per-state flags and biome ids: all a section's encoding reads.
-struct SectionCoder {
+pub(super) struct SectionCoder {
     flags: Vec<u8>,
     /// Network biome id per internal biome index.
     biome_ids: Vec<i32>,
@@ -293,10 +308,126 @@ fn occupied(
 /// index order (y, then z, then x).
 type Entities = Arc<[(u16, u32)]>;
 
+/// Maximum retained capacity of TLS scratch buffers in [`SectionEncodeScratch`].
+const SCRATCH_BUF_MAX: usize = 64 * 1024;
+const SCRATCH_SLICE_MAX: usize = 4096;
+const SCRATCH_DENSE_MAX: usize = 65_536;
+
+/// Reusable per-thread scratch buffers for streaming [`SectionCoder::wire`].
+/// Eliminates per-section `ids: Vec<u32>`, `Paletted::data: Vec<i64>`, biome
+/// `Vec<i32>`, and intermediate `Writer` allocations while remaining strictly
+/// capacity-bounded.
+#[derive(Default)]
+struct SectionEncodeScratch {
+    buf: Vec<u8>,
+    entities: Vec<(u16, u32)>,
+    map: Vec<u32>,
+    uses: Vec<i16>,
+    palette: Vec<i32>,
+    dense: Vec<u32>,
+}
+
+impl SectionEncodeScratch {
+    fn reset(&mut self) {
+        self.buf.clear();
+        if self.buf.capacity() > SCRATCH_BUF_MAX {
+            self.buf.shrink_to(SCRATCH_BUF_MAX);
+        }
+        self.entities.clear();
+        if self.entities.capacity() > SCRATCH_SLICE_MAX {
+            self.entities.shrink_to(SCRATCH_SLICE_MAX);
+        }
+        self.map.clear();
+        if self.map.capacity() > SCRATCH_SLICE_MAX {
+            self.map.shrink_to(SCRATCH_SLICE_MAX);
+        }
+        self.uses.clear();
+        if self.uses.capacity() > SCRATCH_SLICE_MAX {
+            self.uses.shrink_to(SCRATCH_SLICE_MAX);
+        }
+        self.palette.clear();
+        if self.palette.capacity() > SCRATCH_SLICE_MAX {
+            self.palette.shrink_to(SCRATCH_SLICE_MAX);
+        }
+        if self.dense.capacity() > SCRATCH_DENSE_MAX {
+            self.dense.shrink_to(SCRATCH_DENSE_MAX);
+        }
+    }
+}
+
+thread_local! {
+    static SECTION_ENCODE_SCRATCH: std::cell::RefCell<SectionEncodeScratch> =
+        std::cell::RefCell::new(SectionEncodeScratch::default());
+}
+
+#[inline]
+fn needed_bits(palette_len: usize) -> u8 {
+    if palette_len <= 1 {
+        0
+    } else {
+        (usize::BITS - (palette_len - 1).leading_zeros()) as u8
+    }
+}
+
+#[inline]
+fn block_configuration(needed: u8, global_bits: u8) -> (bool, u8) {
+    match needed {
+        0 => (true, 0),
+        1..=4 => (true, 4),
+        5..=8 => (true, needed),
+        _ => (false, global_bits.max(needed)),
+    }
+}
+
+#[inline]
+fn biome_configuration(needed: u8, global_bits: u8) -> (bool, u8) {
+    match needed {
+        0 => (true, 0),
+        1..=3 => (true, needed),
+        _ => (false, global_bits.max(needed)),
+    }
+}
+
+/// Stream bit-packed 64-bit big-endian words directly into `out`, matching
+/// `Paletted::write` bit-for-bit without allocating a `Vec<i64>`.
+#[inline]
+fn write_packed_words<T>(out: &mut Vec<u8>, values: &[T], bits: u8, mut id: impl FnMut(&T) -> u64) {
+    debug_assert!(bits > 0 && bits <= 64);
+    let bits_usize = usize::from(bits);
+    let per = 64 / bits_usize;
+    out.reserve(values.len().div_ceil(per) * 8);
+    if bits == 4 {
+        let (full, rem) = values.as_chunks::<16>();
+        for chunk in full {
+            let mut word = 0u64;
+            for (k, v) in chunk.iter().enumerate() {
+                word |= id(v) << (k * 4);
+            }
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        if !rem.is_empty() {
+            let mut word = 0u64;
+            for (k, v) in rem.iter().enumerate() {
+                word |= id(v) << (k * 4);
+            }
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        return;
+    }
+    for chunk in values.chunks(per) {
+        let mut word = 0u64;
+        for (k, v) in chunk.iter().enumerate() {
+            word |= id(v) << (k * bits_usize);
+        }
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+}
+
 /// `Paletted::from_values`' palette (distinct values in first-seen order)
 /// and each entry's index in it, from a list palette's stored ids (`raw`
 /// indexes `list`), with how many entries use each stored id. A value the
 /// stored palette holds twice still gets one network index.
+#[cfg(test)]
 fn network_palette(list: &[u32], raw: &[u16]) -> (Vec<i32>, Vec<u32>, Vec<i16>) {
     let mut map = vec![u32::MAX; list.len()];
     let mut uses = vec![0i16; list.len()];
@@ -321,14 +452,256 @@ fn network_palette(list: &[u32], raw: &[u16]) -> (Vec<i32>, Vec<u32>, Vec<i16>) 
 }
 
 impl SectionCoder {
-    /// LevelChunkSection.write, and its block entity blocks.
-    fn wire(&self, section: &Section) -> (Arc<[u8]>, Entities) {
-        let (encoded, entities) = self.section(section);
-        let mut w = horizon_protocol::buf::Writer::new();
-        encoded.write(&mut w);
-        (w.data.into(), entities.into())
+    pub(super) fn biome_ids(&self) -> &[i32] {
+        &self.biome_ids
     }
 
+    /// LevelChunkSection.write, and its block entity blocks.
+    pub(super) fn wire(&self, section: &Section) -> (Arc<[u8]>, Entities) {
+        self.wire_with_entity_filter(section, |_, _| true)
+    }
+
+    /// Streaming `LevelChunkSection.write` directly into TLS scratch buffers,
+    /// retaining only block entity blocks satisfying `keep_entity`.
+    fn wire_with_entity_filter(
+        &self,
+        section: &Section,
+        mut keep_entity: impl FnMut(u16, u32) -> bool,
+    ) -> (Arc<[u8]>, Entities) {
+        SECTION_ENCODE_SCRATCH.with_borrow_mut(|scratch| {
+            scratch.reset();
+            self.encode_section_into(section, scratch, &mut keep_entity);
+            (
+                Arc::<[u8]>::from(scratch.buf.as_slice()),
+                Arc::<[(u16, u32)]>::from(scratch.entities.as_slice()),
+            )
+        })
+    }
+
+    fn encode_section_into(
+        &self,
+        section: &Section,
+        scratch: &mut SectionEncodeScratch,
+        keep_entity: &mut impl FnMut(u16, u32) -> bool,
+    ) {
+        let (mut non_empty, mut fluids) = (0i16, 0i16);
+        let mut count = |state: u32, n: i16| {
+            let f = self.flags.get(state as usize).copied().unwrap_or(0);
+            if f & NON_AIR != 0 {
+                non_empty += n;
+                if f & FLUID != 0 {
+                    fluids += n;
+                }
+            }
+            f & ENTITY != 0
+        };
+        let global_bits = block_strategy().global_bits;
+        let mut raw = [0u16; BLOCKS];
+        if let Some(v) = section.blocks.uniform() {
+            if count(v, BLOCKS as i16) {
+                scratch.entities.reserve(BLOCKS);
+                for i in 0..BLOCKS as u16 {
+                    if keep_entity(i, v) {
+                        scratch.entities.push((i, v));
+                    }
+                }
+            }
+            scratch.buf.extend_from_slice(&non_empty.to_be_bytes());
+            scratch.buf.extend_from_slice(&fluids.to_be_bytes());
+            scratch.buf.push(0);
+            write_varint(&mut scratch.buf, v as i32);
+        } else if let Some(list) = section.blocks.unpack_ids(&mut raw) {
+            let mut stack_map = [u32::MAX; 256];
+            let mut stack_uses = [0i16; 256];
+            let (map, uses): (&mut [u32], &mut [i16]) = if list.len() <= stack_map.len() {
+                (&mut stack_map[..list.len()], &mut stack_uses[..list.len()])
+            } else {
+                scratch.map.resize(list.len(), u32::MAX);
+                scratch.uses.resize(list.len(), 0);
+                (&mut scratch.map, &mut scratch.uses)
+            };
+            let palette = &mut scratch.palette;
+            for &r in &raw {
+                let r = usize::from(r);
+                uses[r] += 1;
+                if map[r] == u32::MAX {
+                    let v = list[r] as i32;
+                    map[r] = match palette.iter().position(|&p| p == v) {
+                        Some(i) => i as u32,
+                        None => {
+                            palette.push(v);
+                            palette.len() as u32 - 1
+                        }
+                    };
+                }
+            }
+            let mut any_entity = false;
+            for (&v, &n) in list.iter().zip(uses.iter()) {
+                if n > 0 {
+                    any_entity |= count(v, n);
+                }
+            }
+            if any_entity {
+                for (i, &r) in raw.iter().enumerate() {
+                    let v = list[usize::from(r)];
+                    if self.flags.get(v as usize).copied().unwrap_or(0) & ENTITY != 0
+                        && keep_entity(i as u16, v)
+                    {
+                        scratch.entities.push((i as u16, v));
+                    }
+                }
+            }
+            scratch.buf.extend_from_slice(&non_empty.to_be_bytes());
+            scratch.buf.extend_from_slice(&fluids.to_be_bytes());
+            let needed = needed_bits(palette.len());
+            let (has_palette, bits) = block_configuration(needed, global_bits);
+            scratch.buf.push(bits);
+            if bits == 0 {
+                write_varint(&mut scratch.buf, palette.first().copied().unwrap_or(0));
+            } else if has_palette {
+                write_varint(&mut scratch.buf, palette.len() as i32);
+                for &p in &*palette {
+                    write_varint(&mut scratch.buf, p);
+                }
+                write_packed_words(&mut scratch.buf, &raw, bits, |&r| {
+                    u64::from(map[usize::from(r)])
+                });
+            } else {
+                write_packed_words(&mut scratch.buf, &raw, bits, |&r| {
+                    (list[usize::from(r)] as i32) as u64
+                });
+            }
+        } else {
+            let mut unpacked = [0u32; BLOCKS];
+            section.unpack(&mut unpacked);
+            let max_v = unpacked.iter().copied().max().unwrap_or(0);
+            if (max_v as usize) < SCRATCH_DENSE_MAX {
+                let needed_len = max_v as usize + 1;
+                if scratch.dense.len() < needed_len {
+                    scratch
+                        .dense
+                        .reserve_exact(needed_len - scratch.dense.len());
+                    scratch.dense.resize(needed_len, u32::MAX);
+                }
+                for (i, &v) in unpacked.iter().enumerate() {
+                    if count(v, 1) && keep_entity(i as u16, v) {
+                        scratch.entities.push((i as u16, v));
+                    }
+                    let slot = &mut scratch.dense[v as usize];
+                    if *slot == u32::MAX {
+                        *slot = scratch.palette.len() as u32;
+                        scratch.palette.push(v as i32);
+                    }
+                }
+                scratch.buf.extend_from_slice(&non_empty.to_be_bytes());
+                scratch.buf.extend_from_slice(&fluids.to_be_bytes());
+                let needed = needed_bits(scratch.palette.len());
+                let (has_palette, bits) = block_configuration(needed, global_bits);
+                scratch.buf.push(bits);
+                if bits == 0 {
+                    write_varint(
+                        &mut scratch.buf,
+                        scratch.palette.first().copied().unwrap_or(0),
+                    );
+                } else if has_palette {
+                    write_varint(&mut scratch.buf, scratch.palette.len() as i32);
+                    for &p in &scratch.palette {
+                        write_varint(&mut scratch.buf, p);
+                    }
+                    write_packed_words(&mut scratch.buf, &unpacked, bits, |&v| {
+                        u64::from(scratch.dense[v as usize])
+                    });
+                } else {
+                    write_packed_words(&mut scratch.buf, &unpacked, bits, |&v| (v as i32) as u64);
+                }
+                for &p in &scratch.palette {
+                    scratch.dense[p as u32 as usize] = u32::MAX;
+                }
+            } else {
+                let mut lookup: FxHashMap<u32, u32> = FxHashMap::default();
+                for (i, &v) in unpacked.iter().enumerate() {
+                    if count(v, 1) && keep_entity(i as u16, v) {
+                        scratch.entities.push((i as u16, v));
+                    }
+                    lookup.entry(v).or_insert_with(|| {
+                        let id = scratch.palette.len() as u32;
+                        scratch.palette.push(v as i32);
+                        id
+                    });
+                }
+                scratch.buf.extend_from_slice(&non_empty.to_be_bytes());
+                scratch.buf.extend_from_slice(&fluids.to_be_bytes());
+                let needed = needed_bits(scratch.palette.len());
+                let (has_palette, bits) = block_configuration(needed, global_bits);
+                scratch.buf.push(bits);
+                if bits == 0 {
+                    write_varint(
+                        &mut scratch.buf,
+                        scratch.palette.first().copied().unwrap_or(0),
+                    );
+                } else if has_palette {
+                    write_varint(&mut scratch.buf, scratch.palette.len() as i32);
+                    for &p in &scratch.palette {
+                        write_varint(&mut scratch.buf, p);
+                    }
+                    write_packed_words(&mut scratch.buf, &unpacked, bits, |&v| {
+                        u64::from(lookup[&v])
+                    });
+                } else {
+                    write_packed_words(&mut scratch.buf, &unpacked, bits, |&v| (v as i32) as u64);
+                }
+            }
+        }
+        self.write_biomes_into(section, &mut scratch.buf);
+    }
+
+    fn write_biomes_into(&self, section: &Section, out: &mut Vec<u8>) {
+        let net = |v: u32| {
+            self.biome_ids
+                .get(usize::from(v as u16))
+                .copied()
+                .unwrap_or(self.biome_fallback)
+        };
+        if let Some(v) = section.biomes.uniform() {
+            out.push(0);
+            write_varint(out, net(v));
+            return;
+        }
+        let mut values = [0i32; BIOMES];
+        let mut palette = [0i32; BIOMES];
+        let mut ids = [0u8; BIOMES];
+        let mut palette_len = 0usize;
+        for (j, slot) in values.iter_mut().enumerate() {
+            let v = net(section.biomes.get(j));
+            *slot = v;
+            let id = match palette[..palette_len].iter().position(|&p| p == v) {
+                Some(i) => i,
+                None => {
+                    let i = palette_len;
+                    palette[i] = v;
+                    palette_len += 1;
+                    i
+                }
+            };
+            ids[j] = id as u8;
+        }
+        let needed = needed_bits(palette_len);
+        let (has_palette, bits) = biome_configuration(needed, self.biome_bits);
+        out.push(bits);
+        if bits == 0 {
+            write_varint(out, palette[0]);
+        } else if has_palette {
+            write_varint(out, palette_len as i32);
+            for &p in &palette[..palette_len] {
+                write_varint(out, p);
+            }
+            write_packed_words(out, &ids, bits, |&id| u64::from(id));
+        } else {
+            write_packed_words(out, &values, bits, |&v| v as u64);
+        }
+    }
+
+    #[cfg(test)]
     fn section(&self, section: &Section) -> (horizon_protocol::chunk::Section, Vec<(u16, u32)>) {
         let (mut non_empty, mut fluids, mut entities) = (0i16, 0i16, Vec::new());
         let mut count = |state: u32, n: i16| {
@@ -341,7 +714,7 @@ impl SectionCoder {
             }
             f & ENTITY != 0
         };
-        let global_bits = crate::chunk::block_strategy().global_bits;
+        let global_bits = block_strategy().global_bits;
         // One block everywhere (all air, mostly): what from_values would give.
         let uniform = section.blocks.uniform();
         let mut raw = [0u16; BLOCKS];
@@ -412,7 +785,7 @@ impl SectionCoder {
                 data: Vec::new(),
             };
         }
-        let values: Vec<i32> = (0..BIOMES).map(|j| net(section.biomes.get(j))).collect();
+        let values: [i32; BIOMES] = std::array::from_fn(|j| net(section.biomes.get(j)));
         Paletted::from_values(&values, Strategy::Biomes, self.biome_bits)
     }
 }
@@ -569,12 +942,10 @@ impl TerrainEncoder {
                     biomes: section.biomes.clone(),
                     light: Light::Uniform(0),
                 };
-                let (encoded, mut entities) = self.coder.section(&section);
                 // Even a replacement that has the same entity kind must not expose the original tag.
-                entities.retain(|&(i, state)| original[usize::from(i)] == state);
-                let mut writer = Writer::new();
-                encoded.write(&mut writer);
-                Some((writer.data.into(), entities.into()))
+                Some(self.coder.wire_with_entity_filter(&section, |i, state| {
+                    original[usize::from(i)] == state
+                }))
             })
             .collect();
         TerrainWires(wires)
@@ -996,6 +1367,7 @@ impl ChunkEncoder {
             sections: 0..ColumnLayout::VANILLA.sections(),
             column: ColumnLayout::VANILLA,
             sky: true,
+            direct_owner: Some(Arc::new(())),
         }
     }
 
@@ -1403,6 +1775,7 @@ impl ChunkEncoder {
             sections: self.sections.clone(),
             column: self.column,
             sky: self.sky,
+            direct_owner: None,
         }
     }
     /// The body of a column read from the save that no level holds: its own block entities, and every
@@ -1754,6 +2127,302 @@ impl ChunkEncoder {
             SectionLight::of,
         )
     }
+
+    /// Build a [`super::handoff::DirectColumn`] for direct single-player handoff
+    /// when this chunk's blocks, biomes, and light are provably bit-identical
+    /// to wire encode -> wire decode under an identity client `ChunkFormat`.
+    pub fn direct_column(
+        &self,
+        chunk: &Chunk,
+        world: &crate::world::World,
+        protos: &dyn Fn(i32, i32) -> Option<SectionMask>,
+    ) -> Option<super::handoff::DirectColumn> {
+        let owner = self.direct_owner.as_ref()?;
+        if chunk.layout() != self.column
+            || self.sections.is_empty()
+            || self.sections.end > chunk.sections.len()
+        {
+            return None;
+        }
+        let full_column = self.sections.start == 0 && self.sections.end == chunk.sections.len();
+        if !full_column && self.sky {
+            return None;
+        }
+        let biome_limit = self.coder.biome_ids.len();
+        if biome_limit == 0 {
+            return None;
+        }
+        let ours = block_strategy();
+        let max_valid = 1u64 << ours.global_bits.min(32);
+        let unknown_block = |id: u32| !known_block_state(id) || u64::from(id) >= max_valid;
+        let level_sections = &chunk.sections[self.sections.clone()];
+        for s in level_sections {
+            if s.blocks.strategy().global_bits != ours.global_bits {
+                return None;
+            }
+            let any_unknown = if s.blocks.is_global() {
+                s.blocks.has(unknown_block)
+            } else {
+                s.blocks.maybe_has(unknown_block)
+            };
+            if any_unknown {
+                return None;
+            }
+            let any_out_of_range_biome = if s.biomes.is_global() {
+                s.biomes.has(|v| usize::from(v as u16) >= biome_limit)
+            } else {
+                s.biomes.maybe_has(|v| usize::from(v as u16) >= biome_limit)
+            };
+            if any_out_of_range_biome {
+                return None;
+            }
+        }
+        let around = self.around(chunk, world, protos);
+        if !direct_light_matches(level_sections, around, self.sky) {
+            return None;
+        }
+        Some(super::handoff::DirectColumn::new(
+            chunk.x,
+            chunk.z,
+            self.column,
+            chunk.sections.clone(),
+            shared_generation(),
+            Arc::downgrade(owner),
+            DirectWire {
+                coder: self.coder.clone(),
+                tables: self.tables.clone(),
+                section_range: self.sections.clone(),
+                column: self.column,
+                around,
+                sky: self.sky,
+            },
+        ))
+    }
+
+    /// Collect the chunk's `BlockEntityInfo`s in exact `encode_blocks` /
+    /// `LevelChunk.getBlockEntities()` order without wire-encoding any section.
+    /// Sections whose palette contains no block-entity states are skipped in O(palette).
+    pub(super) fn block_entities_of(
+        &self,
+        chunk: &Chunk,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+    ) -> Vec<BlockEntityInfo> {
+        let mut entity_infos = Vec::new();
+        let mut raw = [0u16; BLOCKS];
+        let flags = &self.coder.flags;
+        let has_entity = |state: u32| flags.get(state as usize).copied().unwrap_or(0) & ENTITY != 0;
+        for (i, s) in chunk
+            .sections
+            .iter()
+            .enumerate()
+            .skip(self.sections.start)
+            .take(self.sections.len())
+        {
+            if !s.blocks.is_global() && !s.blocks.maybe_has(has_entity) {
+                continue;
+            }
+            if let Some(v) = s.blocks.uniform() {
+                if has_entity(v) {
+                    for index in 0..BLOCKS as u16 {
+                        if let Some(info) =
+                            self.chunk_entity_info(chunk, block_entities, i, index, v)
+                        {
+                            entity_infos.push(info);
+                        }
+                    }
+                }
+            } else if let Some(list) = s.blocks.unpack_ids(&mut raw) {
+                for (index, &r) in raw.iter().enumerate() {
+                    let v = list[usize::from(r)];
+                    if has_entity(v)
+                        && let Some(info) =
+                            self.chunk_entity_info(chunk, block_entities, i, index as u16, v)
+                    {
+                        entity_infos.push(info);
+                    }
+                }
+            } else {
+                let mut unpacked = [0u32; BLOCKS];
+                s.unpack(&mut unpacked);
+                for (index, &v) in unpacked.iter().enumerate() {
+                    if has_entity(v)
+                        && let Some(info) =
+                            self.chunk_entity_info(chunk, block_entities, i, index as u16, v)
+                    {
+                        entity_infos.push(info);
+                    }
+                }
+            }
+        }
+        Self::order_chunk_entities(chunk, &mut entity_infos);
+        entity_infos
+    }
+
+    /// Minimal `LevelChunkWithLight` wire body carrying `(x, z, block_entities)`
+    /// and a direct-handoff `token` in heightmap sentinel [`super::handoff::DIRECT_HEIGHTMAP_KIND`]
+    /// with an empty section buffer and empty light data.
+    pub fn direct_stub_body(
+        &self,
+        chunk: &Chunk,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        token: u64,
+    ) -> Vec<u8> {
+        let entity_infos = self.block_entities_of(chunk, block_entities);
+        let mut w = Writer::new();
+        w.varint(horizon_protocol::ids::play::clientbound::LEVEL_CHUNK_WITH_LIGHT);
+        w.i32(chunk.x);
+        w.i32(chunk.z);
+        // Single sentinel heightmap entry carrying the direct handoff token.
+        w.varint(1);
+        w.varint(super::handoff::DIRECT_HEIGHTMAP_KIND);
+        w.varint(1);
+        w.i64(token as i64);
+        // Empty section buffer signals direct handoff.
+        w.varint(0);
+        List::<BlockEntityInfo>::write(&entity_infos, &mut w);
+        // Empty LightData: 4 empty BitSets + 2 empty DataLayer lists.
+        w.bytes(&[0, 0, 0, 0, 0, 0]);
+        w.data
+    }
+}
+
+/// Metadata kept on a [`super::handoff::DirectColumn`] so that any mid-flight
+/// recorder start or client `ChunkFormat` mismatch can lazily materialize the
+/// exact full `LevelChunkWithLight` wire bytes without dropping the column.
+#[derive(Clone)]
+pub(super) struct DirectWire {
+    coder: Arc<SectionCoder>,
+    tables: Option<Arc<crate::save::SaveTables>>,
+    section_range: std::ops::Range<usize>,
+    column: ColumnLayout,
+    around: SectionMask,
+    sky: bool,
+}
+
+impl DirectWire {
+    pub(super) fn level_min_y(&self) -> i32 {
+        self.column.section_y(self.section_range.start)
+    }
+
+    pub(super) fn level_sections(&self) -> usize {
+        self.section_range.len()
+    }
+
+    pub(super) fn has_skylight(&self) -> bool {
+        self.sky
+    }
+
+    pub(super) fn biomes_identity(&self, biome_map: &[u16]) -> bool {
+        let ids = self.coder.biome_ids();
+        !ids.is_empty()
+            && ids.iter().enumerate().all(|(internal, &net)| {
+                usize::try_from(net)
+                    .ok()
+                    .and_then(|n| biome_map.get(n))
+                    .is_some_and(|&mapped| usize::from(mapped) == internal)
+            })
+    }
+
+    pub(super) fn materialize_packet(
+        &self,
+        x: i32,
+        z: i32,
+        sections: &[Arc<Section>],
+        block_entities: &[BlockEntityInfo],
+    ) -> LevelChunkWithLight {
+        let level_min_y = self.level_min_y();
+        let level_height = 16 * self.section_range.len() as i32;
+        let heightmaps = self
+            .tables
+            .as_ref()
+            .map(|tables| {
+                crate::save::client_heightmaps_in(
+                    sections,
+                    self.column.min_y(),
+                    tables,
+                    level_min_y,
+                    level_height,
+                )
+            })
+            .unwrap_or_default();
+        let mut buffer = Vec::new();
+        for s in &sections[self.section_range.clone()] {
+            let (wire, _) = self.coder.wire(s);
+            buffer.extend_from_slice(&wire);
+        }
+        let lights = light_sections(
+            &sections[self.section_range.clone()],
+            self.around,
+            SectionLight::of,
+        );
+        let light = light_data_of(&lights, self.sky);
+        LevelChunkWithLight {
+            x,
+            z,
+            chunk: ChunkData {
+                heightmaps,
+                buffer,
+                block_entities: block_entities.to_vec(),
+            },
+            light,
+        }
+    }
+
+    /// Materialize both the decoded `LevelChunkWithLight` and its serialized
+    /// body payload (without the leading packet id varint) for `PacketRecorder`.
+    pub(super) fn materialize_payload(
+        &self,
+        x: i32,
+        z: i32,
+        sections: &[Arc<Section>],
+        block_entities: &[BlockEntityInfo],
+    ) -> (LevelChunkWithLight, Vec<u8>) {
+        let packet = self.materialize_packet(x, z, sections, block_entities);
+        let mut w = Writer::new();
+        LevelChunkWithLight::write(&packet, &mut w);
+        (packet, w.data)
+    }
+}
+
+/// Proves that adopting `sections`'s existing `Light` directly produces the
+/// exact same light per section as `write_light` followed by `decode_light_into`.
+fn direct_light_matches(sections: &[Arc<Section>], around: SectionMask, sky: bool) -> bool {
+    let n = sections.len();
+    if n == 0 {
+        return false;
+    }
+    let exists =
+        |idx: usize| (idx.saturating_sub(1)..=(idx + 1).min(n - 1)).any(|k| around.contains(k));
+    if !sky {
+        for (idx, s) in sections.iter().enumerate() {
+            if s.light.any(0xF0) {
+                return false;
+            }
+            if !exists(idx) && !matches!(s.light, Light::Uniform(0)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    let mut above_uniform = Some(15u8);
+    for (idx, section) in sections.iter().enumerate().rev() {
+        let light = &section.light;
+        if exists(idx) {
+            above_uniform = match light {
+                Light::Uniform(v) => Some(v >> 4),
+                Light::Block(_, s) => Some(*s),
+                Light::Sky(..) | Light::Full(..) => None,
+            };
+        } else {
+            let Some(expected_sky) = above_uniform else {
+                return false;
+            };
+            if !matches!(light, Light::Uniform(v) if *v == expected_sky << 4) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The order LevelChunk.getBlockEntities() iterates in: a fastutil
@@ -3179,6 +3848,341 @@ mod tests {
                 .unwrap()
                 .values()
                 .all(|e| e.wire.is_none())
+        );
+    }
+
+    #[test]
+    fn streaming_section_wire_matches_reference_across_all_palettes_and_biomes() {
+        use horizon_core::paletted::PalettedContainer;
+
+        let builtin = Builtin::parse(
+            r#"{"minecraft:block_entity_type": {"entries": {
+                "minecraft:chest": {"protocol_id": 1},
+                "minecraft:sign": {"protocol_id": 7}}}}"#,
+        )
+        .unwrap();
+        // Build enough distinct block states (air, water, chest, sign, and >600
+        // solid states) plus 20 biomes in non-alphabetical order.
+        let mut states: Vec<(Arc<str>, bool)> = vec![
+            (Arc::from("minecraft:air"), false),
+            (Arc::from("minecraft:water"), true),
+            (Arc::from("minecraft:chest"), false),
+            (Arc::from("minecraft:oak_sign"), false),
+        ];
+        for i in 4..640 {
+            states.push((Arc::from(format!("minecraft:stone_{i}")), false));
+        }
+        let biome_names: Vec<String> = (0..20).map(|i| format!("minecraft:biome_{i:02}")).collect();
+        let mut biome_registry = biome_names.clone();
+        biome_registry.reverse();
+        let encoder = ChunkEncoder::new(states, &builtin, &biome_names, &biome_registry);
+
+        let assert_section_matches = |label: &str, section: &Section| {
+            let (ref_sec, ref_entities) = encoder.coder.section(section);
+            let mut ref_writer = Writer::new();
+            ref_sec.write(&mut ref_writer);
+            let (got_bytes, got_entities) = encoder.coder.wire(section);
+            assert_eq!(
+                got_bytes.as_ref(),
+                ref_writer.data.as_slice(),
+                "wire bytes mismatch for {label}"
+            );
+            assert_eq!(
+                got_entities.as_ref(),
+                ref_entities.as_slice(),
+                "entity list mismatch for {label}"
+            );
+        };
+
+        // 1. Uniform sections: air, fluid, block-entity (all 4096 entities), and solid.
+        for (label, state) in [
+            ("uniform_air", 0u32),
+            ("uniform_water", 1),
+            ("uniform_chest", 2),
+            ("uniform_stone", 5),
+        ] {
+            let section = Section {
+                blocks: PalettedContainer::new(block_strategy(), state),
+                biomes: PalettedContainer::new(crate::chunk::BIOME_STRATEGY, 3),
+                light: Light::Uniform(0xF0),
+            };
+            assert_section_matches(label, &section);
+        }
+
+        // 2. Indirect list palettes across 4-, 5-, 6-, 7-, and 8-bit boundaries
+        //    (including block entities and fluids).
+        for distinct in [2usize, 3, 15, 16, 17, 32, 33, 64, 65, 128, 129, 256] {
+            let mut blocks = PalettedContainer::new(block_strategy(), 0);
+            for i in 0..BLOCKS {
+                blocks.set(i, (i % distinct) as u32);
+            }
+            let mut biomes = PalettedContainer::new(crate::chunk::BIOME_STRATEGY, 0);
+            let biome_count = (distinct % 12).max(1);
+            for j in 0..BIOMES {
+                biomes.set(j, (j % biome_count) as u32);
+            }
+            let section = Section {
+                blocks,
+                biomes,
+                light: Light::Uniform(0xF0),
+            };
+            assert_section_matches(&format!("list_{distinct}"), &section);
+        }
+
+        // 3. List palette with duplicate values and unused stale entries.
+        let mut stale_blocks = PalettedContainer::from_packed(
+            block_strategy(),
+            vec![10, 2, 10, 99, 1],
+            Some(&[0u64; 256]),
+        )
+        .unwrap();
+        stale_blocks.set(17, 2);
+        stale_blocks.set(500, 1);
+        stale_blocks.set(4095, 10);
+        // Biomes where two unknown internal indices collapse onto the single fallback.
+        let mut fallback_biomes = PalettedContainer::new(crate::chunk::BIOME_STRATEGY, 90);
+        fallback_biomes.set(5, 91);
+        let section = Section {
+            blocks: stale_blocks,
+            biomes: fallback_biomes,
+            light: Light::Uniform(0xF0),
+        };
+        assert_section_matches("stale_list_and_fallback_biome", &section);
+
+        // 4. Global block palettes: >256 distinct states, shrunk global down to
+        //    indirect (10 states) and uniform (1 state), and high ids >= SCRATCH_DENSE_MAX
+        //    exercising the FxHashMap fallback path.
+        for distinct in [257usize, 300, 600] {
+            let mut blocks = PalettedContainer::new(block_strategy(), 0);
+            for i in 0..BLOCKS {
+                blocks.set(i, (i % distinct) as u32);
+            }
+            assert!(blocks.is_global());
+            let mut biomes = PalettedContainer::new(crate::chunk::BIOME_STRATEGY, 0);
+            for j in 0..BIOMES {
+                biomes.set(j, (j % 20) as u32);
+            }
+            let section = Section {
+                blocks,
+                biomes,
+                light: Light::Uniform(0xF0),
+            };
+            assert_section_matches(&format!("global_{distinct}"), &section);
+        }
+
+        // Global container overwritten down to 10 distinct states (indirect on wire).
+        let mut shrunk_10 = PalettedContainer::new(block_strategy(), 0);
+        for i in 0..300 {
+            shrunk_10.set(i, i as u32);
+        }
+        assert!(shrunk_10.is_global());
+        for i in 0..BLOCKS {
+            shrunk_10.set(i, (i % 10) as u32);
+        }
+        assert_section_matches(
+            "shrunk_global_10",
+            &Section {
+                blocks: shrunk_10,
+                biomes: PalettedContainer::new(crate::chunk::BIOME_STRATEGY, 2),
+                light: Light::Uniform(0xF0),
+            },
+        );
+
+        // Global container overwritten down to 1 state (uniform on wire).
+        let mut shrunk_1 = PalettedContainer::new(block_strategy(), 0);
+        for i in 0..300 {
+            shrunk_1.set(i, i as u32);
+        }
+        for i in 0..BLOCKS {
+            shrunk_1.set(i, 3);
+        }
+        assert_section_matches(
+            "shrunk_global_1",
+            &Section {
+                blocks: shrunk_1,
+                biomes: PalettedContainer::new(crate::chunk::BIOME_STRATEGY, 2),
+                light: Light::Uniform(0xF0),
+            },
+        );
+
+        // Global container with ids >= SCRATCH_DENSE_MAX (FxHashMap fallback path).
+        let wide_strategy = horizon_core::paletted::Strategy::blocks(17);
+        let mut high_blocks = PalettedContainer::new(wide_strategy, 0);
+        for i in 0..300 {
+            high_blocks.set(i, 70_000 + i as u32);
+        }
+        assert!(high_blocks.is_global());
+        assert_section_matches(
+            "global_high_ids_hashmap",
+            &Section {
+                blocks: high_blocks,
+                biomes: PalettedContainer::new(crate::chunk::BIOME_STRATEGY, 1),
+                light: Light::Uniform(0xF0),
+            },
+        );
+
+        // 5. Filtered entities (used by TerrainEncoder) keep only matching slots.
+        let mut chest_blocks = PalettedContainer::new(block_strategy(), 0);
+        chest_blocks.set(1, 2);
+        chest_blocks.set(2, 3);
+        chest_blocks.set(3, 2);
+        let chest_sec = Section {
+            blocks: chest_blocks,
+            biomes: PalettedContainer::new(crate::chunk::BIOME_STRATEGY, 0),
+            light: Light::Uniform(0xF0),
+        };
+        let (bytes_all, entities_all) = encoder.coder.wire(&chest_sec);
+        let (bytes_filtered, entities_filtered) = encoder
+            .coder
+            .wire_with_entity_filter(&chest_sec, |i, state| i != 1 && state == 2);
+        assert_eq!(bytes_filtered, bytes_all);
+        assert_eq!(entities_all.as_ref(), &[(1, 2), (2, 3), (3, 2)]);
+        assert_eq!(entities_filtered.as_ref(), &[(3, 2)]);
+    }
+
+    #[test]
+    fn direct_column_block_entities_stub_and_materialization_match_wire() {
+        let builtin = Builtin::parse(
+            r#"{"minecraft:block_entity_type": {"entries": {
+                "minecraft:chest": {"protocol_id": 1},
+                "minecraft:sign": {"protocol_id": 7}}}}"#,
+        )
+        .unwrap();
+        let mut states: Vec<(Arc<str>, bool)> = vec![
+            (Arc::from("minecraft:air"), false),
+            (Arc::from("minecraft:stone"), false),
+            (Arc::from("minecraft:chest"), false),
+            (Arc::from("minecraft:oak_sign"), false),
+        ];
+        for i in 4..320 {
+            states.push((Arc::from(format!("minecraft:block_{i}")), false));
+        }
+        let biome_names = [
+            "minecraft:plains".to_string(),
+            "minecraft:desert".to_string(),
+            "minecraft:forest".to_string(),
+        ];
+        let biome_registry = [
+            "minecraft:desert".to_string(),
+            "minecraft:forest".to_string(),
+            "minecraft:plains".to_string(),
+        ];
+        let mut encoder = ChunkEncoder::new(states, &builtin, &biome_names, &biome_registry);
+        let mut world = crate::world::World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut chunk = Chunk::empty(4, -5);
+        // List section with chest & sign.
+        chunk.set(2, MIN_Y + 5, 3, 2);
+        chunk.set(7, MIN_Y + 5, 11, 3);
+        // Global section (>256 states) also containing a chest.
+        for i in 0..270 {
+            let x = i & 15;
+            let z = (i >> 4) & 15;
+            let y = i >> 8;
+            chunk.set(x, MIN_Y + 32 + y, z, (i as u32) + 1);
+        }
+        // Uniform block-entity section? Keep one small stone section + biomes.
+        Arc::make_mut(&mut chunk.sections[0]).biomes.set(0, 1);
+        Arc::make_mut(&mut chunk.sections[0]).biomes.set(7, 2);
+        // Lit Overworld sections: 0..4 have light, 4..24 uniform sky 0xF0.
+        Arc::make_mut(&mut chunk.sections[0]).light = Light::Uniform(0xA4);
+        Arc::make_mut(&mut chunk.sections[2]).light =
+            Light::packed(Box::new(std::array::from_fn(|i| {
+                if i.is_multiple_of(5) { 0xE3 } else { 0xC1 }
+            })));
+        chunk.lit = true;
+        world.chunks.insert((4, -5), Arc::new(chunk));
+        let col = &*world.chunks[&(4, -5)];
+
+        // 1. `block_entities_of` matches full `encode` bit-for-bit.
+        let wire_pkt = encoder.encode(col, &world.block_entities);
+        assert_eq!(
+            encoder.block_entities_of(col, &world.block_entities),
+            wire_pkt.chunk.block_entities
+        );
+
+        // 2. `direct_column` accepts valid Overworld column, builds a tiny
+        //    stub that decodes cleanly with `direct_token == Some(token)`,
+        //    and lazy materialization matches `encoder.body_in` byte-for-byte.
+        let direct = encoder
+            .direct_column(col, &world, &|_, _| None)
+            .expect("valid lit Overworld column is direct-eligible");
+        let token = 0x1234_5678_9ABC_DEF0u64;
+        let stub_body = encoder.direct_stub_body(col, &world.block_entities, token);
+        let full_body = encoder.body_in(col, &world);
+        assert!(
+            stub_body.len() * 8 < full_body.len(),
+            "stub ({} B) should be drastically smaller than full wire ({} B)",
+            stub_body.len(),
+            full_body.len()
+        );
+        let mut reader = horizon_protocol::buf::Reader::new(&stub_body);
+        let stub_id = reader.varint().unwrap();
+        let play::Clientbound::LevelChunkWithLight(stub_pkt) =
+            play::Clientbound::decode(stub_id, reader.rest()).unwrap()
+        else {
+            panic!("stub did not decode as LevelChunkWithLight");
+        };
+        assert!(stub_pkt.chunk.buffer.is_empty());
+        assert_eq!(super::super::handoff::direct_token(&stub_pkt), Some(token));
+        assert_eq!(stub_pkt.chunk.block_entities, wire_pkt.chunk.block_entities);
+
+        let mut full_reader = horizon_protocol::buf::Reader::new(&full_body);
+        let full_id = full_reader.varint().unwrap();
+        assert_eq!(full_id, stub_id);
+        let mat_pkt = direct.materialize_packet(&stub_pkt.chunk.block_entities);
+        let mut mat_writer = Writer::new();
+        LevelChunkWithLight::write(&mat_pkt, &mut mat_writer);
+        assert_eq!(mat_writer.data.as_slice(), full_reader.rest());
+
+        // 3. Rejects out-of-range biome placeholder.
+        let mut bad_biome = col.clone();
+        Arc::make_mut(&mut bad_biome.sections[0]).biomes.set(0, 99);
+        assert!(
+            encoder
+                .direct_column(&bad_biome, &world, &|_, _| None)
+                .is_none()
+        );
+
+        // 4. Rejects synthetic mismatched light in an omitted air section.
+        let mut bad_light = col.clone();
+        Arc::make_mut(&mut bad_light.sections[20]).light = Light::Uniform(0x00);
+        assert!(
+            encoder
+                .direct_column(&bad_light, &world, &|_, _| None)
+                .is_none()
+        );
+
+        // 5. Detached encoder has no owner and declines direct handoff.
+        assert!(
+            encoder
+                .detached()
+                .direct_column(col, &world, &|_, _| None)
+                .is_none()
+        );
+
+        // 6. Nether partial-column (`min_y = 0, height = 256, sky = false`) is
+        //    eligible when sky nibbles are 0, and rejected if sky light is set.
+        encoder.set_dimension(LevelShape::NETHER);
+        let mut nether = Chunk::empty(9, 9);
+        for sec in &mut nether.sections {
+            Arc::make_mut(sec).light = Light::Uniform(0);
+        }
+        nether.set(1, 32, 1, 1);
+        Arc::make_mut(&mut nether.sections[6]).light = Light::Uniform(0x09);
+        let mut nether_world =
+            crate::world::World::new(horizon_world::registry::BlockStateId(0), 0);
+        nether_world.chunks.insert((9, 9), Arc::new(nether));
+        assert!(
+            encoder
+                .direct_column(&nether_world.chunks[&(9, 9)], &nether_world, &|_, _| None)
+                .is_some()
+        );
+        let mut bad_nether = (*nether_world.chunks[&(9, 9)]).clone();
+        Arc::make_mut(&mut bad_nether.sections[6]).light = Light::Uniform(0xF9);
+        assert!(
+            encoder
+                .direct_column(&bad_nether, &nether_world, &|_, _| None)
+                .is_none()
         );
     }
 }

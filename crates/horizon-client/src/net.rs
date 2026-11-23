@@ -225,6 +225,8 @@ pub struct Session {
     far: Arc<crate::lod_net::Inbox>,
     /// The recording running, if any.
     recorder: RecorderSlot,
+    /// Whether this local session currently holds a `lan::handoff` recording claim.
+    recording_handoff: AtomicBool,
     /// This connection's number, new for each one ([`Session::serial`]).
     serial: u64,
 }
@@ -348,6 +350,7 @@ impl Session {
             debug: false,
             far: Arc::new(crate::lod_net::Inbox::default()),
             recorder: Arc::new(Mutex::new(None)),
+            recording_handoff: AtomicBool::new(false),
             serial: next_serial(),
         }
     }
@@ -443,6 +446,7 @@ impl Session {
             debug,
             far,
             recorder,
+            recording_handoff: AtomicBool::new(false),
             serial: next_serial(),
         }
     }
@@ -510,12 +514,22 @@ impl Session {
         initialize: impl FnOnce(&R),
     ) {
         let mut slot = self.recorder.lock().unwrap();
+        if self.address == "local" && !self.recording_handoff.swap(true, Ordering::AcqRel) {
+            crate::lan::handoff::begin_recording();
+        }
         initialize(&recorder);
         *slot = Some(Box::new(recorder));
     }
     /// Stop recording and finalize the `.mcpr` archive.
     pub fn stop_recording(&self) -> Option<std::io::Result<PathBuf>> {
-        let rec = self.recorder.lock().unwrap().take()?;
+        let rec = {
+            let mut slot = self.recorder.lock().unwrap();
+            let rec = slot.take();
+            if self.recording_handoff.swap(false, Ordering::AcqRel) {
+                crate::lan::handoff::end_recording();
+            }
+            rec
+        }?;
         Some(rec.stop())
     }
     /// Whether recording is currently active.
@@ -690,6 +704,9 @@ impl Session {
         self.payloads.close();
         if let Some(w) = self.writer.lock().unwrap().take() {
             w.shutdown();
+        }
+        if self.recording_handoff.swap(false, Ordering::AcqRel) {
+            crate::lan::handoff::end_recording();
         }
         drop(self.thread.take());
     }
@@ -1246,7 +1263,15 @@ fn receive_play(
         if let Some(rec) = recorder.lock().unwrap().as_ref()
             && rec.is_active()
         {
-            rec.received(&packet, id, &payload);
+            if reader.is_memory()
+                && let play::Clientbound::LevelChunkWithLight(ref chunk) = packet
+                && let Some((full_packet, full_payload)) =
+                    crate::lan::handoff::materialize_for_recorder(chunk)
+            {
+                rec.received(&full_packet, id, &full_payload);
+            } else {
+                rec.received(&packet, id, &payload);
+            }
         }
         let reply = |p: play::Serverbound| {
             if let Some(w) = shared_writer.lock().unwrap().as_mut() {
@@ -3188,6 +3213,7 @@ mod tests {
                 debug: false,
                 far: Arc::default(),
                 recorder: Arc::new(Mutex::new(None)),
+                recording_handoff: AtomicBool::new(false),
                 serial: next_serial(),
             };
             let started = std::time::Instant::now();
@@ -3601,6 +3627,7 @@ mod tests {
             debug: false,
             far: Arc::default(),
             recorder: Arc::new(Mutex::new(None)),
+            recording_handoff: AtomicBool::new(false),
             serial: next_serial(),
         };
         let mut server = Connection::local(server);
@@ -3645,6 +3672,7 @@ mod tests {
             debug: false,
             far: Arc::default(),
             recorder: Arc::new(Mutex::new(None)),
+            recording_handoff: AtomicBool::new(false),
             serial: next_serial(),
         };
         let (thread_writer, thread_configuring, thread_recorder) = (
@@ -3947,6 +3975,7 @@ mod tests {
             debug: false,
             far: Arc::default(),
             recorder: Arc::new(Mutex::new(None)),
+            recording_handoff: AtomicBool::new(false),
             serial: next_serial(),
         };
         let recorder = TestRecorder::default();
@@ -4088,5 +4117,107 @@ mod tests {
         assert!(reg.entries[2].data.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn local_session_recording_toggles_handoff_and_materializes_inflight_stub() {
+        use crate::chunk::{Chunk, MIN_Y};
+        use crate::lan::{chunks::ChunkEncoder, handoff};
+        use horizon_protocol::registry::Builtin;
+
+        let (root, data) = empty_item_data("direct_stub_recording");
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (mut reader, writer) = Connection::local(client).split();
+        let (send, events) = event_channel();
+        let mut session = Session {
+            events,
+            payload_events: event_channel().0,
+            payloads: crate::raw_payloads::Transport::empty(),
+            writer: Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap()))),
+            configuring: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            address: "local".into(),
+            name: "StudioTester".into(),
+            counters: Arc::new(Mutex::new(None)),
+            cookies: Cookies::default(),
+            debug: false,
+            far: Arc::default(),
+            recorder: Arc::new(Mutex::new(None)),
+            recording_handoff: AtomicBool::new(false),
+            serial: next_serial(),
+        };
+
+        // Build an Overworld direct-handoff stub BEFORE recording starts (simulating
+        // a stub already buffered in the Pipe when the user presses Start Recording).
+        let states = [
+            (Arc::<str>::from("minecraft:air"), false),
+            (Arc::<str>::from("minecraft:stone"), false),
+        ];
+        let biomes = ["minecraft:plains".to_string()];
+        let encoder = ChunkEncoder::new(states, &Builtin::default(), &biomes, &biomes);
+        let mut world = crate::world::World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut chunk = Chunk::empty(12, -34);
+        chunk.set(3, MIN_Y + 5, 7, 1);
+        world.chunks.insert((12, -34), Arc::new(chunk));
+        let col = &*world.chunks[&(12, -34)];
+        let expected_full = encoder.body_in(col, &world);
+        let direct = encoder.direct_column(col, &world, &|_, _| None).unwrap();
+        let token = handoff::offer_direct(direct).unwrap();
+        let stub_body = encoder.direct_stub_body(col, &world.block_entities, token);
+
+        // Start recording: local session claims handoff recording flag.
+        let recorder = TestRecorder::default();
+        session.start_recording(recorder.clone(), |_| {});
+        assert!(session.recording_handoff.load(Ordering::Acquire));
+        assert!(handoff::is_recording());
+
+        let (thread_writer, thread_configuring, thread_recorder) = (
+            session.writer.clone(),
+            session.configuring.clone(),
+            session.recorder.clone(),
+        );
+        let thread = std::thread::spawn(move || {
+            receive_play(
+                &mut reader,
+                &thread_writer,
+                &thread_configuring,
+                &Language::new(),
+                &send,
+                &Cookies::default(),
+                &crate::lod_net::Inbox::default(),
+                &data,
+                &thread_recorder,
+                &crate::raw_payloads::Transport::empty(),
+            )
+        });
+
+        let mut server = Connection::local(server);
+        server.send(&stub_body).unwrap();
+        let disc_pkt = play::Clientbound::Disconnect(cfg::Disconnect {
+            reason: Tag::String("Direct stub recording check".into()),
+        });
+        server.send(&disc_pkt.encode()).unwrap();
+        let _ = thread.join().unwrap();
+
+        // Recorder received the FULL materialized wire payload (not the empty stub!),
+        // matching `encoder.body_in` byte-for-byte.
+        let mut expected_reader = horizon_protocol::buf::Reader::new(&expected_full);
+        let expected_id = expected_reader.varint().unwrap();
+        let recorded_raw = recorder.0.lock().unwrap().clone();
+        assert_eq!(recorded_raw.len(), 2);
+        assert_eq!(recorded_raw[0].0, expected_id);
+        assert_eq!(recorded_raw[0].1.as_slice(), expected_reader.rest());
+        // DirectColumn is still available for the client decoder (peek-only materialization).
+        assert!(handoff::take_direct(token, 12, -34).is_some());
+
+        // Stopping clears the session's claim; dropping an active recording session
+        // without calling `stop_recording` also releases its claim cleanly.
+        session.stop_recording().unwrap().unwrap();
+        assert!(!session.recording_handoff.load(Ordering::Acquire));
+        session.start_recording(TestRecorder::default(), |_| {});
+        assert!(session.recording_handoff.load(Ordering::Acquire));
+        session.disconnect();
+        assert!(!session.recording_handoff.load(Ordering::Acquire));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

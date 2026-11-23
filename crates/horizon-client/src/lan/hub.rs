@@ -3003,24 +3003,55 @@ impl Hub {
             })
             .collect();
         let chunks = &columns.chunks;
-        self.encoder.warm(chunks);
-        // A column one batch takes keeps its own buffer. One that several take is
-        // copied into shared storage once, and each batch queues a reference to it.
-        let mut encoded: Vec<super::Body> = self
-            .encoder
-            .bodies_with(chunks, world, &|x, z| {
-                ctx.streaming.and_then(|s| s.proto_sections(x, z))
-            })
-            .into_iter()
-            .zip(&columns.uses)
-            .map(|(body, &uses)| {
-                if uses == 1 {
+        let solo_direct = self.guests.len() == 1 && {
+            let g = &self.guests[0];
+            direct_handoff_allowed(
+                self.guests.len(),
+                g.address == super::conn::MEMORY_ADDRESS,
+                g.sender.payload_framing(),
+                self.terrain_protected(g.conn, &g.dimension),
+                self.lan.shared.config.accept_older_clients,
+                super::handoff::is_recording(),
+            )
+        };
+        let mut encoded: Vec<Option<super::Body>> = vec![None; chunks.len()];
+        let mut direct_used: Vec<bool> = vec![false; chunks.len()];
+        let mut wire_indices: Vec<usize> = Vec::new();
+        if solo_direct {
+            for (j, &chunk) in chunks.iter().enumerate() {
+                if columns.uses[j] == 1
+                    && let Some(direct) = self.encoder.direct_column(chunk, world, &protos)
+                    && let Some(token) = super::handoff::offer_direct(direct)
+                {
+                    let stub = self
+                        .encoder
+                        .direct_stub_body(chunk, &world.block_entities, token);
+                    encoded[j] = Some(super::Body::Owned(stub));
+                    direct_used[j] = true;
+                } else {
+                    wire_indices.push(j);
+                }
+            }
+        } else {
+            wire_indices.extend(0..chunks.len());
+        }
+        if !wire_indices.is_empty() {
+            let wire_chunks: Vec<&Chunk> = wire_indices.iter().map(|&j| chunks[j]).collect();
+            self.encoder.warm(&wire_chunks);
+            // A column one batch takes keeps its own buffer. One that several take is
+            // copied into shared storage once, and each batch queues a reference to it.
+            for (j, body) in
+                wire_indices
+                    .into_iter()
+                    .zip(self.encoder.bodies_with(&wire_chunks, world, &protos))
+            {
+                encoded[j] = Some(if columns.uses[j] == 1 {
                     super::Body::Owned(body)
                 } else {
                     super::Body::shared(body)
-                }
-            })
-            .collect();
+                });
+            }
+        }
         self.encoder.clear_batch_wire();
         for (i, taken, far, batch) in batches {
             let g = &self.guests[i];
@@ -3039,10 +3070,13 @@ impl Hub {
                     g.send(&C::ChunkBatchStart(horizon_protocol::packets::Empty));
                     g.sender.send_many(batch.into_iter().map(|body| match body {
                         Body::Level(j) => {
-                            if memory && !protected {
+                            if memory && !protected && !direct_used[j] {
                                 super::handoff::offer(chunks[j]);
                             }
-                            match &mut encoded[j] {
+                            match encoded[j]
+                                .as_mut()
+                                .expect("every level column in the batch was encoded")
+                            {
                                 super::Body::Owned(body) => {
                                     super::Body::Owned(std::mem::take(body))
                                 }
@@ -5792,6 +5826,94 @@ fn neighbours_ready(
     c: &Chunk,
 ) -> bool {
     chunks.surrounded((c.x, c.z)) || neighbours_scanned(chunks, proto, c)
+}
+
+/// Whether solo single-player direct chunk handoff is allowed for the sole
+/// guest: requires an in-memory integrated connection, no LAN guests, no
+/// terrain protection, no older-protocol translation, and no active recording.
+fn direct_handoff_allowed(
+    guests_len: usize,
+    memory: bool,
+    framing: horizon_protocol::connection::Framing,
+    protected: bool,
+    accept_older_clients: bool,
+    recording: bool,
+) -> bool {
+    guests_len == 1
+        && memory
+        && matches!(framing, horizon_protocol::connection::Framing::Memory)
+        && !protected
+        && !accept_older_clients
+        && !recording
+}
+
+#[cfg(test)]
+mod direct_handoff_tests {
+    use super::direct_handoff_allowed;
+    use horizon_protocol::connection::Framing;
+
+    #[test]
+    fn direct_handoff_allowed_requires_solo_memory_unprotected_current_unrecorded() {
+        assert!(direct_handoff_allowed(
+            1,
+            true,
+            Framing::Memory,
+            false,
+            false,
+            false,
+        ));
+        // Any LAN guest joining disables direct handoff.
+        assert!(!direct_handoff_allowed(
+            2,
+            true,
+            Framing::Memory,
+            false,
+            false,
+            false,
+        ));
+        // Non-memory address or non-memory framing disables direct handoff.
+        assert!(!direct_handoff_allowed(
+            1,
+            false,
+            Framing::Memory,
+            false,
+            false,
+            false,
+        ));
+        assert!(!direct_handoff_allowed(
+            1,
+            true,
+            Framing::Network(None),
+            false,
+            false,
+            false,
+        ));
+        // Terrain protection, older-client compatibility, or active recording disables it.
+        assert!(!direct_handoff_allowed(
+            1,
+            true,
+            Framing::Memory,
+            true,
+            false,
+            false,
+        ));
+        assert!(!direct_handoff_allowed(
+            1,
+            true,
+            Framing::Memory,
+            false,
+            true,
+            false,
+        ));
+        assert!(!direct_handoff_allowed(
+            1,
+            true,
+            Framing::Memory,
+            false,
+            false,
+            true,
+        ));
+    }
 }
 
 #[cfg(test)]

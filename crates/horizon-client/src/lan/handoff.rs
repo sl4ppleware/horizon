@@ -15,12 +15,32 @@
 //! The server also hands its window the columns it changed in bulk (`World::edit_runs`) without sending them: ones
 //! the window doesn't hold, whose far terrain still draws them as the window last saw them (`changed`,
 //! `take_changed`).
-use crate::chunk::{Chunk, Section};
+use super::chunks::DirectWire;
+use crate::chunk::{Chunk, ColumnLayout, Section};
 use crate::fast_hash::FxHashMap;
-use std::sync::{Arc, Mutex, Weak};
+use horizon_protocol::{
+    chunk::BlockEntityInfo,
+    packets::play::{self, LevelChunkWithLight},
+};
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 
 /// Columns offered and not taken yet before the dead ones are swept.
 const SWEEP: usize = 1 << 13;
+
+/// Maximum live in-flight single-player direct-handoff columns kept at once.
+/// Fits a full RD-32 initial burst (4,225 columns) with headroom while staying
+/// strictly bounded; once full, new offers return `None` so the server falls
+/// back cleanly to full wire bytes without evicting live in-flight stubs.
+const DIRECT_MAX: usize = 1 << 13;
+
+/// Sentinel heightmap type id carrying a direct single-player handoff token.
+/// Vanilla `Heightmap.Types` ids are non-negative (`0..=5`), so `-1` never
+/// collides with a real heightmap, and `chunk.buffer` is empty (`0` bytes),
+/// which no valid dimension (`height >= 16`) can produce on the wire.
+pub const DIRECT_HEIGHTMAP_KIND: i32 = -1;
 
 struct Offer {
     /// The minimum block Y of `sections[0]`.
@@ -29,6 +49,194 @@ struct Offer {
 }
 
 static OFFERED: Mutex<Option<FxHashMap<(i32, i32), Offer>>> = Mutex::new(None);
+static RECORDING_COUNT: AtomicUsize = AtomicUsize::new(0);
+static NEXT_DIRECT_TOKEN: AtomicU64 = AtomicU64::new(1);
+static DIRECT_OFFERED: Mutex<Option<FxHashMap<u64, Arc<DirectColumn>>>> = Mutex::new(None);
+
+/// Record that a local integrated session has started packet recording,
+/// disabling direct chunk handoff so the recorder receives full wire bytes.
+pub fn begin_recording() {
+    RECORDING_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Release a recording claim acquired via [`begin_recording`].
+pub fn end_recording() {
+    let _ = RECORDING_COUNT.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        Some(n.saturating_sub(1))
+    });
+}
+
+/// Whether any local integrated session is actively recording play packets.
+pub fn is_recording() -> bool {
+    RECORDING_COUNT.load(Ordering::Acquire) != 0
+}
+
+/// A server-side column handed directly to the local single-player client,
+/// bypassing wire encode -> Pipe -> wire decode -> `same_as` memcmp while
+/// retaining lazy wire-materialization metadata for recorder or format fallback.
+pub struct DirectColumn {
+    x: i32,
+    z: i32,
+    layout: ColumnLayout,
+    sections: Vec<Arc<Section>>,
+    shared_generation: u64,
+    owner: Weak<()>,
+    wire: DirectWire,
+}
+
+impl DirectColumn {
+    pub(super) fn new(
+        x: i32,
+        z: i32,
+        layout: ColumnLayout,
+        sections: Vec<Arc<Section>>,
+        shared_generation: u64,
+        owner: Weak<()>,
+        wire: DirectWire,
+    ) -> Self {
+        Self {
+            x,
+            z,
+            layout,
+            sections,
+            shared_generation,
+            owner,
+            wire,
+        }
+    }
+
+    pub fn layout(&self) -> ColumnLayout {
+        self.layout
+    }
+
+    pub fn level_min_y(&self) -> i32 {
+        self.wire.level_min_y()
+    }
+
+    pub fn level_sections(&self) -> usize {
+        self.wire.level_sections()
+    }
+
+    pub fn has_skylight(&self) -> bool {
+        self.wire.has_skylight()
+    }
+
+    pub fn shared_generation(&self) -> u64 {
+        self.shared_generation
+    }
+
+    pub fn biomes_identity(&self, biome_map: &[u16]) -> bool {
+        self.wire.biomes_identity(biome_map)
+    }
+
+    pub fn sections(&self) -> &[Arc<Section>] {
+        &self.sections
+    }
+
+    /// Materialize the full `LevelChunkWithLight` packet when the client's
+    /// `ChunkFormat` cannot adopt the direct column directly.
+    pub fn materialize_packet(&self, block_entities: &[BlockEntityInfo]) -> LevelChunkWithLight {
+        self.wire
+            .materialize_packet(self.x, self.z, &self.sections, block_entities)
+    }
+}
+
+/// Extract the direct-handoff token from a minimal stub `LevelChunkWithLight`
+/// packet, or `None` for any normal wire-encoded chunk packet.
+pub fn direct_token(packet: &LevelChunkWithLight) -> Option<u64> {
+    if !packet.chunk.buffer.is_empty() {
+        return None;
+    }
+    match packet.chunk.heightmaps.as_slice() {
+        [(kind, longs)] if *kind == DIRECT_HEIGHTMAP_KIND && longs.len() == 1 => {
+            Some(longs[0] as u64)
+        }
+        _ => None,
+    }
+}
+
+/// Register a [`DirectColumn`] for direct single-player handoff and return its
+/// unique token, or `None` if the bounded in-flight table is full.
+pub fn offer_direct(column: DirectColumn) -> Option<u64> {
+    let Ok(mut guard) = DIRECT_OFFERED.lock() else {
+        return None;
+    };
+    let map = guard.get_or_insert_with(FxHashMap::default);
+    if map.len() >= DIRECT_MAX / 2 {
+        map.retain(|_, c| c.owner.strong_count() > 0);
+    }
+    if map.len() >= DIRECT_MAX {
+        return None;
+    }
+    let token = NEXT_DIRECT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    map.insert(token, Arc::new(column));
+    Some(token)
+}
+
+/// Borrow a direct-handoff column without removing it (used by background
+/// `ChunkDecoder` workers so a subsequent `ChunkFormat` change or recorder
+/// capture still sees the entry until `release_direct` runs on retirement).
+pub fn peek_direct(token: u64, x: i32, z: i32) -> Option<Arc<DirectColumn>> {
+    let Ok(guard) = DIRECT_OFFERED.lock() else {
+        return None;
+    };
+    let col = guard.as_ref()?.get(&token)?;
+    (col.x == x && col.z == z).then(|| Arc::clone(col))
+}
+
+/// Remove and return a direct-handoff column when coordinates match.
+pub fn take_direct(token: u64, x: i32, z: i32) -> Option<Arc<DirectColumn>> {
+    let Ok(mut guard) = DIRECT_OFFERED.lock() else {
+        return None;
+    };
+    let map = guard.as_mut()?;
+    let matches = map.get(&token).is_some_and(|c| c.x == x && c.z == z);
+    if matches { map.remove(&token) } else { None }
+}
+
+/// Release a previously peeked direct-handoff entry once the client has
+/// retired, ignored, or dropped the corresponding chunk packet.
+pub fn release_direct(packet: &LevelChunkWithLight) {
+    let Some(token) = direct_token(packet) else {
+        return;
+    };
+    let Ok(mut guard) = DIRECT_OFFERED.lock() else {
+        return;
+    };
+    let Some(map) = guard.as_mut() else {
+        return;
+    };
+    if map
+        .get(&token)
+        .is_some_and(|c| c.x == packet.x && c.z == packet.z)
+    {
+        map.remove(&token);
+    }
+}
+
+/// Materialize full wire bytes for an in-flight direct-handoff stub if packet
+/// recording starts while the stub is already buffered in the local `Pipe`.
+pub(crate) fn materialize_for_recorder(
+    packet: &LevelChunkWithLight,
+) -> Option<(play::Clientbound, Vec<u8>)> {
+    let token = direct_token(packet)?;
+    let col = peek_direct(token, packet.x, packet.z)?;
+    let (full, payload) =
+        col.wire
+            .materialize_payload(col.x, col.z, &col.sections, &packet.chunk.block_entities);
+    Some((play::Clientbound::LevelChunkWithLight(full), payload))
+}
+
+/// Drop direct-handoff entries whose owning [`super::chunks::ChunkEncoder`] has
+/// been dropped, without disturbing entries belonging to any other live world.
+pub(super) fn sweep_dead_direct() {
+    let Ok(mut guard) = DIRECT_OFFERED.lock() else {
+        return;
+    };
+    if let Some(map) = guard.as_mut() {
+        map.retain(|_, c| c.owner.strong_count() > 0);
+    }
+}
 
 /// Columns changed in bulk and not sent to the window, the latest of each, until the window takes them.
 static CHANGED: Mutex<Option<FxHashMap<(i32, i32), Arc<Chunk>>>> = Mutex::new(None);
@@ -183,5 +391,91 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&taken[1], &other));
         assert!(take_changed().is_empty(), "taken once");
+    }
+
+    #[test]
+    fn direct_handoff_peek_take_release_and_owner_sweep() {
+        use super::super::chunks::ChunkEncoder;
+        use horizon_protocol::registry::Builtin;
+
+        let states = [
+            (Arc::<str>::from("minecraft:air"), false),
+            (Arc::<str>::from("minecraft:stone"), false),
+        ];
+        let biomes = ["minecraft:plains".to_string()];
+        let encoder_a = ChunkEncoder::new(states.clone(), &Builtin::default(), &biomes, &biomes);
+        let encoder_b = ChunkEncoder::new(states, &Builtin::default(), &biomes, &biomes);
+
+        let mut world = crate::world::World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut c1 = Chunk::empty(701, -702);
+        c1.set(1, MIN_Y + 4, 2, 1);
+        let mut c2 = Chunk::empty(703, -704);
+        c2.set(3, MIN_Y + 8, 4, 1);
+        world.chunks.insert((701, -702), Arc::new(c1));
+        world.chunks.insert((703, -704), Arc::new(c2));
+
+        let d1 = encoder_a
+            .direct_column(&world.chunks[&(701, -702)], &world, &|_, _| None)
+            .unwrap();
+        let t1 = offer_direct(d1).unwrap();
+        // Coordinate mismatch never steals or reads the entry.
+        assert!(peek_direct(t1, 701, 0).is_none());
+        assert!(take_direct(t1, 0, -702).is_none());
+        // Peek leaves the entry intact; take removes it once.
+        let peeked = peek_direct(t1, 701, -702).unwrap();
+        assert_eq!(
+            peeked.sections().len(),
+            world.chunks[&(701, -702)].sections.len()
+        );
+        let taken = take_direct(t1, 701, -702).unwrap();
+        assert!(Arc::ptr_eq(&peeked, &taken));
+        assert!(peek_direct(t1, 701, -702).is_none());
+        assert!(take_direct(t1, 701, -702).is_none());
+
+        // `release_direct` removes a peeked stub entry without affecting other tokens.
+        let d1_again = encoder_a
+            .direct_column(&world.chunks[&(701, -702)], &world, &|_, _| None)
+            .unwrap();
+        let t1_again = offer_direct(d1_again).unwrap();
+        let stub_body = encoder_a.direct_stub_body(
+            &world.chunks[&(701, -702)],
+            &world.block_entities,
+            t1_again,
+        );
+        let mut r = horizon_protocol::buf::Reader::new(&stub_body);
+        let id = r.varint().unwrap();
+        let play::Clientbound::LevelChunkWithLight(stub_pkt) =
+            play::Clientbound::decode(id, r.rest()).unwrap()
+        else {
+            panic!("expected LevelChunkWithLight stub");
+        };
+        assert_eq!(direct_token(&stub_pkt), Some(t1_again));
+        assert!(peek_direct(t1_again, 701, -702).is_some());
+        release_direct(&stub_pkt);
+        assert!(peek_direct(t1_again, 701, -702).is_none());
+
+        // Dropping `encoder_a` sweeps only `encoder_a`'s dead entries while leaving
+        // `encoder_b`'s live entries intact.
+        let t_a = offer_direct(
+            encoder_a
+                .direct_column(&world.chunks[&(701, -702)], &world, &|_, _| None)
+                .unwrap(),
+        )
+        .unwrap();
+        let t_b = offer_direct(
+            encoder_b
+                .direct_column(&world.chunks[&(703, -704)], &world, &|_, _| None)
+                .unwrap(),
+        )
+        .unwrap();
+        drop(encoder_a);
+        assert!(peek_direct(t_a, 701, -702).is_none());
+        assert!(take_direct(t_b, 703, -704).is_some());
+        drop(encoder_b);
+
+        // Recording flag refcount turns on while claimed and releases cleanly.
+        begin_recording();
+        assert!(is_recording());
+        end_recording();
     }
 }

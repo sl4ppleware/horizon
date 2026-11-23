@@ -518,7 +518,108 @@ impl ChunkFormat {
         p: &play::LevelChunkWithLight,
         scratch: &mut DecodeScratch,
     ) -> Result<Chunk, String> {
+        self.column_with_scratch_mode(p, scratch, DirectConsume::Take)
+    }
+
+    fn column_with_scratch_mode(
+        &self,
+        p: &play::LevelChunkWithLight,
+        scratch: &mut DecodeScratch,
+        mode: DirectConsume,
+    ) -> Result<Chunk, String> {
         let generation = shared_generation();
+        if let Some(token) = horizon_client::lan::handoff::direct_token(p) {
+            let direct = match mode {
+                DirectConsume::Take => horizon_client::lan::handoff::take_direct(token, p.x, p.z),
+                DirectConsume::Peek => horizon_client::lan::handoff::peek_direct(token, p.x, p.z),
+            };
+            if let Some(direct) = direct {
+                if let Some(chunk) = self.adopt_direct(p.x, p.z, &direct, generation) {
+                    return Ok(chunk);
+                }
+                let materialized = direct.materialize_packet(&p.chunk.block_entities);
+                return self.decode_wire_column(&materialized, scratch, generation);
+            }
+        }
+        self.decode_wire_column(p, scratch, generation)
+    }
+
+    fn adopt_direct(
+        &self,
+        x: i32,
+        z: i32,
+        direct: &Arc<horizon_client::lan::handoff::DirectColumn>,
+        generation: u64,
+    ) -> Option<Chunk> {
+        if direct.layout() != self.column
+            || direct.level_min_y() != self.min_y
+            || direct.level_sections() != self.sections
+            || direct.has_skylight() != self.has_skylight
+            || direct.shared_generation() != generation
+            || !direct.biomes_identity(&self.biome_map)
+        {
+            return None;
+        }
+        let column = self.column.sections();
+        let offset = (self.min_y - self.column.min_y()).div_euclid(16);
+        if offset < 0 || (offset as usize) + self.sections > column {
+            return None;
+        }
+        let offset = offset as usize;
+        let full_column = offset == 0 && self.sections == column;
+        if !full_column && self.has_skylight {
+            return None;
+        }
+        let mut chunk = Chunk::with_layout(x, z, self.column);
+        if full_column {
+            for (dst, src) in chunk.sections.iter_mut().zip(direct.sections()) {
+                *dst = Arc::clone(src);
+            }
+        } else {
+            let ours = block_strategy();
+            let end = offset + self.sections;
+            for (dst, src) in chunk.sections[offset..end]
+                .iter_mut()
+                .zip(&direct.sections()[offset..end])
+            {
+                *dst = Arc::clone(src);
+            }
+            if offset > 0 {
+                let edge = repeat_biome_layer(&direct.sections()[offset].biomes, 0);
+                let below = Arc::new(Section {
+                    blocks: PalettedContainer::new(ours, 0),
+                    biomes: edge,
+                    light: Light::Uniform(0),
+                });
+                for slot in &mut chunk.sections[..offset] {
+                    *slot = Arc::clone(&below);
+                }
+                horizon_client::chunk::share_uniform(&mut chunk.sections[..offset]);
+            }
+            if end < column {
+                let edge = repeat_biome_layer(&direct.sections()[end - 1].biomes, 3);
+                let above = Arc::new(Section {
+                    blocks: PalettedContainer::new(ours, 0),
+                    biomes: edge,
+                    light: Light::Uniform(0),
+                });
+                for slot in &mut chunk.sections[end..] {
+                    *slot = Arc::clone(&above);
+                }
+                horizon_client::chunk::share_uniform(&mut chunk.sections[end..]);
+            }
+        }
+        chunk.lit = true;
+        chunk.light_loaded = true;
+        Some(chunk)
+    }
+
+    fn decode_wire_column(
+        &self,
+        p: &play::LevelChunkWithLight,
+        scratch: &mut DecodeScratch,
+        generation: u64,
+    ) -> Result<Chunk, String> {
         let ours = block_strategy();
         let offset = (self.min_y - self.column.min_y()).div_euclid(16);
         let column = self.column.sections();
@@ -773,6 +874,12 @@ pub(super) fn section_blocks(
     })
 }
 
+#[derive(Clone, Copy)]
+enum DirectConsume {
+    Take,
+    Peek,
+}
+
 type Decoded = (Box<C>, Result<Chunk, String>);
 
 struct Job {
@@ -854,9 +961,11 @@ impl ChunkDecoder {
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &*job
                                 .packet
                             {
-                                C::LevelChunkWithLight(p) => {
-                                    job.format.column_with_scratch(p, &mut scratch)
-                                }
+                                C::LevelChunkWithLight(p) => job.format.column_with_scratch_mode(
+                                    p,
+                                    &mut scratch,
+                                    DirectConsume::Peek,
+                                ),
                                 _ => Err("not a chunk packet".into()),
                             }));
                         let column = match result {
@@ -960,7 +1069,24 @@ impl Drop for ChunkDecoder {
     fn drop(&mut self) {
         if let Ok(mut q) = self.queue.0.lock() {
             q.stopped = true;
+            for job in q.jobs.drain(..) {
+                if let C::LevelChunkWithLight(p) = &*job.packet {
+                    horizon_client::lan::handoff::release_direct(p);
+                }
+            }
             self.queue.1.notify_all();
+        }
+        if let Ok(mut ret) = self.retirement.lock() {
+            for (_, (packet, _)) in std::mem::take(&mut ret.ready) {
+                if let C::LevelChunkWithLight(p) = &*packet {
+                    horizon_client::lan::handoff::release_direct(p);
+                }
+            }
+            while let Ok(res) = ret.done.try_recv() {
+                if let C::LevelChunkWithLight(p) = &*res.packet {
+                    horizon_client::lan::handoff::release_direct(p);
+                }
+            }
         }
     }
 }
@@ -1019,6 +1145,7 @@ impl Game<'_> {
         // ClientChunkCache.replaceWithPacketData: a column outside the
         // storage around the view centre is ignored.
         if !self.remote_chunk_in_range(p.x, p.z) {
+            horizon_client::lan::handoff::release_direct(p);
             log::warn!(
                 "Ignoring chunk since it's not in the view range: {}, {}",
                 p.x,
@@ -1027,10 +1154,14 @@ impl Game<'_> {
             return;
         }
         let Some(format) = self.remote.as_ref().map(|r| r.chunk_format.clone()) else {
+            horizon_client::lan::handoff::release_direct(p);
             return;
         };
         let column = match decoded {
-            Some((used, column)) if Arc::ptr_eq(used, &format) => column,
+            Some((used, column)) if Arc::ptr_eq(used, &format) => {
+                horizon_client::lan::handoff::release_direct(p);
+                column
+            }
             _ => format.column(p),
         };
         let chunk = match column {
@@ -1365,5 +1496,212 @@ mod tests {
             assert_eq!(a.0.as_deref(), b.0);
             assert_eq!(a.1.as_deref(), b.1);
         }
+    }
+
+    #[test]
+    fn direct_handoff_adopts_overworld_and_nether_and_falls_back_cleanly() {
+        use horizon_client::{
+            chunk::{LevelShape, MIN_Y},
+            lan::{chunks::ChunkEncoder, handoff},
+            world::World,
+        };
+        use horizon_protocol::registry::Builtin;
+
+        let builtin = Builtin::parse(
+            r#"{"minecraft:block_entity_type": {"entries": {
+                "minecraft:chest": {"protocol_id": 1}}}}"#,
+        )
+        .unwrap();
+        let states = [
+            (Arc::<str>::from("minecraft:air"), false),
+            (Arc::<str>::from("minecraft:stone"), false),
+            (Arc::<str>::from("minecraft:chest"), false),
+        ];
+        // Non-alphabetical internal biome list vs network registry order:
+        // internal [plains(0), desert(1), forest(2)] -> net [desert(0), forest(1), plains(2)]
+        // so encoder.biome_ids = [2, 0, 1] and client biome_map = [1, 2, 0] (exact inverse!).
+        let biome_names = [
+            "minecraft:plains".to_string(),
+            "minecraft:desert".to_string(),
+            "minecraft:forest".to_string(),
+        ];
+        let biome_registry = [
+            "minecraft:desert".to_string(),
+            "minecraft:forest".to_string(),
+            "minecraft:plains".to_string(),
+        ];
+        let mut encoder = ChunkEncoder::new(states, &builtin, &biome_names, &biome_registry);
+
+        let decode_body = |body: &[u8]| -> play::LevelChunkWithLight {
+            let mut r = Reader::new(body);
+            let id = r.varint().unwrap();
+            let C::LevelChunkWithLight(pkt) = C::decode(id, r.rest()).unwrap() else {
+                panic!("expected LevelChunkWithLight");
+            };
+            pkt
+        };
+
+        // 1. Overworld full-column direct handoff: exact Arc::ptr_eq sharing +
+        //    bit-exact equivalence with wire decode + exact block entities.
+        let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut overworld_chunk = Chunk::empty(21, -22);
+        overworld_chunk.set(2, MIN_Y + 5, 3, 1);
+        overworld_chunk.set(4, MIN_Y + 5, 6, 2);
+        overworld_chunk.set(8, 64, 9, 1);
+        Arc::make_mut(&mut overworld_chunk.sections[0])
+            .biomes
+            .set(0, 1);
+        Arc::make_mut(&mut overworld_chunk.sections[0])
+            .biomes
+            .set(17, 2);
+        Arc::make_mut(&mut overworld_chunk.sections[0]).light = Light::Uniform(0xB3);
+        overworld_chunk.lit = true;
+        world.chunks.insert((21, -22), Arc::new(overworld_chunk));
+        let col = &*world.chunks[&(21, -22)];
+
+        let wire_pkt = decode_body(&encoder.body_in(col, &world));
+        let overworld_dim = DimensionType::vanilla("minecraft:overworld");
+        let matching_format = ChunkFormat::new(&overworld_dim, vec![1, 2, 0], 2);
+        let wire_decoded = matching_format.column(&wire_pkt).unwrap();
+
+        let direct = encoder.direct_column(col, &world, &|_, _| None).unwrap();
+        let token = handoff::offer_direct(direct).unwrap();
+        let stub_pkt = decode_body(&encoder.direct_stub_body(col, &world.block_entities, token));
+        assert_eq!(stub_pkt.chunk.block_entities, wire_pkt.chunk.block_entities);
+        let direct_decoded = matching_format.column(&stub_pkt).unwrap();
+        assert_eq!(direct_decoded.sections.len(), wire_decoded.sections.len());
+        for (i, ((srv, dir), wir)) in col
+            .sections
+            .iter()
+            .zip(&direct_decoded.sections)
+            .zip(&wire_decoded.sections)
+            .enumerate()
+        {
+            assert!(Arc::ptr_eq(srv, dir), "section {i} should share server Arc");
+            assert!(dir.same_as(wir), "section {i} must match wire decode");
+        }
+        // Token was consumed on `column` (DirectConsume::Take).
+        assert!(handoff::peek_direct(token, 21, -22).is_none());
+
+        // 2. Non-identity biome_map mismatch seamlessly materializes and decodes
+        //    the exact remapped biomes without failing or dropping the column.
+        let remapped_format = ChunkFormat::new(&overworld_dim, vec![0, 1, 2], 2);
+        let remapped_wire = remapped_format.column(&wire_pkt).unwrap();
+        let token_remap =
+            handoff::offer_direct(encoder.direct_column(col, &world, &|_, _| None).unwrap())
+                .unwrap();
+        let stub_remap =
+            decode_body(&encoder.direct_stub_body(col, &world.block_entities, token_remap));
+        let remapped_direct = remapped_format.column(&stub_remap).unwrap();
+        for (i, (got, exp)) in remapped_direct
+            .sections
+            .iter()
+            .zip(&remapped_wire.sections)
+            .enumerate()
+        {
+            assert!(
+                got.same_as(exp),
+                "remapped fallback mismatch in section {i}"
+            );
+        }
+
+        // 3. Nether partial-column (`min_y = 0, height = 256, has_skylight = false`)
+        //    shares sections 4..20 directly and builds bit-exact edge sections 0..4 and 20..24.
+        encoder.set_dimension(LevelShape::NETHER);
+        let mut nether_world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut nether_chunk = Chunk::empty(31, 32);
+        for sec in &mut nether_chunk.sections {
+            Arc::make_mut(sec).light = Light::Uniform(0);
+        }
+        nether_chunk.set(5, 16, 6, 1);
+        Arc::make_mut(&mut nether_chunk.sections[4])
+            .biomes
+            .set(0, 1);
+        Arc::make_mut(&mut nether_chunk.sections[19])
+            .biomes
+            .set(63, 2);
+        Arc::make_mut(&mut nether_chunk.sections[5]).light = Light::Uniform(0x0B);
+        nether_chunk.lit = true;
+        nether_world.chunks.insert((31, 32), Arc::new(nether_chunk));
+        let ncol = &*nether_world.chunks[&(31, 32)];
+
+        let nether_dim = DimensionType::vanilla("minecraft:the_nether");
+        let nether_format = ChunkFormat::new(&nether_dim, vec![1, 2, 0], 2);
+        let nether_wire = nether_format
+            .column(&decode_body(&encoder.body_in(ncol, &nether_world)))
+            .unwrap();
+        let token_nether = handoff::offer_direct(
+            encoder
+                .direct_column(ncol, &nether_world, &|_, _| None)
+                .unwrap(),
+        )
+        .unwrap();
+        let stub_nether = decode_body(&encoder.direct_stub_body(
+            ncol,
+            &nether_world.block_entities,
+            token_nether,
+        ));
+        let nether_direct = nether_format.column(&stub_nether).unwrap();
+        for (idx, (srv, dir)) in ncol.sections[4..20]
+            .iter()
+            .zip(&nether_direct.sections[4..20])
+            .enumerate()
+        {
+            assert!(
+                Arc::ptr_eq(srv, dir),
+                "nether section {} should share server Arc",
+                idx + 4
+            );
+        }
+        for (i, (got, exp)) in nether_direct
+            .sections
+            .iter()
+            .zip(&nether_wire.sections)
+            .enumerate()
+        {
+            assert!(got.same_as(exp), "nether section {i} mismatch vs wire");
+        }
+
+        // 4. ChunkDecoder peeks (keeping the token alive if ChunkFormat changes before
+        //    retirement), and `release_direct` removes it once retired.
+        encoder.set_dimension(LevelShape::OVERWORLD);
+        let token_dec =
+            handoff::offer_direct(encoder.direct_column(col, &world, &|_, _| None).unwrap())
+                .unwrap();
+        let stub_dec =
+            decode_body(&encoder.direct_stub_body(col, &world.block_entities, token_dec));
+        let decoder = ChunkDecoder::new();
+        let format_arc = Arc::new(ChunkFormat::new(&overworld_dim, vec![1, 2, 0], 2));
+        assert!(
+            decoder
+                .submit(
+                    format_arc.clone(),
+                    Box::new(C::LevelChunkWithLight(stub_dec.clone()))
+                )
+                .is_none()
+        );
+        let (pkt, decoded) = loop {
+            match decoder.next() {
+                Next::Ready(res) => break res,
+                Next::Decoding => std::thread::yield_now(),
+                Next::Lost => panic!("decoder stopped"),
+            }
+        };
+        assert!(decoded.unwrap().sections[0].same_as(&col.sections[0]));
+        // Still present for format-change re-decode until `release_direct` runs.
+        assert!(handoff::peek_direct(token_dec, 21, -22).is_some());
+        // Simulate format change before retirement: re-decoding via `remapped_format.column`
+        // consumes the token and still succeeds cleanly!
+        let C::LevelChunkWithLight(retired_pkt) = *pkt else {
+            panic!("expected LevelChunkWithLight");
+        };
+        let redecoded = remapped_format.column(&retired_pkt).unwrap();
+        assert!(redecoded.sections[0].same_as(&remapped_wire.sections[0]));
+        assert!(handoff::peek_direct(token_dec, 21, -22).is_none());
+
+        // 5. Missing direct token gracefully falls through to normal wire error.
+        let mut missing_stub = stub_dec;
+        missing_stub.chunk.heightmaps = vec![(handoff::DIRECT_HEIGHTMAP_KIND, vec![i64::MAX])];
+        assert!(matching_format.column(&missing_stub).is_err());
     }
 }
