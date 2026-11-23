@@ -1831,4 +1831,19 @@ mod tests {
             &fresh_chunk_b.sections[0]
         ));
     }
+
+    #[test]
+    fn section_layout_stays_compact() {
+        assert!(std::mem::size_of::<PalettedContainer>() <= 40);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(std::mem::size_of::<PalettedContainer>(), 40);
+            assert_eq!(std::mem::size_of::<Section>(), 96);
+            assert_eq!(
+                2 * std::mem::size_of::<usize>() + std::mem::size_of::<Section>(),
+                112
+            );
+        }
+        assert!(2 * std::mem::size_of::<usize>() + std::mem::size_of::<Section>() <= 128);
+    }
 }
