@@ -139,6 +139,8 @@ pub struct Flat {
     looks: Vec<wgpu::BindGroup>,
     free_ids: Vec<u32>,
     next_id: u32,
+    /// Scratch buffer for `place` block-table fills (avoids a per-upload/move `Vec<u32>` alloc).
+    place_ids: Vec<u32>,
     origins: wgpu::Buffer,
     origin_capacity: u64,
     origin_data: Vec<[f32; 4]>,
@@ -174,6 +176,23 @@ pub struct Flat {
     /// the visibility buffer's ID pass (`visbuffer`) reads it. The other flat pipelines
     /// have no instance-rate inputs.
     pub page_instances: bool,
+}
+
+/// Maximum retained elements in [`Flat::place_ids`] after a transiently huge upload.
+const PLACE_IDS_SCRATCH_CAP: usize = 4096;
+
+fn fill_place_ids(scratch: &mut Vec<u32>, id: u32, vertices: u64) -> &[u32] {
+    let count = vertices.div_ceil(GRAIN) as usize;
+    scratch.clear();
+    scratch.resize(count, id);
+    scratch
+}
+
+fn trim_place_ids(scratch: &mut Vec<u32>) {
+    scratch.clear();
+    if scratch.capacity() > PLACE_IDS_SCRATCH_CAP {
+        scratch.shrink_to(PLACE_IDS_SCRATCH_CAP);
+    }
 }
 
 /// Sections in view (and distant tiles) from which a frame is drawn flat.
@@ -617,6 +636,7 @@ impl Flat {
             pages: Vec::new(),
             free_ids: Vec::new(),
             next_id: 0,
+            place_ids: Vec::new(),
             origins: buffer(device, "Section origins by id", 16, storage_usage),
             origin_capacity: 1,
             origin_data: Vec::new(),
@@ -699,13 +719,9 @@ impl Flat {
         });
         table.generation = next_block_table_generation();
         let first = start / GRAIN;
-        let ids = vec![id; vertices.div_ceil(GRAIN) as usize];
-        uploads.buffer(
-            encoder,
-            &table.blocks,
-            first * 4,
-            bytemuck::cast_slice(&ids),
-        );
+        let ids = fill_place_ids(&mut self.place_ids, id, vertices);
+        uploads.buffer(encoder, &table.blocks, first * 4, bytemuck::cast_slice(ids));
+        trim_place_ids(&mut self.place_ids);
     }
     /// The block table of the page keyed `page`, for tests that read it back.
     #[cfg(test)]
@@ -729,6 +745,8 @@ impl Flat {
         self.phase2_group = None;
         self.free_ids.clear();
         self.next_id = 0;
+        self.place_ids.clear();
+        self.place_ids.shrink_to_fit();
     }
     /// Takes over `from`'s block tables and section ids, with the arenas they describe
     /// (`Renderer::take_world`). Their bind groups name `from`'s origins: `bind_pages` makes
@@ -1813,5 +1831,37 @@ mod tests {
         let before = all.len();
         all.dedup();
         assert_eq!(all.len(), before);
+    }
+
+    #[test]
+    fn place_ids_scratch_reuses_allocation_and_bounds_peak_capacity() {
+        let mut scratch = Vec::new();
+        assert!(fill_place_ids(&mut scratch, 7, 0).is_empty());
+        assert_eq!(fill_place_ids(&mut scratch, 11, 1), &[11]);
+        assert_eq!(fill_place_ids(&mut scratch, 12, GRAIN), &[12]);
+        assert_eq!(fill_place_ids(&mut scratch, 13, GRAIN + 1), &[13, 13]);
+
+        // Warm up to 64 grains and confirm subsequent fills reuse the exact allocation.
+        let _ = fill_place_ids(&mut scratch, 1, 64 * GRAIN);
+        let cap_warm = scratch.capacity();
+        let ptr_warm = scratch.as_ptr();
+        trim_place_ids(&mut scratch);
+        assert!(scratch.is_empty());
+        assert_eq!(scratch.capacity(), cap_warm);
+
+        let reused = fill_place_ids(&mut scratch, 42, 32 * GRAIN);
+        assert_eq!(reused.len(), 32);
+        assert!(reused.iter().all(|&v| v == 42));
+        assert_eq!(reused.as_ptr(), ptr_warm);
+        assert_eq!(scratch.capacity(), cap_warm);
+
+        // Oversized one-off fill shrinks back within PLACE_IDS_SCRATCH_CAP on trim.
+        let huge_grains = PLACE_IDS_SCRATCH_CAP + 256;
+        let huge = fill_place_ids(&mut scratch, 99, huge_grains as u64 * GRAIN);
+        assert_eq!(huge.len(), huge_grains);
+        assert!(huge.iter().all(|&v| v == 99));
+        trim_place_ids(&mut scratch);
+        assert!(scratch.is_empty());
+        assert!(scratch.capacity() <= PLACE_IDS_SCRATCH_CAP);
     }
 }

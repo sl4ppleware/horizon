@@ -612,6 +612,7 @@ mod stars;
 mod surface_setup;
 use surface_setup::{AdapterChoice, AdapterFailure, open_adapter, pick_adapter, set_up_surface};
 mod off_page;
+#[cfg(test)]
 use off_page::move_off_page;
 pub mod submit;
 mod sunrise_fan;
@@ -1006,7 +1007,7 @@ impl SectionGpu {
 /// Which of a mesh's ranges `move_off_page` moves: what it holds in the section
 /// arena (`split`: its solid quads alone, `SectionGpu::vertex_ranges`), its
 /// translucent quads in `translucent_arena`, or its sorted indices.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Part {
     Section { split: bool },
     Translucent,
@@ -1044,6 +1045,7 @@ impl Part {
 /// it. None: no page to shrink. False, and nothing changes: no video memory for
 /// the new page, or a range there without its mesh in `meshes`, which would keep
 /// the page from ever emptying.
+#[cfg(test)]
 fn begin_shrink<'a>(
     arena: &mut arena::Arena,
     device: &wgpu::Device,
@@ -1057,6 +1059,27 @@ fn begin_shrink<'a>(
         .sum();
     debug_assert_eq!(held, arena.used(page), "a range in use without its mesh");
     if held != arena.used(page) || !arena.open_page(device, capacity) {
+        return Some(false);
+    }
+    arena.close(page);
+    Some(true)
+}
+/// Starts shrinking an `oversized` page while collecting its resident keys into
+/// `targets` in the same pass, so `Renderer::shrink_translucent` does not scan
+/// every resident section a second time to move them off `page`.
+fn begin_shrink_into(
+    arena: &mut arena::Arena,
+    device: &wgpu::Device,
+    sections: &resident::Resident<SectionGpu>,
+    lods: &mut FxHashMap<crate::lod::TileKey, lod::Tile>,
+    part: Part,
+    targets: &mut off_page::PageTargets,
+) -> Option<bool> {
+    let (page, capacity) = arena.oversized()?;
+    let held = targets.collect(part, page, sections, lods);
+    debug_assert_eq!(held, arena.used(page), "a range in use without its mesh");
+    if held != arena.used(page) || !arena.open_page(device, capacity) {
+        targets.clear();
         return Some(false);
     }
     arena.close(page);
@@ -1831,6 +1854,12 @@ pub struct Renderer {
     section_copy_bytes: u64,
     /// When a large translucent page may start to shrink (`shrink_translucent`).
     shrink_gate: ShrinkGate,
+    /// Cooldown after `compact_arena` reopens a page for want of room elsewhere.
+    compact_retry: Option<Instant>,
+    /// Incremental key queue for `compact_arena`'s closing page.
+    arena_compact: off_page::PageTargets,
+    /// Incremental key queue for `shrink_translucent`'s closing page.
+    shrink_compact: off_page::PageTargets,
     /// Whether `lightmap` holds `lightmap_pixels` yet.
     lightmap_uploaded: bool,
     /// Inputs of the last lightmap computation, to skip 256-texel recompute on unchanged frames.
@@ -4915,6 +4944,9 @@ impl Renderer {
             section_copies: None,
             section_copy_bytes: 0,
             shrink_gate: ShrinkGate::default(),
+            compact_retry: None,
+            arena_compact: off_page::PageTargets::default(),
+            shrink_compact: off_page::PageTargets::default(),
             lightmap_uploaded: false,
             lightmap_key: None,
             frame_lost: false,
@@ -6043,10 +6075,19 @@ impl Renderer {
     /// Returns what is left of the frame's `COMPACT_BUDGET`.
     fn compact_arena(&mut self) -> u64 {
         let mut budget = COMPACT_BUDGET;
-        if self.arena.closing().is_none()
-            && let Some(page) = self.arena.sparsest()
-        {
-            self.arena.close(page);
+        if self.arena.closing().is_none() {
+            self.arena_compact.clear();
+            let ready = match self.compact_retry {
+                Some(at) if Instant::now() < at => false,
+                Some(_) => {
+                    self.compact_retry = None;
+                    true
+                }
+                None => true,
+            };
+            if ready && let Some(page) = self.arena.sparsest() {
+                self.arena.close(page);
+            }
         }
         let Some(page) = self.arena.closing() else {
             return budget;
@@ -6057,10 +6098,6 @@ impl Renderer {
                     label: Some("Section uploads"),
                 })
         });
-        let meshes = self
-            .sections
-            .values_mut()
-            .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()));
         let flat = self
             .flat
             .as_mut()
@@ -6070,19 +6107,22 @@ impl Renderer {
         let meshlets = self.mesh_terrain.as_mut().map(|m| &mut m.store);
         let split = self.translucent_arena.is_some();
         let (arena, part) = (&mut self.arena, Part::Section { split });
-        if !off_page::move_off_page_with_meshlets(
+        if !self.arena_compact.move_step(
             arena,
             encoder,
             flat,
             gpu,
             meshlets,
-            meshes,
+            &mut self.sections,
+            &mut self.lods,
             page,
             part,
             &mut budget,
         ) {
             // The other pages have no room after all.
             arena.reopen();
+            self.arena_compact.clear();
+            self.compact_retry = Some(Instant::now() + SHRINK_RETRY);
         }
         // With every mesh moved off, the page stays closed so this frame's
         // uploads can't refill it: `trim` returns it and clears `closing`.
@@ -6097,6 +6137,7 @@ impl Renderer {
     /// again (stopped, the page would stay closed while the new one fills).
     fn shrink_translucent(&mut self, left: u64) {
         let Some(vertices) = self.translucent_arena.as_mut() else {
+            self.shrink_compact.clear();
             return; // split off: nothing to shrink
         };
         let now = Instant::now();
@@ -6105,17 +6146,21 @@ impl Renderer {
             (&mut self.sorted_indices, Part::Indices),
         ];
         if arenas.iter().all(|(arena, _)| arena.closing().is_none()) {
+            self.shrink_compact.clear();
             if !self.shrink_gate.may_start(now, left) {
                 return;
             }
             // The next start in a second, or `SHRINK_RETRY` after a try found no room.
             let mut wait = SHRINK_SETTLE;
             for (arena, part) in &mut arenas {
-                let meshes = self
-                    .sections
-                    .values_mut()
-                    .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()));
-                match begin_shrink(arena, &self.device, meshes, *part) {
+                match begin_shrink_into(
+                    arena,
+                    &self.device,
+                    &self.sections,
+                    &mut self.lods,
+                    *part,
+                    &mut self.shrink_compact,
+                ) {
                     Some(true) => break,
                     Some(false) => wait = SHRINK_RETRY, // the other arena may still go
                     None => {}
@@ -6135,10 +6180,6 @@ impl Renderer {
                     label: Some("Section uploads"),
                 })
         });
-        let meshes = self
-            .sections
-            .values_mut()
-            .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()));
         // As many quads a frame either way: a quad's indices are a quarter of its bytes.
         let cap = match part {
             Part::Indices => COMPACT_BUDGET / 4,
@@ -6152,9 +6193,21 @@ impl Renderer {
         }
         .map(|f| (f, &self.device, &mut self.section_uploads));
         // GPU culling's records follow the section arena alone.
-        if !move_off_page(arena, encoder, flat, None, meshes, page, part, &mut budget) {
+        if !self.shrink_compact.move_step(
+            arena,
+            encoder,
+            flat,
+            None,
+            None,
+            &mut self.sections,
+            &mut self.lods,
+            page,
+            part,
+            &mut budget,
+        ) {
             // New ranges took the room: both pages stay, drawn, until a later try.
             arena.reopen();
+            self.shrink_compact.clear();
             self.shrink_gate.wait(now, SHRINK_RETRY);
         }
     }
@@ -6343,6 +6396,9 @@ impl Renderer {
         self.detail_columns.clear();
         self.detail_revision += 1;
         self.upload_retries.clear();
+        self.arena_compact.clear();
+        self.shrink_compact.clear();
+        self.compact_retry = None;
         // A dimension change drops every page at once: freed later, off this thread.
         self.graveyard.add(self.arena.clear());
         if let Some(gpu) = &mut self.gpu_culling {

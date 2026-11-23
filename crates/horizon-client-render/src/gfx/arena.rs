@@ -4,7 +4,7 @@
 //! with pages up to `LARGE_PAGE_BYTES`, and their sorted indices too
 //! (`Arena::translucent_indices`): their back-to-front list then stays in one
 //! page of each and draws in a few multi-draws.
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(test)]
 #[path = "arena/source_tests.rs"]
 mod source_tests;
@@ -20,93 +20,178 @@ pub const PAGE_BYTES: u64 = 256 << 20;
 /// wgpu-core adds to vertex buffers; the device's own limit still applies.
 pub const LARGE_PAGE_BYTES: u64 = (1 << 31) - (1 << 20);
 
-/// Free vertex ranges: start -> length, never adjacent.
+/// Power-of-two size classes for [`FreeList`]: class `c < 31` holds holes in `[1 << c, 2 << c)`,
+/// and class `31` holds `[1 << 31, u64::MAX]`.
+const SIZE_CLASSES: usize = 32;
+
+/// Maximum retained scratch entries on [`Arena`] after a bulk release wave.
+const RELEASE_SCRATCH_CAP: usize = 8192;
+
+/// Free vertex ranges: start -> length, never adjacent, indexed by power-of-two
+/// size classes for O(1)/O(log H) exact best-fit allocation and O(1) exact `max_bound`.
 #[derive(Debug)]
 struct FreeList {
     ranges: BTreeMap<u64, u64>,
+    /// Holes partitioned by [`Self::size_class`], ordered by `(len, start)` within each class.
+    classes: Box<[BTreeSet<(u64, u64)>; SIZE_CLASSES]>,
+    /// Bit `c` is set iff `classes[c]` is non-empty.
+    non_empty: u32,
     /// Total free vertices across `ranges`, maintained in O(1).
     total: u64,
-    /// Upper bound on the largest single free range in `ranges`:
-    /// raised on `give`/`give_all`, tightened whenever `take(len)` misses.
+    /// Exact length of the largest single free range in `ranges`, maintained in O(1) amortized.
     max_bound: u64,
 }
 
 impl PartialEq for FreeList {
     fn eq(&self, other: &Self) -> bool {
-        self.ranges == other.ranges && self.total == other.total
+        self.ranges == other.ranges
+            && self.total == other.total
+            && self.max_bound == other.max_bound
     }
 }
 
 impl FreeList {
+    fn size_class(len: u64) -> usize {
+        debug_assert!(len > 0);
+        ((u64::BITS - 1 - len.leading_zeros()) as usize).min(SIZE_CLASSES - 1)
+    }
     fn new(capacity: u64) -> Self {
-        Self {
-            ranges: BTreeMap::from([(0, capacity)]),
+        let mut list = Self {
+            ranges: BTreeMap::new(),
+            classes: Box::new(std::array::from_fn(|_| BTreeSet::new())),
+            non_empty: 0,
             total: capacity,
             max_bound: capacity,
+        };
+        if capacity > 0 {
+            list.insert_hole(0, capacity);
         }
+        list
     }
     #[cfg(test)]
     fn from_ranges(ranges: BTreeMap<u64, u64>) -> Self {
-        let total = ranges.values().sum();
-        let max_bound = ranges.values().copied().max().unwrap_or(0);
-        Self {
-            ranges,
-            total,
-            max_bound,
+        let mut list = Self::new(0);
+        for (start, len) in ranges {
+            if len > 0 {
+                list.total += len;
+                list.max_bound = list.max_bound.max(len);
+                list.insert_hole(start, len);
+            }
+        }
+        list
+    }
+    fn insert_hole(&mut self, start: u64, len: u64) {
+        debug_assert!(len > 0);
+        let class = Self::size_class(len);
+        self.ranges.insert(start, len);
+        self.classes[class].insert((len, start));
+        self.non_empty |= 1u32 << class;
+    }
+    fn remove_hole(&mut self, start: u64, len: u64) {
+        let removed = self.ranges.remove(&start);
+        debug_assert_eq!(removed, Some(len));
+        let class = Self::size_class(len);
+        let class_removed = self.classes[class].remove(&(len, start));
+        debug_assert!(class_removed);
+        if self.classes[class].is_empty() {
+            self.non_empty &= !(1u32 << class);
         }
     }
-    /// First fit, skipping pages whose total or largest free range cannot hold `len`.
+    fn clear_classes(&mut self) {
+        let mut mask = self.non_empty;
+        while mask != 0 {
+            let class = mask.trailing_zeros() as usize;
+            self.classes[class].clear();
+            mask &= mask - 1;
+        }
+        self.non_empty = 0;
+    }
+    fn recompute_max_bound(&mut self) {
+        if self.non_empty == 0 {
+            self.max_bound = 0;
+        } else {
+            let top = (u32::BITS - 1 - self.non_empty.leading_zeros()) as usize;
+            self.max_bound = self.classes[top].last().map_or(0, |&(len, _)| len);
+        }
+    }
+    /// Resets the free list to a single `0..capacity` range, reusing its bucket storage.
+    fn reset(&mut self, capacity: u64) {
+        self.ranges.clear();
+        self.clear_classes();
+        self.total = capacity;
+        self.max_bound = capacity;
+        if capacity > 0 {
+            self.insert_hole(0, capacity);
+        }
+    }
+    /// Exact best fit (smallest hole `>= len`, tie-broken by lowest address), skipping pages
+    /// whose total or exact largest free range cannot hold `len`.
     fn take(&mut self, len: u64) -> Option<u64> {
+        if len == 0 {
+            return self.ranges.keys().next().copied();
+        }
         if len > self.total || len > self.max_bound {
             return None;
         }
-        let Some((&start, &free)) = self.ranges.iter().find(|(_, l)| **l >= len) else {
-            self.max_bound = self.max_bound.min(len.saturating_sub(1));
-            return None;
-        };
-        self.ranges.remove(&start);
+        let class = Self::size_class(len);
+        let hit = if self.non_empty & (1u32 << class) != 0 {
+            self.classes[class].range((len, 0)..).next().copied()
+        } else {
+            None
+        }
+        .or_else(|| {
+            let higher_mask = if class + 1 < SIZE_CLASSES {
+                self.non_empty & (!0u32 << (class + 1))
+            } else {
+                0
+            };
+            if higher_mask == 0 {
+                return None;
+            }
+            let next_class = higher_mask.trailing_zeros() as usize;
+            self.classes[next_class].first().copied()
+        });
+        let (free, start) = hit?;
+        self.remove_hole(start, free);
         if free > len {
-            self.ranges.insert(start + len, free - len);
+            self.insert_hole(start + len, free - len);
         }
         self.total -= len;
-        if self.total == 0 {
-            self.max_bound = 0;
-        } else if self.ranges.len() == 1 {
-            self.max_bound = self.total;
-        } else {
-            self.max_bound = self.max_bound.min(self.total);
+        if free == self.max_bound {
+            self.recompute_max_bound();
         }
         Some(start)
     }
     fn give(&mut self, start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
         self.total += len;
         let (mut start, mut len) = (start, len);
         if let Some((&prev, &prev_len)) = self.ranges.range(..start).next_back()
             && prev + prev_len == start
         {
-            self.ranges.remove(&prev);
+            self.remove_hole(prev, prev_len);
             start = prev;
             len += prev_len;
         }
-        if let Some(next_len) = self.ranges.remove(&(start + len)) {
+        if let Some(&next_len) = self.ranges.get(&(start + len)) {
+            self.remove_hole(start + len, next_len);
             len += next_len;
         }
         self.max_bound = self.max_bound.max(len);
-        self.ranges.insert(start, len);
+        self.insert_hole(start, len);
     }
-    /// `give` for many ranges: one merge of the sorted ranges into the list,
-    /// where giving them one by one costs a few tree lookups each.
-    fn give_all(&mut self, mut ranges: Vec<(u64, u64)>) {
-        if ranges.len() < 64 {
-            for (start, len) in ranges {
-                self.give(start, len);
-            }
-            return;
-        }
-        ranges.sort_unstable();
+    /// Merges an already-sorted iterator of `(start, len)` ranges into the free list,
+    /// reusing `merged` as scratch so bulk unloads do not allocate.
+    fn give_sorted_run(
+        &mut self,
+        given: impl Iterator<Item = (u64, u64)>,
+        merged: &mut Vec<(u64, u64)>,
+    ) {
+        merged.clear();
         let mut free = std::mem::take(&mut self.ranges).into_iter().peekable();
-        let mut given = ranges.into_iter().peekable();
-        let mut merged: Vec<(u64, u64)> = Vec::new();
+        let mut given = given.filter(|&(_, len)| len > 0).peekable();
         loop {
             let next = match (free.peek(), given.peek()) {
                 (Some(a), Some(b)) if a.0 <= b.0 => free.next(),
@@ -120,16 +205,34 @@ impl FreeList {
                 _ => merged.push((start, len)),
             }
         }
+        self.clear_classes();
         let mut total = 0u64;
         let mut max_bound = 0u64;
-        for &(_, len) in &merged {
+        for &(start, len) in &*merged {
             total += len;
             max_bound = max_bound.max(len);
+            let class = Self::size_class(len);
+            self.classes[class].insert((len, start));
+            self.non_empty |= 1u32 << class;
         }
         self.total = total;
         self.max_bound = max_bound;
         // Sorted: the tree is built in one pass.
-        self.ranges = merged.into_iter().collect();
+        self.ranges = merged.drain(..).collect();
+    }
+    /// `give` for many ranges: one merge of the sorted ranges into the list,
+    /// where giving them one by one costs a few tree lookups each.
+    #[cfg(test)]
+    fn give_all(&mut self, mut ranges: Vec<(u64, u64)>) {
+        if ranges.len() < 64 {
+            for (start, len) in ranges {
+                self.give(start, len);
+            }
+            return;
+        }
+        ranges.sort_unstable();
+        let mut merged = Vec::new();
+        self.give_sorted_run(ranges.into_iter(), &mut merged);
     }
     /// End of the last range in use (excludes any trailing free range up to `capacity`).
     fn last_used_end(&self, capacity: u64) -> u64 {
@@ -169,9 +272,58 @@ impl Page {
     }
 }
 
-/// An arena with this many bytes in free ranges, at least half of its pages,
-/// has a page worth emptying (`Arena::sparsest`).
+/// An arena with at least this many bytes in free ranges may evacuate a sparse
+/// page (`Arena::sparsest`).
 const COMPACT_MIN_FREE: u64 = 128 << 20;
+
+/// Page-based compaction selector shared by [`Arena::sparsest_from`]: picks the
+/// sparsest reclaimable page `(index, capacity, free, host)` when total free
+/// bytes reach `min_free`.
+fn pick_sparsest_page<I, F>(pages: F, stride: u64, min_free: u64) -> Option<u32>
+where
+    I: Iterator<Item = (usize, u64, u64, bool)>,
+    F: Fn() -> I,
+{
+    let free: u64 = pages().map(|(_, _, f, _)| f).sum();
+    if free.saturating_mul(stride) < min_free {
+        return None;
+    }
+    let capacity: u64 = pages().map(|(_, c, _, _)| c).sum();
+    // Moves only go to video-memory pages (`alloc_moved`).
+    let local_free: u64 = pages()
+        .filter(|(_, _, _, host)| !*host)
+        .map(|(_, _, f, _)| f)
+        .sum();
+    pages()
+        .filter_map(|(i, cap, page_free, host)| {
+            let used = cap - page_free;
+            if used == 0 {
+                return None;
+            }
+            let own = if host { 0 } else { page_free };
+            let other_local = local_free - own;
+            // Room elsewhere, leaving an eighth for best-fit rounding and gaps.
+            let elsewhere = other_local - other_local / 8;
+            if used > elsewhere {
+                return None;
+            }
+            if !host {
+                // Page-based reclaimability gate: evacuate a VRAM page only when it is at
+                // most half full and reclaiming it still leaves healthy slack across the
+                // surviving pages (avoiding flight ping-pong while reclaiming sparse pages
+                // long before a global 50%-free wait wastes >1 GiB at high render distances).
+                let cap_after = capacity - cap;
+                let slack = (cap / 4).max(cap_after / 8);
+                if used * 2 > cap || local_free < cap.saturating_add(slack) {
+                    return None;
+                }
+            }
+            // A page in system memory is emptied first.
+            Some((!host, used, i as u32))
+        })
+        .min()
+        .map(|(_, _, i)| i)
+}
 /// A page of at least this many bytes shrinks (`Arena::oversized`) when a page
 /// of its ranges in use halves it or is `PAGE_BYTES` smaller.
 const SHRINK_MIN_BYTES: u64 = 64 << 20;
@@ -194,6 +346,10 @@ pub struct Arena {
     spilled: bool,
     sources_enabled: bool,
     looks_enabled: bool,
+    /// Reusable scratch for `release_all` (`(page, start, len)` sorted in place).
+    release_scratch: Vec<(u32, u64, u64)>,
+    /// Reusable merge scratch passed into `FreeList::give_sorted_run`.
+    merge_scratch: Vec<(u64, u64)>,
     /// Tests: GPU-local pages fail as if video memory were full.
     #[cfg(test)]
     video_memory_full: bool,
@@ -293,6 +449,8 @@ impl Arena {
             spilled: false,
             sources_enabled: false,
             looks_enabled: false,
+            release_scratch: Vec::new(),
+            merge_scratch: Vec::new(),
             #[cfg(test)]
             video_memory_full: false,
             #[cfg(test)]
@@ -653,33 +811,16 @@ impl Arena {
         if self.closing.is_some() {
             return None;
         }
-        let pages = || {
-            self.pages
-                .iter()
-                .enumerate()
-                .filter_map(|(i, p)| Some((i, p.as_ref()?)))
-        };
-        let free: u64 = pages().map(|(_, p)| p.free_vertices()).sum();
-        let capacity: u64 = pages().map(|(_, p)| p.capacity).sum();
-        if free * self.stride < min_free || free * 2 < capacity {
-            return None;
-        }
-        // Moves only go to video-memory pages (`alloc_moved`).
-        let local_free: u64 = pages()
-            .filter(|(_, p)| !p.host)
-            .map(|(_, p)| p.free_vertices())
-            .sum();
-        pages()
-            .filter_map(|(i, p)| {
-                let used = p.capacity - p.free_vertices();
-                let own = if p.host { 0 } else { p.free_vertices() };
-                // The room elsewhere, less a quarter for first fit's gaps.
-                let elsewhere = (local_free - own) / 4 * 3;
-                // A page in system memory is emptied first.
-                (used > 0 && used <= elsewhere).then_some((!p.host, used, i as u32))
-            })
-            .min()
-            .map(|(_, _, i)| i)
+        pick_sparsest_page(
+            || {
+                self.pages.iter().enumerate().filter_map(|(i, p)| {
+                    let p = p.as_ref()?;
+                    Some((i, p.capacity, p.free_vertices(), p.host))
+                })
+            },
+            self.stride,
+            min_free,
+        )
     }
     /// A page far larger than its ranges in use, and the capacity a page of them
     /// gets (`grown`: twice theirs, or `PAGE_BYTES` more; at least the first
@@ -799,27 +940,55 @@ impl Arena {
     }
     /// `release` for many ranges (page, start, vertices) at once.
     pub fn release_all(&mut self, ranges: impl IntoIterator<Item = (u32, u64, u64)>) {
-        let mut by_page: Vec<Vec<(u64, u64)>> = Vec::new();
-        for (page, start, vertices) in ranges {
-            let page = page as usize;
-            if by_page.len() <= page {
-                by_page.resize_with(page + 1, Vec::new);
-            }
-            by_page[page].push((start, Self::span(vertices).min(self.page_limit)));
+        self.release_scratch.clear();
+        let limit = self.page_limit;
+        self.release_scratch.extend(
+            ranges
+                .into_iter()
+                .map(|(page, start, vertices)| (page, start, Self::span(vertices).min(limit))),
+        );
+        if self.release_scratch.is_empty() {
+            return;
         }
-        for (page, ranges) in by_page.into_iter().enumerate() {
-            if ranges.is_empty() {
-                continue;
+        if self.release_scratch.len() < 64 {
+            for &(page, start, len) in &self.release_scratch {
+                self.pages[page as usize]
+                    .as_mut()
+                    .expect("live arena page")
+                    .free
+                    .give(start, len);
             }
-            let page = self.pages[page].as_mut().expect("live arena page");
+            self.release_scratch.clear();
+            return;
+        }
+        self.release_scratch.sort_unstable();
+        for run in self.release_scratch.chunk_by(|a, b| a.0 == b.0) {
+            let page = self.pages[run[0].0 as usize]
+                .as_mut()
+                .expect("live arena page");
             // Every range of the page given back (a far teleport empties the arena): one
-            // free range, without sorting tens of thousands into the list.
-            let given: u64 = ranges.iter().map(|r| r.1).sum();
+            // free range, without merging tens of thousands into the list.
+            let given: u64 = run.iter().map(|r| r.2).sum();
             if page.free_vertices() + given == page.capacity {
-                page.free = FreeList::new(page.capacity);
+                page.free.reset(page.capacity);
+            } else if run.len() < 64 {
+                for &(_, start, len) in run {
+                    page.free.give(start, len);
+                }
             } else {
-                page.free.give_all(ranges);
+                page.free.give_sorted_run(
+                    run.iter().map(|&(_, start, len)| (start, len)),
+                    &mut self.merge_scratch,
+                );
             }
+        }
+        self.release_scratch.clear();
+        if self.release_scratch.capacity() > RELEASE_SCRATCH_CAP {
+            self.release_scratch.shrink_to(RELEASE_SCRATCH_CAP);
+        }
+        self.merge_scratch.clear();
+        if self.merge_scratch.capacity() > RELEASE_SCRATCH_CAP {
+            self.merge_scratch.shrink_to(RELEASE_SCRATCH_CAP);
         }
     }
     /// The capacity the newest page grows to for a range of `len`: half as
@@ -907,6 +1076,10 @@ impl Arena {
     /// Drops every page; gives back their buffers, for a [`Graveyard`].
     pub fn clear(&mut self) -> Vec<wgpu::Buffer> {
         self.closing = None;
+        self.release_scratch.clear();
+        self.release_scratch.shrink_to_fit();
+        self.merge_scratch.clear();
+        self.merge_scratch.shrink_to_fit();
         let mut released = Vec::new();
         for p in self.pages.drain(..).flatten() {
             released.push(p.buffer);
@@ -1963,6 +2136,291 @@ mod tests {
         assert_eq!(free.take(3 * GRAIN), Some(0));
         assert_eq!(free.total, GRAIN);
         assert_eq!(free.max_bound, GRAIN);
+    }
+
+    #[test]
+    fn best_fit_prefers_tightest_hole_then_lowest_address() {
+        let mut free = FreeList::new(10 * GRAIN);
+        let a = free.take(4 * GRAIN).unwrap();
+        let _b = free.take(GRAIN).unwrap();
+        let c = free.take(2 * GRAIN).unwrap();
+        let _d = free.take(GRAIN).unwrap();
+        let e = free.take(2 * GRAIN).unwrap();
+        assert_eq!((a, c, e), (0, 5 * GRAIN, 8 * GRAIN));
+        assert_eq!((free.total, free.max_bound), (0, 0));
+
+        // Three holes: 4*GRAIN at 0, 2*GRAIN at 5*GRAIN, 2*GRAIN at 8*GRAIN.
+        free.give(a, 4 * GRAIN);
+        free.give(c, 2 * GRAIN);
+        free.give(e, 2 * GRAIN);
+        assert_eq!((free.total, free.max_bound), (8 * GRAIN, 4 * GRAIN));
+
+        // 2*GRAIN picks the tightest fit (2*GRAIN) at the lowest address (c), keeping 4*GRAIN intact.
+        assert_eq!(free.take(2 * GRAIN), Some(c));
+        assert_eq!((free.total, free.max_bound), (6 * GRAIN, 4 * GRAIN));
+
+        // GRAIN carves from the remaining 2*GRAIN hole (e), still preserving the 4*GRAIN hole (a).
+        assert_eq!(free.take(GRAIN), Some(e));
+        assert_eq!((free.total, free.max_bound), (5 * GRAIN, 4 * GRAIN));
+
+        // 4*GRAIN still fits at 0 because best-fit did not shred the largest hole.
+        assert_eq!(free.take(4 * GRAIN), Some(a));
+        assert_eq!((free.total, free.max_bound), (GRAIN, GRAIN));
+        assert_eq!(free.last_used_end(10 * GRAIN), 9 * GRAIN);
+    }
+
+    #[test]
+    fn segregated_free_list_randomized_property_matches_reference_best_fit() {
+        fn assert_invariants(fl: &FreeList, capacity: u64, live: &[(u64, u64)]) {
+            let sum: u64 = fl.ranges.values().sum();
+            assert_eq!(fl.total, sum, "total mismatch");
+            let expected_max = fl.ranges.values().copied().max().unwrap_or(0);
+            assert_eq!(fl.max_bound, expected_max, "exact max_bound mismatch");
+            assert_eq!(fl.is_all_free(capacity), live.is_empty());
+
+            // Ranges are non-empty, in-bounds, and never adjacent or overlapping.
+            let mut prev_end: Option<u64> = None;
+            for (&start, &len) in &fl.ranges {
+                assert!(len > 0);
+                assert!(start + len <= capacity);
+                if let Some(pe) = prev_end {
+                    assert!(pe < start, "adjacent or overlapping holes: {pe} vs {start}");
+                }
+                prev_end = Some(start + len);
+            }
+
+            // Segregated classes and `non_empty` bitmask match `ranges` bijectively.
+            let mut indexed = BTreeMap::new();
+            for (class, bucket) in fl.classes.iter().enumerate() {
+                let bit = (fl.non_empty & (1u32 << class)) != 0;
+                assert_eq!(
+                    bit,
+                    !bucket.is_empty(),
+                    "non_empty bit out of sync for class {class}"
+                );
+                for &(len, start) in bucket {
+                    assert_eq!(FreeList::size_class(len), class);
+                    assert_eq!(indexed.insert(start, len), None);
+                }
+            }
+            assert_eq!(indexed, fl.ranges, "classes diverged from ranges");
+
+            let expected_end = live.iter().map(|&(s, l)| s + l).max().unwrap_or(0);
+            assert_eq!(fl.last_used_end(capacity), expected_end);
+        }
+
+        fn ref_take(ranges: &mut BTreeMap<u64, u64>, len: u64) -> Option<u64> {
+            if len == 0 {
+                return ranges.keys().next().copied();
+            }
+            let (free, start) = ranges
+                .iter()
+                .filter(|(_, l)| **l >= len)
+                .map(|(&s, &l)| (l, s))
+                .min()?;
+            ranges.remove(&start);
+            if free > len {
+                ranges.insert(start + len, free - len);
+            }
+            Some(start)
+        }
+
+        fn ref_give(ranges: &mut BTreeMap<u64, u64>, mut start: u64, mut len: u64) {
+            if len == 0 {
+                return;
+            }
+            if let Some((&prev, &prev_len)) = ranges.range(..start).next_back()
+                && prev + prev_len == start
+            {
+                ranges.remove(&prev);
+                start = prev;
+                len += prev_len;
+            }
+            if let Some(next_len) = ranges.remove(&(start + len)) {
+                len += next_len;
+            }
+            ranges.insert(start, len);
+        }
+
+        let mut seed = 0x5EED_CAFE_1234_5678u64;
+        let mut next = || -> u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for capacity in [0u64, GRAIN, 4 * GRAIN, 4096 * GRAIN, 1u64 << 33] {
+            let mut fl = FreeList::new(capacity);
+            let mut reference = BTreeMap::new();
+            if capacity > 0 {
+                reference.insert(0u64, capacity);
+            }
+            let mut live: Vec<(u64, u64)> = Vec::new();
+            let steps: usize = if capacity == 0 { 16 } else { 1200 };
+            for step in 0..steps {
+                let req = if capacity == (1u64 << 33) {
+                    const BIG_SIZES: [u64; 6] =
+                        [GRAIN, 1 << 20, 1 << 30, 1 << 31, (1 << 31) + GRAIN, 1 << 32];
+                    BIG_SIZES[(next() as usize) % BIG_SIZES.len()]
+                } else {
+                    let sizes = [
+                        0,
+                        GRAIN,
+                        2 * GRAIN,
+                        3 * GRAIN,
+                        4 * GRAIN,
+                        8 * GRAIN,
+                        16 * GRAIN,
+                        64 * GRAIN,
+                        capacity,
+                    ];
+                    sizes[(next() as usize) % sizes.len()]
+                };
+                let roll = next() % 100;
+                if roll < 55 || live.is_empty() {
+                    let got = fl.take(req);
+                    let expected = ref_take(&mut reference, req);
+                    assert_eq!(got, expected, "cap={capacity} step={step} req={req}");
+                    if let Some(start) = got
+                        && req > 0
+                    {
+                        live.push((start, req));
+                    }
+                } else if roll < 90 {
+                    let idx = (next() as usize) % live.len();
+                    let (start, len) = live.swap_remove(idx);
+                    fl.give(start, len);
+                    ref_give(&mut reference, start, len);
+                } else {
+                    let count = ((next() as usize) % 96 + 1).min(live.len());
+                    let mut batch = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let idx = (next() as usize) % live.len();
+                        batch.push(live.swap_remove(idx));
+                    }
+                    for &(start, len) in &batch {
+                        ref_give(&mut reference, start, len);
+                    }
+                    fl.give_all(batch);
+                }
+                assert_eq!(fl.ranges, reference, "cap={capacity} step={step}");
+                if step.is_multiple_of(32) {
+                    assert_invariants(&fl, capacity, &live);
+                }
+            }
+            for &(start, len) in &live {
+                ref_give(&mut reference, start, len);
+            }
+            fl.give_all(std::mem::take(&mut live));
+            assert_eq!(fl.ranges, reference);
+            assert_invariants(&fl, capacity, &live);
+
+            // Reset after partial allocation restores the single full range cleanly.
+            if capacity >= GRAIN {
+                let _ = fl.take(GRAIN);
+                fl.reset(capacity);
+                assert_invariants(&fl, capacity, &[]);
+                assert_eq!(fl, FreeList::new(capacity));
+            }
+        }
+    }
+
+    #[test]
+    fn page_based_sparsest_compacts_sparse_rd32_pages_without_thrashing() {
+        const MIB: u64 = 1 << 20;
+        let pick = |pages: &[(u64, u64, bool)], stride: u64, min_free: u64| {
+            pick_sparsest_page(
+                || {
+                    pages
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(cap, free, host))| (i, cap, free, host))
+                },
+                stride,
+                min_free,
+            )
+        };
+
+        // RD 32 mountain: 10 x 256 MiB pages; 9 pages are 80% full (51 MiB free each) and
+        // 1 sparse page is 30% full (179 MiB free). Total free = 638 MiB (24.9% of 2560 MiB):
+        // old global 50% rule refused (<1280 MiB), while page-based policy evacuates page 9.
+        let mut rd32 = [(256 * MIB, 51 * MIB, false); 10];
+        rd32[9] = (256 * MIB, 179 * MIB, false);
+        assert_eq!(pick(&rd32, 1, COMPACT_MIN_FREE), Some(9));
+
+        // Steady RD 32 flight: 8 x 256 MiB pages at 87.5% full (256 MiB total free):
+        // must stay quiet to avoid page allocation ping-pong.
+        let steady = [(256 * MIB, 32 * MIB, false); 8];
+        assert_eq!(pick(&steady, 1, COMPACT_MIN_FREE), None);
+
+        // 10 x 256 MiB pages uniformly 79% full (540 MiB total free, none <= 50% full):
+        // avoids copying >200 MiB of live data off a dense page.
+        let uniform_dense = [(256 * MIB, 54 * MIB, false); 10];
+        assert_eq!(pick(&uniform_dense, 1, COMPACT_MIN_FREE), None);
+
+        // Two pages where reclaiming would leave <25% slack on the survivor: wait.
+        let tight_pair = [(256 * MIB, 150 * MIB, false), (256 * MIB, 140 * MIB, false)];
+        assert_eq!(pick(&tight_pair, 1, COMPACT_MIN_FREE), None);
+
+        // Two pages where reclaiming leaves >=25% slack and fits with best-fit headroom.
+        let sparse_pair = [(256 * MIB, 200 * MIB, false), (256 * MIB, 140 * MIB, false)];
+        assert_eq!(pick(&sparse_pair, 1, COMPACT_MIN_FREE), Some(0));
+
+        // A page spilled to system memory evacuates first as soon as VRAM has room,
+        // even when it is >50% full.
+        let with_host = [
+            (256 * MIB, 200 * MIB, false),
+            (256 * MIB, 200 * MIB, false),
+            (256 * MIB, 100 * MIB, true),
+        ];
+        assert_eq!(pick(&with_host, 1, COMPACT_MIN_FREE), Some(2));
+
+        // Single page and `min_free` gate.
+        assert_eq!(pick(&[(256 * MIB, 200 * MIB, false)], 1, 0), None);
+        assert_eq!(pick(&rd32, 1, u64::MAX), None);
+    }
+
+    #[test]
+    fn release_all_reuses_and_bounds_scratch_buffers() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let mut arena = Arena::new(&device, 4, 256 * GRAIN, false);
+        arena.page_limit = 256 * GRAIN;
+        let mut live: Vec<(u32, u64)> = (0..320)
+            .map(|_| alloc(&mut arena, &device, &queue, GRAIN).unwrap())
+            .collect();
+        // Keep a few ranges live on each page so `give_sorted_run` (not `reset`) runs.
+        let mut released = Vec::new();
+        for (i, &(page, start)) in live.iter().enumerate() {
+            if !i.is_multiple_of(5) {
+                released.push((page, start, GRAIN));
+            }
+        }
+        assert!(released.len() >= 128);
+        arena.release_all(released.iter().copied());
+        assert!(arena.release_scratch.is_empty());
+        assert!(arena.merge_scratch.is_empty());
+        assert!(arena.release_scratch.capacity() <= RELEASE_SCRATCH_CAP);
+        assert!(arena.merge_scratch.capacity() <= RELEASE_SCRATCH_CAP);
+
+        // Second release wave reuses scratch buffers and frees the rest back to full capacity.
+        let rest: Vec<_> = live
+            .drain(..)
+            .enumerate()
+            .filter(|(i, _)| i.is_multiple_of(5))
+            .map(|(_, (page, start))| (page, start, GRAIN))
+            .collect();
+        arena.release_all(rest);
+        for page in arena.pages.iter().flatten() {
+            assert!(page.free.is_all_free(page.capacity));
+        }
+        drop(arena.clear());
+        assert_eq!(arena.release_scratch.capacity(), 0);
+        assert_eq!(arena.merge_scratch.capacity(), 0);
     }
 
     fn read(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64) -> u32 {

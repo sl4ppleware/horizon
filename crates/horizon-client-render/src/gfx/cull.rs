@@ -733,6 +733,43 @@ fn buffer(
     })
 }
 
+/// Decodes mapped GPU readback words directly from raw bytes in a single pass
+/// (avoiding both 4-byte alignment requirements on Windows Vega 11 mappings and
+/// a per-frame `Vec<u32>` heap copy), updating `seen` / `seen_tiles` and
+/// returning `([hidden_count, tested_count], hidden_index_share)`.
+fn apply_readback_bytes(
+    data: &[u8],
+    stamp: u32,
+    slots: &[u32],
+    indices: &[u32],
+    total: u64,
+    seen: &mut Vec<bool>,
+    seen_tiles: &mut Vec<bool>,
+) -> ([usize; 2], f32) {
+    let (words, _) = data.as_chunks::<4>();
+    debug_assert_eq!(words.len(), slots.len());
+    debug_assert_eq!(words.len(), indices.len());
+    let (mut hidden, mut hidden_indices) = (0usize, 0u64);
+    for ((&word, &n), &slot) in words.iter().zip(indices).zip(slots) {
+        let visible = u32::from_ne_bytes(word) == stamp;
+        if !visible {
+            hidden += 1;
+            hidden_indices += u64::from(n);
+        }
+        let (target, idx) = if slot & TILE != 0 {
+            (&mut *seen_tiles, (slot & !TILE) as usize)
+        } else {
+            (&mut *seen, slot as usize)
+        };
+        if idx >= target.len() {
+            target.resize(idx + 1, false);
+        }
+        target[idx] = visible;
+    }
+    let share = hidden_indices as f32 / total.max(1) as f32;
+    ([hidden, words.len()], share)
+}
+
 const TEST_READ: wgpu::BufferUsages = if cfg!(test) {
     wgpu::BufferUsages::COPY_SRC
 } else {
@@ -1184,28 +1221,17 @@ impl Cull {
             let mapped = r.buffer.slice(..r.slots.len() as u64 * 4);
             if let Ok(data) = mapped.get_mapped_range() {
                 // The mapping isn't guaranteed to be 4-byte aligned (a Vega 11
-                // on Windows panicked in cast_slice), so copy the words out.
-                let results: Vec<u32> = bytemuck::pod_collect_to_vec(&data);
-                let (mut hidden, mut indices) = (0, 0u64);
-                for (&result, &n) in results.iter().zip(&r.indices) {
-                    if result != r.stamp {
-                        hidden += 1;
-                        indices += u64::from(n);
-                    }
-                }
-                let share = indices as f32 / r.total.max(1) as f32;
-                self.hidden = ([hidden, results.len()], share);
-                for (&slot, &result) in r.slots.iter().zip(&results) {
-                    let (seen, slot) = if slot & TILE != 0 {
-                        (&mut self.seen_tiles, (slot & !TILE) as usize)
-                    } else {
-                        (&mut self.seen, slot as usize)
-                    };
-                    if slot >= seen.len() {
-                        seen.resize(slot + 1, false);
-                    }
-                    seen[slot] = result == r.stamp;
-                }
+                // on Windows panicked in cast_slice), so decode the words from
+                // raw bytes in a single pass without allocating a copy buffer.
+                self.hidden = apply_readback_bytes(
+                    &data,
+                    r.stamp,
+                    &r.slots,
+                    &r.indices,
+                    r.total,
+                    &mut self.seen,
+                    &mut self.seen_tiles,
+                );
             }
             r.buffer.unmap();
             r.state.store(FREE, Ordering::Release);
@@ -2413,5 +2439,71 @@ struct Rect {
         .expect("Cull::pick(Compute) must succeed on qualifying adapter");
         assert_eq!(compute.depth_test, DepthTest::Compute);
         assert!(compute.hiz_read_layout().is_some());
+    }
+
+    #[test]
+    fn apply_readback_bytes_matches_pod_collect_including_unaligned_mappings() {
+        let stamp = 0x1357_9BDFu32;
+        let words = [stamp, 0, stamp, stamp.wrapping_sub(1), stamp, 42];
+        let slots = [3u32, 0, TILE | 5, 1, TILE | 2, 7];
+        let indices = [120u32, 480, 60, 300, 90, 240];
+        let total = 1290u64;
+
+        // Place words at offset 1 inside a 4-byte-aligned buffer so `unaligned` has
+        // alignment 1 (like Vega 11 mapped ranges).
+        let mut aligned = [0u32; 8];
+        let bytes = bytemuck::bytes_of_mut(&mut aligned);
+        bytes[0] = 0xAA;
+        for (i, word) in words.iter().enumerate() {
+            bytes[1 + i * 4..1 + (i + 1) * 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        let unaligned = &bytes[1..1 + words.len() * 4];
+        assert!(!(unaligned.as_ptr() as usize).is_multiple_of(4));
+
+        // Reference two-loop implementation using `bytemuck::pod_collect_to_vec`.
+        let ref_results: Vec<u32> = bytemuck::pod_collect_to_vec(unaligned);
+        let (mut ref_hidden, mut ref_indices) = (0usize, 0u64);
+        for (&result, &n) in ref_results.iter().zip(&indices) {
+            if result != stamp {
+                ref_hidden += 1;
+                ref_indices += u64::from(n);
+            }
+        }
+        let ref_pair = (
+            [ref_hidden, ref_results.len()],
+            ref_indices as f32 / total.max(1) as f32,
+        );
+        let (mut ref_seen, mut ref_seen_tiles) = (vec![true; 2], vec![true; 1]);
+        for (&slot, &result) in slots.iter().zip(&ref_results) {
+            let (target, idx) = if slot & TILE != 0 {
+                (&mut ref_seen_tiles, (slot & !TILE) as usize)
+            } else {
+                (&mut ref_seen, slot as usize)
+            };
+            if idx >= target.len() {
+                target.resize(idx + 1, false);
+            }
+            target[idx] = result == stamp;
+        }
+
+        let (mut seen, mut seen_tiles) = (vec![true; 2], vec![true; 1]);
+        let got = apply_readback_bytes(
+            unaligned,
+            stamp,
+            &slots,
+            &indices,
+            total,
+            &mut seen,
+            &mut seen_tiles,
+        );
+        assert_eq!(got, ref_pair);
+        assert_eq!(seen, ref_seen);
+        assert_eq!(seen_tiles, ref_seen_tiles);
+
+        // Empty readback leaves `seen` intact and avoids division by zero when total == 0.
+        let empty = apply_readback_bytes(&[], stamp, &[], &[], 0, &mut seen, &mut seen_tiles);
+        assert_eq!(empty, ([0, 0], 0.0));
+        assert_eq!(seen, ref_seen);
+        assert_eq!(seen_tiles, ref_seen_tiles);
     }
 }
