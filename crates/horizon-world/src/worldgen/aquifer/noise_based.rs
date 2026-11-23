@@ -3,11 +3,11 @@ use super::{AquiferField, AquiferSamplers, FluidPicker, FluidStatus};
 use crate::registry::{BlockRegistry, BlockStateId};
 use horizon_core::{
     density::{SampleError, SamplerContext},
+    fast_hash::FxHashMap,
     noise::{DensityError, DensityVolume},
     position::{BlockPos, ChunkPos},
     random::{PositionalRandom, RandomSource},
 };
-use std::collections::HashMap;
 
 const WAY_BELOW_MIN_Y: i32 = -32512;
 const FLOWING_UPDATE_SIMILARITY: f64 = 1.0 - 44.0 / 25.0;
@@ -37,6 +37,7 @@ pub trait AquiferBlockStates {
     fn is_lava(&self, state: BlockStateId) -> bool;
     fn is_water(&self, state: BlockStateId) -> bool;
 }
+#[derive(Clone, Copy)]
 pub struct RegistryAquiferBlockStates<'a> {
     registry: &'a BlockRegistry,
     air: BlockStateId,
@@ -147,7 +148,15 @@ pub struct NoiseBasedAquifer<P, F, B> {
     locations: Vec<i64>,
     /// Each drawn location as `BlockPos.getX/Y/Z` read it back.
     points: Vec<[i32; 3]>,
-    surfaces: HashMap<i64, i32>,
+    /// Pre-sampled surface levels stored in a dense 2D quart grid `(x, z)`
+    /// covering `surface_low .. surface_low + surface_sizes`, with a sparse
+    /// overflow map for out-of-grid queries.
+    surface_low: [i32; 2],
+    surface_sizes: [usize; 2],
+    surface_grid: Vec<i32>,
+    surfaces_overflow: FxHashMap<i64, i32>,
+    /// Reusable scratch buffer for `SurfaceLevel` volume sampling.
+    surface_buf: Vec<f32>,
     /// The anchor `cells` holds, once all 12 of its cells are in the grid.
     anchor: Option<[i32; 3]>,
     /// The column `cells.horizontal` was computed for.
@@ -167,6 +176,46 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
         volume: DensityVolume,
         context: &mut SamplerContext,
     ) -> Result<Self, AquiferError> {
+        let mut result = Self {
+            samplers,
+            picker,
+            random,
+            blocks,
+            minimum: [0; 3],
+            size_x: 0,
+            size_z: 0,
+            statuses: Vec::new(),
+            locations: Vec::new(),
+            points: Vec::new(),
+            surface_low: [0; 2],
+            surface_sizes: [0; 2],
+            surface_grid: Vec::new(),
+            surfaces_overflow: FxHashMap::default(),
+            surface_buf: Vec::new(),
+            anchor: None,
+            column: [0; 2],
+            cells: Cells {
+                index: [0; 12],
+                x: [0; 12],
+                y: [0; 12],
+                z: [0; 12],
+                horizontal: [0; 12],
+            },
+            skip_above_y: 0,
+            schedule: false,
+        };
+        result.reset(volume, context)?;
+        Ok(result)
+    }
+    /// Reuse this aquifer's heap buffers for a new chunk or column `volume`,
+    /// preserving the exact state a fresh `NoiseBasedAquifer::new` produces.
+    /// Commits new state only after all validation, allocation, and surface
+    /// sampling succeed so a failed `reset` leaves the previous state intact.
+    pub fn reset(
+        &mut self,
+        volume: DensityVolume,
+        context: &mut SamplerContext,
+    ) -> Result<(), AquiferError> {
         let low = volume.minimum();
         let high = volume.maximum();
         let minimum = [
@@ -192,58 +241,93 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
             })
             .filter(|n| *n <= 16_777_216)
             .ok_or(AquiferError::InvalidGrid)?;
-        let mut statuses = Vec::new();
-        statuses
-            .try_reserve_exact(count)
-            .map_err(|_| AquiferError::Allocation)?;
-        statuses.resize(count, None);
-        let mut locations = Vec::new();
-        locations
-            .try_reserve_exact(count)
-            .map_err(|_| AquiferError::Allocation)?;
-        locations.resize(count, i64::MAX);
-        let mut points = Vec::new();
-        points
-            .try_reserve_exact(count)
-            .map_err(|_| AquiferError::Allocation)?;
-        points.resize(count, [0; 3]);
-        let mut result = Self {
-            samplers,
-            picker,
-            random,
-            blocks,
-            minimum,
-            size_x: sizes[0],
-            size_z: sizes[2],
-            statuses,
-            locations,
-            points,
-            surfaces: HashMap::new(),
-            anchor: None,
-            column: [0; 2],
-            cells: Cells {
-                index: [0; 12],
-                x: [0; 12],
-                y: [0; 12],
-                z: [0; 12],
-                horizontal: [0; 12],
-            },
-            skip_above_y: 0,
-            schedule: false,
+
+        let surf_min = [minimum[0].wrapping_shl(4), minimum[2].wrapping_shl(4)];
+        let surf_max = [
+            maximum[0].wrapping_shl(4).wrapping_add(9),
+            maximum[2].wrapping_shl(4).wrapping_add(9),
+        ];
+        let surf_low = surf_min.map(|v| v >> 2);
+        let surf_high = surf_max.map(|v| v >> 2);
+        let surf_sizes: [i32; 2] =
+            std::array::from_fn(|i| surf_high[i].wrapping_sub(surf_low[i]).wrapping_add(1));
+        let surf_volume = DensityVolume::new(
+            [surf_sizes[0], 1, surf_sizes[1]],
+            [surf_low[0].wrapping_shl(2), 0, surf_low[1].wrapping_shl(2)],
+            [4, 1, 4],
+        )?;
+        let surf_count = surf_volume.size();
+        if surf_count > 2_097_152 {
+            return Err(AquiferError::InvalidGrid);
+        }
+
+        // Reserve all output buffers before modifying any live state so an
+        // allocation or sampling error leaves the prior grid/surfaces valid.
+        if self.statuses.capacity() < count {
+            self.statuses
+                .try_reserve_exact(count - self.statuses.len())
+                .map_err(|_| AquiferError::Allocation)?;
+        }
+        if self.locations.capacity() < count {
+            self.locations
+                .try_reserve_exact(count - self.locations.len())
+                .map_err(|_| AquiferError::Allocation)?;
+        }
+        if self.points.capacity() < count {
+            self.points
+                .try_reserve_exact(count - self.points.len())
+                .map_err(|_| AquiferError::Allocation)?;
+        }
+        if self.surface_grid.capacity() < surf_count {
+            self.surface_grid
+                .try_reserve_exact(surf_count - self.surface_grid.len())
+                .map_err(|_| AquiferError::Allocation)?;
+        }
+        self.surface_buf.clear();
+        if self.surface_buf.capacity() < surf_count {
+            self.surface_buf
+                .try_reserve_exact(surf_count)
+                .map_err(|_| AquiferError::Allocation)?;
+        }
+        self.surface_buf.resize(surf_count, 0.);
+        self.samplers
+            .get(AquiferField::SurfaceLevel)
+            .sample_volume(context, &mut self.surface_buf, surf_volume)?;
+
+        // Infallible commit: all buffers already have sufficient capacity.
+        self.statuses.clear();
+        self.statuses.resize(count, None);
+        self.locations.clear();
+        self.locations.resize(count, i64::MAX);
+        self.points.clear();
+        self.points.resize(count, [0; 3]);
+        self.minimum = minimum;
+        self.size_x = sizes[0];
+        self.size_z = sizes[2];
+        self.surface_grid.clear();
+        let mut max_surface = i32::MIN;
+        for &raw in &self.surface_buf {
+            let value = (raw as f64).floor() as i32;
+            self.surface_grid.push(value);
+            max_surface = max_surface.max(value);
+        }
+        self.surface_low = surf_low;
+        self.surface_sizes = [surf_sizes[0] as usize, surf_sizes[1] as usize];
+        self.surfaces_overflow.clear();
+        self.anchor = None;
+        self.column = [0; 2];
+        self.cells = Cells {
+            index: [0; 12],
+            x: [0; 12],
+            y: [0; 12],
+            z: [0; 12],
+            horizontal: [0; 12],
         };
-        let max_surface = result
-            .max_surface_level(
-                context,
-                [minimum[0].wrapping_shl(4), minimum[2].wrapping_shl(4)],
-                [
-                    maximum[0].wrapping_shl(4).wrapping_add(9),
-                    maximum[2].wrapping_shl(4).wrapping_add(9),
-                ],
-            )?
-            .wrapping_add(8);
+        let max_surface = max_surface.wrapping_add(8);
         let skip_grid = max_surface.wrapping_add(12).div_euclid(12).wrapping_add(1);
-        result.skip_above_y = skip_grid.wrapping_mul(12).wrapping_add(11).wrapping_sub(1);
-        Ok(result)
+        self.skip_above_y = skip_grid.wrapping_mul(12).wrapping_add(11).wrapping_sub(1);
+        self.schedule = false;
+        Ok(())
     }
     /// Read-only diagnostic state; enumeration never populates a cache.
     pub fn cached_cells(&self) -> impl Iterator<Item = (i64, Option<FluidStatus>)> + '_ {
@@ -253,7 +337,29 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
             .zip(self.statuses.iter().copied())
     }
     pub fn cached_surfaces(&self) -> impl Iterator<Item = (i64, i32)> + '_ {
-        self.surfaces.iter().map(|(key, value)| (*key, *value))
+        let low = self.surface_low;
+        let sx = self.surface_sizes[0];
+        let grid = self
+            .surface_grid
+            .iter()
+            .enumerate()
+            .map(move |(index, &value)| {
+                let x = (index % sx) as i32;
+                let z = (index / sx) as i32;
+                (
+                    ChunkPos::new(
+                        low[0].wrapping_add(x).wrapping_shl(2),
+                        low[1].wrapping_add(z).wrapping_shl(2),
+                    )
+                    .pack(),
+                    value,
+                )
+            });
+        let overflow = self
+            .surfaces_overflow
+            .iter()
+            .map(|(key, value)| (*key, *value));
+        grid.chain(overflow)
     }
     pub fn should_schedule_fluid_update(&self) -> bool {
         self.schedule
@@ -291,64 +397,24 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
         x: i32,
         z: i32,
     ) -> Result<i32, AquiferError> {
-        let x = (x >> 2).wrapping_shl(2);
-        let z = (z >> 2).wrapping_shl(2);
+        let qx = x >> 2;
+        let qz = z >> 2;
+        let rx = qx.wrapping_sub(self.surface_low[0]) as u32 as usize;
+        let rz = qz.wrapping_sub(self.surface_low[1]) as u32 as usize;
+        if rx < self.surface_sizes[0] && rz < self.surface_sizes[1] {
+            return Ok(self.surface_grid[rz * self.surface_sizes[0] + rx]);
+        }
+        let x = qx.wrapping_shl(2);
+        let z = qz.wrapping_shl(2);
         let key = ChunkPos::new(x, z).pack();
-        if let Some(level) = self.surfaces.get(&key) {
-            return Ok(*level);
+        if let Some(&level) = self.surfaces_overflow.get(&key) {
+            return Ok(level);
         }
         let level = self
             .sample(AquiferField::SurfaceLevel, context, [x, 0, z])?
             .floor() as i32;
-        self.surfaces.insert(key, level);
+        self.surfaces_overflow.insert(key, level);
         Ok(level)
-    }
-    fn max_surface_level(
-        &mut self,
-        context: &mut SamplerContext,
-        minimum: [i32; 2],
-        maximum: [i32; 2],
-    ) -> Result<i32, AquiferError> {
-        let low = minimum.map(|v| v >> 2);
-        let high = maximum.map(|v| v >> 2);
-        let sizes: [i32; 2] = std::array::from_fn(|i| high[i].wrapping_sub(low[i]).wrapping_add(1));
-        let volume = DensityVolume::new(
-            [sizes[0], 1, sizes[1]],
-            [low[0].wrapping_shl(2), 0, low[1].wrapping_shl(2)],
-            [4, 1, 4],
-        )?;
-        if volume.size() > 2_097_152 {
-            return Err(AquiferError::InvalidGrid);
-        }
-        let mut buffer = Vec::new();
-        buffer
-            .try_reserve_exact(volume.size())
-            .map_err(|_| AquiferError::Allocation)?;
-        buffer.resize(volume.size(), 0.);
-        self.samplers
-            .get(AquiferField::SurfaceLevel)
-            .sample_volume(context, &mut buffer, volume)?;
-        self.surfaces
-            .try_reserve(volume.size())
-            .map_err(|_| AquiferError::Allocation)?;
-        let mut maximum = i32::MIN;
-        let mut index = 0;
-        for z in 0..sizes[1] {
-            for x in 0..sizes[0] {
-                let value = (buffer[index] as f64).floor() as i32;
-                index += 1;
-                self.surfaces.insert(
-                    ChunkPos::new(
-                        low[0].wrapping_add(x).wrapping_shl(2),
-                        low[1].wrapping_add(z).wrapping_shl(2),
-                    )
-                    .pack(),
-                    value,
-                );
-                maximum = maximum.max(value);
-            }
-        }
-        Ok(maximum)
     }
     fn grid_index(&self, position: [i32; 3]) -> Result<usize, AquiferError> {
         let relative: [i32; 3] = std::array::from_fn(|i| position[i].wrapping_sub(self.minimum[i]));
@@ -1134,6 +1200,234 @@ mod tests {
             surfaces.sort();
             want.sort();
             assert_eq!(surfaces, want);
+        }
+    }
+
+    #[test]
+    fn failed_reset_preserves_prior_state_for_queries() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct ToggleSurface {
+            inner: Pattern,
+            fail: Arc<AtomicBool>,
+        }
+        impl DensitySampler for ToggleSurface {
+            fn sample_value(
+                &self,
+                context: &mut SamplerContext,
+                pos: [i32; 3],
+            ) -> Result<f32, SampleError> {
+                if self.fail.load(Ordering::Relaxed) {
+                    return Err(SampleError::SurfaceSearchOverflow);
+                }
+                self.inner.sample_value(context, pos)
+            }
+        }
+
+        let registry = registry(&STATES);
+        let air = registry.default_state("minecraft:air").unwrap();
+        let water = registry.default_state("minecraft:water").unwrap();
+        let lava = registry.default_state("minecraft:lava").unwrap();
+        let picker = GlobalFluidPicker::new(63, water, lava, air);
+        let fail = Arc::new(AtomicBool::new(false));
+        let pattern =
+            |salt, base, span| Arc::new(Pattern { salt, base, span }) as Arc<dyn DensitySampler>;
+        let surface = Arc::new(ToggleSurface {
+            inner: Pattern {
+                salt: 6,
+                base: -90.,
+                span: 190.,
+            },
+            fail: Arc::clone(&fail),
+        }) as Arc<dyn DensitySampler>;
+        let toggle_samplers = AquiferSamplers::new([
+            pattern(1, -1.5, 3.),
+            pattern(2, -1.2, 2.4),
+            pattern(3, -1., 2.),
+            pattern(4, -0.6, 1.2),
+            pattern(5, -1., 1.3),
+            surface,
+        ]);
+
+        let vol1 = DensityVolume::new([16, 384, 16], [0, -64, 0], [1; 3]).unwrap();
+        let vol2 = DensityVolume::new([16, 384, 16], [64, -64, 64], [1; 3]).unwrap();
+        let mut context = SamplerContext::cached();
+        let mut aquifer = NoiseBasedAquifer::new(
+            toggle_samplers,
+            picker,
+            LegacyPositionalRandom::new(7),
+            RegistryAquiferBlockStates::new(&registry).unwrap(),
+            vol1,
+            &mut context,
+        )
+        .unwrap();
+        let mut reference = NoiseBasedAquifer::new(
+            samplers(),
+            picker,
+            LegacyPositionalRandom::new(7),
+            RegistryAquiferBlockStates::new(&registry).unwrap(),
+            vol1,
+            &mut context,
+        )
+        .unwrap();
+
+        // Populate anchor, column, and cells on vol1.
+        for y in (-64..100).rev() {
+            let got = aquifer
+                .compute_substance(&mut context, [3, y, 5], -0.25)
+                .unwrap();
+            let want = reference
+                .compute_substance(&mut context, [3, y, 5], -0.25)
+                .unwrap();
+            assert_eq!(got, want, "before reset y={y}");
+        }
+        let skip_before = aquifer.skip_sampling_above_y();
+
+        // Surface sampling failure on a larger/shifted volume must leave prior state intact.
+        fail.store(true, Ordering::Relaxed);
+        let err = aquifer.reset(vol2, &mut context);
+        assert!(matches!(err, Err(AquiferError::Sample(_))));
+        assert_eq!(aquifer.skip_sampling_above_y(), skip_before);
+
+        // Queries at vol1 must still match reference without panicking or wrong fluids.
+        for y in (-64..120).rev() {
+            let got = aquifer
+                .compute_substance(&mut context, [3, y, 5], -0.25)
+                .unwrap();
+            let want = reference
+                .compute_substance(&mut context, [3, y, 5], -0.25)
+                .unwrap();
+            assert_eq!(got, want, "after failed reset y={y}");
+            assert_eq!(
+                aquifer.should_schedule_fluid_update(),
+                reference.should_schedule_fluid_update()
+            );
+        }
+
+        // Subsequent successful reset to vol2 works normally.
+        fail.store(false, Ordering::Relaxed);
+        aquifer.reset(vol2, &mut context).unwrap();
+        assert!(aquifer.surfaces_overflow.is_empty());
+        let mut ref2 = NoiseBasedAquifer::new(
+            samplers(),
+            picker,
+            LegacyPositionalRandom::new(7),
+            RegistryAquiferBlockStates::new(&registry).unwrap(),
+            vol2,
+            &mut context,
+        )
+        .unwrap();
+        for y in (-64..100).rev() {
+            assert_eq!(
+                aquifer
+                    .compute_substance(&mut context, [67, y, 69], -0.25)
+                    .unwrap(),
+                ref2.compute_substance(&mut context, [67, y, 69], -0.25)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn reset_clears_poisoned_state_and_matches_fresh_aquifer() {
+        let registry = registry(&STATES);
+        let air = registry.default_state("minecraft:air").unwrap();
+        let water = registry.default_state("minecraft:water").unwrap();
+        let lava = registry.default_state("minecraft:lava").unwrap();
+        let picker = GlobalFluidPicker::new(63, water, lava, air);
+        let blocks = RegistryAquiferBlockStates::new(&registry).unwrap();
+
+        let vol_initial = DensityVolume::new([16, 384, 16], [0, -64, 0], [1; 3]).unwrap();
+        let vol_grow = DensityVolume::new([32, 384, 32], [-96, -64, 80], [1; 3]).unwrap();
+        let vol_shrink = DensityVolume::new([1, 384, 1], [128, -64, -112], [1; 3]).unwrap();
+
+        let mut context = SamplerContext::cached();
+        let mut aquifer = NoiseBasedAquifer::new(
+            samplers(),
+            picker,
+            LegacyPositionalRandom::new(19),
+            blocks,
+            vol_initial,
+            &mut context,
+        )
+        .unwrap();
+
+        for (vol, query_xz) in [(vol_grow, [-85, 91]), (vol_shrink, [128, -112])] {
+            // Poison every reusable field before reset: grid caches, overflow map,
+            // anchor/column/cells, skip bound, and fluid-schedule flag.
+            aquifer.statuses.fill(Some(FluidStatus {
+                level: 777,
+                state: lava,
+            }));
+            aquifer.locations.fill(42);
+            aquifer.points.fill([999, -999, 999]);
+            aquifer.surface_grid.fill(12345);
+            aquifer
+                .surfaces_overflow
+                .insert(ChunkPos::new(4096, -4096).pack(), 9999);
+            aquifer.anchor = Some([12, -3, 45]);
+            aquifer.column = [123, 456];
+            aquifer.cells = Cells {
+                index: [7; 12],
+                x: [11; 12],
+                y: [22; 12],
+                z: [33; 12],
+                horizontal: [44; 12],
+            };
+            aquifer.skip_above_y = i32::MAX;
+            aquifer.schedule = true;
+
+            aquifer.reset(vol, &mut context).unwrap();
+            assert!(aquifer.surfaces_overflow.is_empty());
+            assert!(aquifer.anchor.is_none());
+            assert!(!aquifer.should_schedule_fluid_update());
+
+            let mut fresh = NoiseBasedAquifer::new(
+                samplers(),
+                picker,
+                LegacyPositionalRandom::new(19),
+                blocks,
+                vol,
+                &mut context,
+            )
+            .unwrap();
+            assert_eq!(
+                aquifer.skip_sampling_above_y(),
+                fresh.skip_sampling_above_y()
+            );
+            assert!(aquifer.cached_cells().eq(fresh.cached_cells()));
+
+            let mut got_surfaces: Vec<_> = aquifer.cached_surfaces().collect();
+            let mut want_surfaces: Vec<_> = fresh.cached_surfaces().collect();
+            got_surfaces.sort();
+            want_surfaces.sort();
+            assert_eq!(got_surfaces, want_surfaces);
+
+            let [qx, qz] = query_xz;
+            for y in (-64..110).rev() {
+                assert_eq!(
+                    aquifer
+                        .compute_substance(&mut context, [qx, y, qz], -0.25)
+                        .unwrap(),
+                    fresh
+                        .compute_substance(&mut context, [qx, y, qz], -0.25)
+                        .unwrap(),
+                    "y={y} at [{qx}, {qz}]"
+                );
+                assert_eq!(
+                    aquifer.should_schedule_fluid_update(),
+                    fresh.should_schedule_fluid_update(),
+                    "schedule y={y} at [{qx}, {qz}]"
+                );
+            }
+
+            assert!(aquifer.cached_cells().eq(fresh.cached_cells()));
+            let mut got_surfaces: Vec<_> = aquifer.cached_surfaces().collect();
+            let mut want_surfaces: Vec<_> = fresh.cached_surfaces().collect();
+            got_surfaces.sort();
+            want_surfaces.sort();
+            assert_eq!(got_surfaces, want_surfaces);
         }
     }
 }

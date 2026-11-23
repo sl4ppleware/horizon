@@ -364,6 +364,9 @@ struct Pipeline<R: RandomSource> {
     noises: BTreeMap<String, Arc<dyn Noise>>,
     extensions: MaterialExtensions<R::Positional>,
     picker: GlobalFluidPicker,
+    aquifer_random: R::Positional,
+    aquifer_blocks: Option<RegistryAquiferBlockStates<'static>>,
+    air_state: BlockStateId,
     zoom: BiomeZoom,
     biome_cache: BiomeCache,
     /// The terrain density's cell lattice each biome chunk's climate volume
@@ -612,6 +615,17 @@ impl SurfaceBiomeRegion {
     }
 }
 
+type ChunkNoiseAquifer<R> = NoiseBasedAquifer<
+    GlobalFluidPicker,
+    <R as RandomSource>::Positional,
+    RegistryAquiferBlockStates<'static>,
+>;
+
+enum ActiveAquifer<R: RandomSource> {
+    Noise(Box<ChunkNoiseAquifer<R>>),
+    Disabled(DisabledAquifer<GlobalFluidPicker>),
+}
+
 /// `NoiseGeneratorSettings`' `default_block` and `default_fluid`: a block state
 /// in 26.3's form, the id alone or `{"id", "properties"}`.
 fn state(
@@ -714,12 +728,15 @@ where
             },
             settings.sea_level,
         );
+        let air_state = default("minecraft:air")?;
         let picker = GlobalFluidPicker::new(
             settings.sea_level,
             settings.default_fluid,
             default("minecraft:lava")?,
-            default("minecraft:air")?,
+            air_state,
         );
+        let aquifer_random = root.from_hash_of("minecraft:aquifer").fork_positional();
+        let aquifer_blocks = RegistryAquiferBlockStates::new(data.registry).ok();
         let mut pipeline = Self {
             zoom: BiomeZoom::new(obfuscate_seed(seed)),
             data,
@@ -736,6 +753,9 @@ where
             noises,
             extensions,
             picker,
+            aquifer_random,
+            aquifer_blocks,
+            air_state,
             biome_cache: BiomeCache::new(),
             lattice_cache: LatticeCache::new(),
             biome_work: ChunkWork::new(),
@@ -1209,24 +1229,37 @@ where
         }
         worker.timings.structures += lap(&mut clock);
         worker.timings.noise += lap(&mut clock);
-        let mut aquifer: Box<dyn TerrainAquifer> = match &self.aquifer {
-            Some(samplers) => Box::new(
-                NoiseBasedAquifer::new(
-                    AquiferSamplers::new(samplers.clone()),
-                    self.picker,
-                    self.root
-                        .from_hash_of("minecraft:aquifer")
-                        .fork_positional(),
-                    RegistryAquiferBlockStates::new(data.registry).map_err(stage("aquifer"))?,
-                    volume,
-                    context,
-                )
-                .map_err(stage("aquifer"))?,
-            ),
-            None => Box::new(DisabledAquifer::new(
-                self.picker,
-                data.registry.default_state("minecraft:air").unwrap(),
-            )),
+        let mut aquifer: ActiveAquifer<R> = match &self.aquifer {
+            Some(samplers) => {
+                let aq = match worker
+                    .chunk_aquifer
+                    .take()
+                    .and_then(|b| b.downcast::<ChunkNoiseAquifer<R>>().ok())
+                {
+                    Some(mut aq) => {
+                        aq.reset(volume, context).map_err(stage("aquifer"))?;
+                        aq
+                    }
+                    None => {
+                        let blocks = self.aquifer_blocks.ok_or_else(|| {
+                            stage("aquifer")(super::aquifer::AquiferError::MissingBlock)
+                        })?;
+                        Box::new(
+                            NoiseBasedAquifer::new(
+                                AquiferSamplers::new(samplers.clone()),
+                                self.picker,
+                                self.aquifer_random.clone(),
+                                blocks,
+                                volume,
+                                context,
+                            )
+                            .map_err(stage("aquifer"))?,
+                        )
+                    }
+                };
+                ActiveAquifer::Noise(aq)
+            }
+            None => ActiveAquifer::Disabled(DisabledAquifer::new(self.picker, self.air_state)),
         };
         worker.timings.noise += lap(&mut clock);
         // The density cells this fill needs are mostly in the climate volumes
@@ -1243,14 +1276,24 @@ where
         context.set_lattice(lattice);
         let filled = match &self.mod_terrain {
             Some(terrain) => terrain.fill(&mut chunk, data.registry, self.seed, [min, height]),
-            None => fill_noise(
-                &mut chunk,
-                volume,
-                self.router.get(RouterField::FinalDensity).as_ref(),
-                context,
-                aquifer.as_mut(),
-                self.settings.default_block,
-            ),
+            None => match &mut aquifer {
+                ActiveAquifer::Noise(aquifer) => fill_noise(
+                    &mut chunk,
+                    volume,
+                    self.router.get(RouterField::FinalDensity).as_ref(),
+                    context,
+                    &mut **aquifer,
+                    self.settings.default_block,
+                ),
+                ActiveAquifer::Disabled(aquifer) => fill_noise(
+                    &mut chunk,
+                    volume,
+                    self.router.get(RouterField::FinalDensity).as_ref(),
+                    context,
+                    aquifer,
+                    self.settings.default_block,
+                ),
+            },
         };
         context.clear_lattice();
         filled.map_err(stage("noise"))?;
@@ -1309,29 +1352,45 @@ where
                 self.router.get(RouterField::Erosion).as_ref(),
             );
             let mut biome_context = SamplerContext::default();
-            apply_carving_mask_shared(
-                &mut chunk,
-                &mask,
-                &self.rule,
-                &mut shared,
-                TopMaterialInputs::<R, _> {
-                    generation,
-                    root: self.root.clone(),
-                    surface: SurfaceQueries {
-                        pipeline: self,
-                        temperatures: &mut worker.temperatures,
-                        biome: Biomes::Resolver(&mut resolver, &mut biome_context),
-                        uniform_biomes: None,
-                        possible_ids: None,
-                    },
-                    preliminary_surface: self.preliminary.clone(),
-                    density_context: context,
+            let top_inputs = TopMaterialInputs::<R, _> {
+                generation,
+                root: self.root.clone(),
+                surface: SurfaceQueries {
+                    pipeline: self,
+                    temperatures: &mut worker.temperatures,
+                    biome: Biomes::Resolver(&mut resolver, &mut biome_context),
+                    uniform_biomes: None,
+                    possible_ids: None,
                 },
-                aquifer.as_mut(),
-                &data.carving_blocks,
-                |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
-            )
+                preliminary_surface: self.preliminary.clone(),
+                density_context: context,
+            };
+            match &mut aquifer {
+                ActiveAquifer::Noise(aquifer) => apply_carving_mask_shared(
+                    &mut chunk,
+                    &mask,
+                    &self.rule,
+                    &mut shared,
+                    top_inputs,
+                    &mut **aquifer,
+                    &data.carving_blocks,
+                    |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
+                ),
+                ActiveAquifer::Disabled(aquifer) => apply_carving_mask_shared(
+                    &mut chunk,
+                    &mask,
+                    &self.rule,
+                    &mut shared,
+                    top_inputs,
+                    aquifer,
+                    &data.carving_blocks,
+                    |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
+                ),
+            }
             .map_err(stage("carvers"))?;
+        }
+        if let ActiveAquifer::Noise(aq) = aquifer {
+            worker.chunk_aquifer = Some(aq);
         }
         worker.surface_rule = shared.map(|rule| Box::new(rule) as Box<dyn Any + Send>);
         worker.timings.carvers += lap(&mut clock);
@@ -2061,6 +2120,8 @@ pub(super) struct WorkerState {
     surface_rule: Option<Box<dyn Any + Send>>,
     /// Reusable per-chunk uniform biome cell cache for the surface stage.
     uniform_biomes: UniformSurfaceBiomes,
+    /// Type-erased `ChunkNoiseAquifer<R>` reused across chunks on this worker.
+    chunk_aquifer: Option<Box<dyn Any + Send>>,
     /// Empty stand-in chunks recycled across decorated chunks so decoration
     /// does not allocate 9 throwaway `TerrainChunk`s per chunk.
     pub(super) decor_standins: Vec<TerrainChunk<'static, GenBlockStates>>,
@@ -3220,6 +3281,7 @@ impl OverworldGenerator {
                 heights: FxHashMap::default(),
                 surface_rule: None,
                 uniform_biomes: UniformSurfaceBiomes::empty(),
+                chunk_aquifer: None,
                 decor_standins: Vec::new(),
                 decor_uniform_biomes: Vec::new(),
             },
@@ -3407,6 +3469,7 @@ impl GeneratorWorker {
         state.heights = FxHashMap::default();
         state.surface_rule = None;
         state.uniform_biomes = UniformSurfaceBiomes::empty();
+        state.chunk_aquifer = None;
         state.decor_standins = Vec::new();
         state.decor_uniform_biomes = Vec::new();
         super::terrain::release_scratch();
@@ -7338,5 +7401,472 @@ mod tests {
             results_a,
             "chunk output must be identical across 1 vs 8 concurrent workers"
         );
+    }
+
+    fn build_synthetic_aquifer_data() -> (Arc<GeneratorData>, &'static BlockRegistry, TempDirGuard)
+    {
+        use horizon_core::nbt::Tag;
+
+        static REGISTRY: OnceLock<(&'static BlockRegistry, Vec<(bool, bool)>)> = OnceLock::new();
+
+        let (registry, flags) = REGISTRY.get_or_init(|| {
+            let mut states = Vec::new();
+            let mut defaults: Vec<(&'static str, i32)> = Vec::new();
+            let mut flags = Vec::new();
+
+            let mut add_simple = |name: &'static str, is_air: bool| {
+                let idx = states.len() as i32;
+                states.push(Tag::compound([("id", Tag::String(name.into()))]));
+                defaults.push((name, idx));
+                flags.push((is_air, false));
+            };
+
+            for air_name in ["minecraft:air", "minecraft:void_air", "minecraft:cave_air"] {
+                add_simple(air_name, true);
+            }
+            for solid_name in [
+                "minecraft:stone",
+                "minecraft:bedrock",
+                "minecraft:dirt",
+                "minecraft:grass_block",
+                "minecraft:mycelium",
+                "minecraft:packed_ice",
+                "minecraft:snow_block",
+                "minecraft:terracotta",
+                "minecraft:orange_terracotta",
+                "minecraft:yellow_terracotta",
+                "minecraft:brown_terracotta",
+                "minecraft:red_terracotta",
+                "minecraft:white_terracotta",
+                "minecraft:light_gray_terracotta",
+            ] {
+                add_simple(solid_name, false);
+            }
+            for fluid_name in ["minecraft:water", "minecraft:lava"] {
+                let first = states.len() as i32;
+                defaults.push((fluid_name, first));
+                for level in 0..16 {
+                    states.push(Tag::compound([
+                        ("id", Tag::String(fluid_name.into())),
+                        (
+                            "properties",
+                            Tag::compound([(
+                                "level",
+                                Tag::String(level.to_string().as_str().into()),
+                            )]),
+                        ),
+                    ]));
+                    flags.push((false, true));
+                }
+            }
+
+            let defaults_tag = Tag::compound(
+                defaults
+                    .into_iter()
+                    .map(|(name, idx)| (name, Tag::Int(idx))),
+            );
+            let registry = BlockRegistry::from_nbt(&Tag::compound([
+                ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+                ("states", Tag::List(states)),
+                ("defaults", defaults_tag),
+            ]))
+            .unwrap();
+            let registry: &'static BlockRegistry = Box::leak(Box::new(registry));
+            (registry, flags)
+        });
+        let registry = *registry;
+
+        let guard = TempDirGuard::create("horizon-aquifer-reuse");
+        let dir = guard.path();
+
+        let write_bundle = |name: &str, entries: &[(&str, Value)]| {
+            let mut map = serde_json::Map::new();
+            for (k, v) in entries {
+                map.insert(
+                    (*k).to_owned(),
+                    Value::String(serde_json::to_string(v).unwrap()),
+                );
+            }
+            std::fs::write(
+                dir.join(name),
+                serde_json::to_string(&Value::Object(map)).unwrap(),
+            )
+            .unwrap();
+        };
+
+        std::fs::write(
+            dir.join("block_flags.json"),
+            serde_json::to_string(flags).unwrap(),
+        )
+        .unwrap();
+
+        let noise_def = |base_octave: i32| {
+            serde_json::json!({
+                "base_octave": base_octave,
+                "octave_count": 2,
+                "base_amplitude": 1.0
+            })
+        };
+        write_bundle(
+            "noises.json",
+            &[
+                ("minecraft:clay_bands_offset", noise_def(-4)),
+                ("minecraft:surface", noise_def(-4)),
+                ("minecraft:surface_secondary", noise_def(-3)),
+                ("minecraft:badlands_surface", noise_def(-4)),
+                ("minecraft:badlands_pillar", noise_def(-3)),
+                ("minecraft:badlands_pillar_roof", noise_def(-4)),
+                ("minecraft:iceberg_surface", noise_def(-4)),
+                ("minecraft:iceberg_pillar", noise_def(-3)),
+                ("minecraft:iceberg_pillar_roof", noise_def(-4)),
+                ("minecraft:aquifer_barrier", noise_def(-3)),
+                ("minecraft:aquifer_fluid_level_floodedness", noise_def(-4)),
+                ("minecraft:aquifer_fluid_level_spread", noise_def(-4)),
+                ("minecraft:aquifer_lava", noise_def(-2)),
+                ("minecraft:terrain", noise_def(-5)),
+            ],
+        );
+        write_bundle("densities.json", &[]);
+        write_bundle("conditions.json", &[]);
+        write_bundle(
+            "rules.json",
+            &[(
+                "minecraft:synthetic_surface",
+                serde_json::json!({
+                    "type": "minecraft:sequence",
+                    "sequence": [
+                        {
+                            "type": "minecraft:condition",
+                            "if_true": {
+                                "type": "minecraft:vertical_gradient",
+                                "random_name": "minecraft:bedrock_floor",
+                                "true_at_and_below": {"above_bottom": 0},
+                                "false_at_and_above": {"above_bottom": 4}
+                            },
+                            "then_run": {"type": "minecraft:block", "result_state": "minecraft:bedrock"}
+                        },
+                        {
+                            "type": "minecraft:condition",
+                            "if_true": {"type": "minecraft:above_preliminary_surface"},
+                            "then_run": {
+                                "type": "minecraft:condition",
+                                "if_true": {
+                                    "type": "minecraft:stone_depth",
+                                    "offset": 0,
+                                    "add_surface_depth": false,
+                                    "secondary_depth_range": 0,
+                                    "surface_type": "floor"
+                                },
+                                "then_run": {"type": "minecraft:block", "result_state": "minecraft:grass_block"}
+                            }
+                        }
+                    ]
+                }),
+            )],
+        );
+        write_bundle(
+            "carvers.json",
+            &[(
+                "minecraft:cave",
+                serde_json::json!({
+                    "type": "minecraft:cave",
+                    "probability": 0.45,
+                    "y": {
+                        "type": "minecraft:uniform",
+                        "min_inclusive": {"absolute": -58},
+                        "max_inclusive": {"absolute": 48}
+                    },
+                    "count": 2,
+                    "thickness": 1.0,
+                    "room_vertical_radius_multiplier": 1.0,
+                    "horizontal_radius_multiplier": 1.0,
+                    "vertical_radius_multiplier": 1.0,
+                    "floor_level": -0.7
+                }),
+            )],
+        );
+        write_bundle(
+            "biomes.json",
+            &[(
+                "minecraft:plains",
+                serde_json::json!({
+                    "temperature": 0.8,
+                    "downfall": 0.4,
+                    "has_precipitation": true,
+                    "carvers": ["minecraft:cave"]
+                }),
+            )],
+        );
+        write_bundle("biome_tags.json", &[]);
+
+        let motion_blocks = serde_json::json!({
+            "values": [
+                "minecraft:stone",
+                "minecraft:bedrock",
+                "minecraft:dirt",
+                "minecraft:grass_block",
+                "minecraft:mycelium",
+                "minecraft:packed_ice",
+                "minecraft:snow_block",
+                "minecraft:terracotta",
+                "minecraft:orange_terracotta",
+                "minecraft:yellow_terracotta",
+                "minecraft:brown_terracotta",
+                "minecraft:red_terracotta",
+                "minecraft:white_terracotta",
+                "minecraft:light_gray_terracotta"
+            ]
+        });
+        write_bundle(
+            "block_tags.json",
+            &[
+                (
+                    "minecraft:blocks_motion_in_heightmap",
+                    motion_blocks.clone(),
+                ),
+                (
+                    "minecraft:blocks_motion_in_heightmap_no_leaves",
+                    motion_blocks,
+                ),
+                (
+                    "minecraft:uncarvable",
+                    serde_json::json!({"values": ["minecraft:bedrock"]}),
+                ),
+            ],
+        );
+
+        let terrain_density = serde_json::json!({
+            "type": "minecraft:add",
+            "left": {
+                "type": "minecraft:gradient",
+                "axis": "y",
+                "from_coordinate": 8,
+                "to_coordinate": 56,
+                "from_value": 1.0,
+                "to_value": -1.0
+            },
+            "right": {
+                "type": "minecraft:mul",
+                "left": 0.75,
+                "right": {
+                    "type": "minecraft:noise",
+                    "noise": "minecraft:terrain",
+                    "xz_scale": 1.0,
+                    "y_scale": 0.5
+                }
+            }
+        });
+        let surface_level = serde_json::json!({
+            "type": "minecraft:add",
+            "left": 32.0,
+            "right": {
+                "type": "minecraft:mul",
+                "left": 16.0,
+                "right": {
+                    "type": "minecraft:noise",
+                    "noise": "minecraft:terrain",
+                    "xz_scale": 1.0,
+                    "y_scale": 0.0
+                }
+            }
+        });
+        let base_settings = serde_json::json!({
+            "sea_level": 32,
+            "default_block": "minecraft:stone",
+            "default_fluid": "minecraft:water",
+            "legacy_random_source": false,
+            "noise": {"min_y": -64, "height": 128},
+            "noise_router": {
+                "temperature": 0.0,
+                "vegetation": 0.0,
+                "continents": 0.0,
+                "erosion": 0.0,
+                "depth": 0.0,
+                "ridges": 0.0,
+                "chunk_surface_level": surface_level,
+                "final_density": terrain_density
+            },
+            "material_rule": "minecraft:synthetic_surface"
+        });
+        let mut aquifer_settings = base_settings.clone();
+        aquifer_settings["aquifers"] = serde_json::json!({
+            "barrier": {
+                "type": "minecraft:noise",
+                "noise": "minecraft:aquifer_barrier",
+                "xz_scale": 1.0,
+                "y_scale": 0.5
+            },
+            "fluid_level_floodedness": {
+                "type": "minecraft:noise",
+                "noise": "minecraft:aquifer_fluid_level_floodedness",
+                "xz_scale": 1.0,
+                "y_scale": 0.67
+            },
+            "fluid_level_spread": {
+                "type": "minecraft:noise",
+                "noise": "minecraft:aquifer_fluid_level_spread",
+                "xz_scale": 1.0,
+                "y_scale": 0.714
+            },
+            "lava": {
+                "type": "minecraft:noise",
+                "noise": "minecraft:aquifer_lava",
+                "xz_scale": 1.0,
+                "y_scale": 1.0
+            },
+            "exclusion": 0.0,
+            "surface_level": surface_level
+        });
+        write_bundle(
+            "settings.json",
+            &[
+                ("minecraft:synthetic_overworld", aquifer_settings),
+                ("minecraft:synthetic_no_aquifer", base_settings),
+            ],
+        );
+        let preset_for = |settings_id: &str| {
+            serde_json::json!({
+                "dimensions": {
+                    "minecraft:overworld": {
+                        "type": "minecraft:overworld",
+                        "generator": {
+                            "type": "minecraft:noise",
+                            "settings": settings_id,
+                            "biome_source": {
+                                "type": "minecraft:fixed",
+                                "biome": "minecraft:plains"
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        write_bundle(
+            "world_presets.json",
+            &[
+                (
+                    "minecraft:normal",
+                    preset_for("minecraft:synthetic_overworld"),
+                ),
+                (
+                    "minecraft:no_aquifer",
+                    preset_for("minecraft:synthetic_no_aquifer"),
+                ),
+            ],
+        );
+
+        let data = GeneratorData::load(dir, registry).unwrap();
+        assert!(data.warnings().is_empty(), "{:?}", data.warnings());
+        (data, registry, guard)
+    }
+
+    #[test]
+    fn aquifer_worker_reuse_matches_fresh_workers_for_proto_chunks() {
+        let (data, registry, _guard) = build_synthetic_aquifer_data();
+        let air = registry.default_state("minecraft:air").unwrap();
+        let water = registry.default_state("minecraft:water").unwrap();
+        let lava = registry.default_state("minecraft:lava").unwrap();
+
+        let generator = OverworldGenerator::for_world(
+            data.clone(),
+            4242,
+            "minecraft:normal",
+            "minecraft:overworld",
+            false,
+        )
+        .unwrap();
+
+        let positions = [
+            ChunkPos::new(0, 0),
+            ChunkPos::new(1, 0),
+            ChunkPos::new(0, 1),
+            ChunkPos::new(-1, -1),
+            ChunkPos::new(5, -4),
+            ChunkPos::new(-7, 6),
+            ChunkPos::new(18, -15),
+            ChunkPos::new(-23, 19),
+        ];
+
+        // Baseline: fresh worker per chunk.
+        let mut baseline = Vec::with_capacity(positions.len());
+        let mut fluid_blocks = 0usize;
+        let mut solid_blocks = 0usize;
+        for pos in positions {
+            let mut fresh = generator.worker();
+            assert!(fresh.state.chunk_aquifer.is_none());
+            let chunk = fresh.generate_proto(pos).unwrap();
+            assert!(
+                fresh.state.chunk_aquifer.is_some(),
+                "expected active noise aquifer cached on worker for {pos:?}"
+            );
+            let min_y = chunk.terrain.min_y();
+            let max_y = min_y + chunk.terrain.height();
+            for y in min_y..max_y {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let state = chunk.block(x, y, z);
+                        if state == water || state == lava {
+                            fluid_blocks += 1;
+                        } else if state != air {
+                            solid_blocks += 1;
+                        }
+                    }
+                }
+            }
+            baseline.push(ProtoSnapshot::of(&chunk));
+        }
+        assert!(
+            fluid_blocks > 0 && solid_blocks > 0,
+            "synthetic aquifer world must produce fluid ({fluid_blocks}) and solid ({solid_blocks}) terrain"
+        );
+
+        // One reused worker fed chunks in shuffled orders, plus a pass after release().
+        let mut reused = generator.worker();
+        let orders = [[6, 1, 7, 3, 0, 5, 2, 4], [4, 2, 5, 0, 3, 7, 1, 6]];
+        for (pass, order) in orders.iter().enumerate() {
+            for &idx in order {
+                let pos = positions[idx];
+                let chunk = reused.generate_proto(pos).unwrap();
+                assert!(reused.state.chunk_aquifer.is_some());
+                assert_proto_snapshot_equal(
+                    &ProtoSnapshot::of(&chunk),
+                    &baseline[idx],
+                    &format!("aquifer reuse pass {pass} chunk {pos:?}"),
+                );
+            }
+        }
+        reused.release();
+        assert!(reused.state.chunk_aquifer.is_none());
+        for idx in [7, 0, 5, 2, 6, 3, 1, 4] {
+            let pos = positions[idx];
+            let chunk = reused.generate_proto(pos).unwrap();
+            assert!(reused.state.chunk_aquifer.is_some());
+            assert_proto_snapshot_equal(
+                &ProtoSnapshot::of(&chunk),
+                &baseline[idx],
+                &format!("post-release chunk {pos:?}"),
+            );
+        }
+
+        // Disabled-aquifer path matches fresh workers and leaves chunk_aquifer None.
+        let no_aquifer = OverworldGenerator::for_world(
+            data,
+            4242,
+            "minecraft:no_aquifer",
+            "minecraft:overworld",
+            false,
+        )
+        .unwrap();
+        let mut disabled_worker = no_aquifer.worker();
+        for pos in [positions[5], positions[0], positions[7]] {
+            let expected = no_aquifer.worker().generate_proto(pos).unwrap();
+            let got = disabled_worker.generate_proto(pos).unwrap();
+            assert!(disabled_worker.state.chunk_aquifer.is_none());
+            assert_proto_snapshot_equal(
+                &ProtoSnapshot::of(&got),
+                &ProtoSnapshot::of(&expected),
+                &format!("disabled aquifer chunk {pos:?}"),
+            );
+        }
     }
 }
