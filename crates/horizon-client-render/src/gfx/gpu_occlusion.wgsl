@@ -1,10 +1,11 @@
 // GPU culling's occlusion test (gpu_culling.rs `BoxTest`), after
-// gpu_culling.wgsl in one module. On compute Hi-Z backends (`prepare_boxes` +
-// `test_boxes`), one compute thread per queued box tests its 8 corners against
-// the reversed-Z min-depth Hi-Z pyramid (`hiz_depth`); on the `Early` raster
-// fallback (`vs_box` + `EARLY_FS_BOX` in gpu_culling.rs), boxes are drawn front
-// faces only against phase 1's depth. Then `count2`, `scan2` and `scatter2`
-// write phase 2's draws.
+// gpu_culling.wgsl in one module. On compute Hi-Z backends (`test_boxes`), one
+// compute thread per queued box tests its 8 corners against the reversed-Z
+// min-depth Hi-Z pyramid (`hiz_depth`), updates hidden statistics, and directly
+// emits visible phase-2 indirect draws into `draws` without scanning all
+// sections (`count2`/`scan2`/`scatter2`). On the `Early` raster fallback
+// (`vs_box` + `EARLY_FS_BOX` in gpu_culling.rs), boxes are drawn front faces
+// only against phase 1's depth, followed by `count2`, `scan2` and `scatter2`.
 @group(0) @binding(9) var<storage, read> box_list: array<u32>;
 @group(0) @binding(10) var<storage, read> box_origins: array<vec4<u32>>;
 @group(0) @binding(11) var<storage, read_write> box_runs: array<u32>;
@@ -42,43 +43,15 @@ fn vs_box(@builtin(vertex_index) v: u32, @builtin(instance_index) t: u32) -> Box
     return out;
 }
 
-// Compute the indirect dispatch dimensions for `test_boxes` from `counts[BOX + 1u]`
-// (queued box count), storing (x, y, z) into `counts[BOX + 2u..5u]`.
-@compute @workgroup_size(1)
-fn prepare_boxes() {
-    let n = atomicLoad(&counts[BOX + 1u]);
-    let wg = (n + BLOCK - 1u) / BLOCK;
-    let x = min(wg, ROW);
-    let y = select(0u, (wg + ROW - 1u) / ROW, wg > 0u);
-    atomicStore(&counts[BOX + 2u], x);
-    atomicStore(&counts[BOX + 3u], y);
-    atomicStore(&counts[BOX + 4u], select(0u, 1u, wg > 0u));
-}
-
-// Conservative Hi-Z compute occlusion test for GPU culling: 1 thread per queued box,
-// reading `box_list` (`counts`, read-only) while dispatched indirectly from `counts[BOX + 2u]`.
-@compute @workgroup_size(64)
-fn test_boxes(
-    @builtin(workgroup_id) group: vec3<u32>,
-    @builtin(local_invocation_index) lane: u32,
-) {
-    let t = (group.y * ROW + group.x) * BLOCK + lane;
-    let n = box_list[BOX + 1u];
-    if t >= n {
-        return;
-    }
-    let id = box_list[params.occl.y + t];
-    let o = bitcast<vec3<f32>>(box_origins[id].xyz);
-    let b = box_sections[id].a.z;
-
+// Conservative reversed-Z Hi-Z visibility test for one section box.
+fn hiz_box_visible(o: vec3<f32>, b: u32) -> bool {
     var lo = vec2(1e30);
     var hi = vec2(-1e30);
     var max_z = -1e30;
     for (var c = 0u; c < 8u; c++) {
         let p = params.view_proj * vec4(box_corner(o, b, c), 1.0);
         if !(p.w > 1e-6 && p.z < p.w) {
-            box_runs[id * RUN_WORDS + SEEN_WORD] = params.occl.x;
-            return;
+            return true;
         }
         let inv_w = 1.0 / p.w;
         let ndc = p.xy * inv_w;
@@ -89,7 +62,7 @@ fn test_boxes(
     }
 
     if hi.x < -1.0 || lo.x > 1.0 || hi.y < -1.0 || lo.y > 1.0 || max_z < 0.0 {
-        return;
+        return false;
     }
 
     let ndc_lo = max(lo, vec2(-1.0));
@@ -133,19 +106,149 @@ fn test_boxes(
     let d11 = textureLoad(hiz_depth, vec2<i32>(hi_px.x, hi_px.y), mip).r;
     let occluder_min_z = min(min(d00, d10), min(d01, d11));
 
-    if !(max_z < occluder_min_z) {
-        box_runs[id * RUN_WORDS + SEEN_WORD] = params.occl.x;
+    return !(max_z < occluder_min_z);
+}
+
+// Workgroup scratch for fused `test_boxes`:
+// - `box_tally`: [0] hidden boxes, [1] hidden quads, [2] phase-2 draws emitted.
+// - `box_page_n` / `box_page_base`: per-page draw batching for pages < FAST_PAGES.
+// - `box_emit`: per-lane `(page << PAGE_SHIFT) | n` for fast-page intra-WG prefix sum.
+var<workgroup> box_tally: array<atomic<u32>, 3>;
+var<workgroup> box_page_n: array<atomic<u32>, 8>;
+var<workgroup> box_page_base: array<u32, 8>;
+var<workgroup> box_emit: array<u32, 64>;
+
+// Fused compute Hi-Z occlusion test + direct Phase-2 indirect draw emission:
+// 1 thread per queued box, using the main compute bind group (`@group(0)`) and
+// dispatched indirectly via `HizTest::dispatch_args` (copied from `counts[BOX + 2..5]`
+// before world pass 1 so `counts` stays read-write with no INDIRECT usage aliasing).
+@compute @workgroup_size(64)
+fn test_boxes(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    if lane < 3u {
+        atomicStore(&box_tally[lane], 0u);
+    }
+    if lane < FAST_PAGES {
+        atomicStore(&box_page_n[lane], 0u);
+    }
+    box_emit[lane] = 0u;
+    workgroupBarrier();
+
+    let t = (group.y * ROW + group.x) * BLOCK + lane;
+    let total_boxes = atomicLoad(&counts[BOX + 1u]);
+    var emit_id = 0u;
+    var emit_page = 0u;
+    var emit_n = 0u;
+    var slow_slot = 0u;
+    if t < total_boxes {
+        let id = atomicLoad(&counts[params.occl.y + t]);
+        let o = bitcast<vec3<f32>>(origins[id].xyz);
+        let b = sections[id].a.z;
+        let at = id * RUN_WORDS;
+        let w = runs[at];
+        let n = w & 7u;
+        if hiz_box_visible(o, b) {
+            runs[at + SEEN_WORD] = params.occl.x;
+            if (w & PHASE2) != 0u && n > 0u {
+                let page = w >> PAGE_SHIFT;
+                emit_id = id;
+                emit_page = page;
+                emit_n = n;
+                if page < FAST_PAGES {
+                    atomicAdd(&box_page_n[page], n);
+                    box_emit[lane] = (page << PAGE_SHIFT) | n;
+                } else {
+                    let r = region(page);
+                    slow_slot = atomicAdd(&counts[page_count(page, 1u)], n);
+                    if slow_slot < r.y {
+                        atomicAdd(&box_tally[2], min(n, r.y - slow_slot));
+                    }
+                    if slow_slot + n > r.y {
+                        atomicMin(&counts[page_count(page, 1u)], r.y);
+                    }
+                }
+            }
+        } else if n > 0u {
+            var quads = 0u;
+            for (var k = 0u; k < n; k++) {
+                quads += runs[at + 2u + 2u * k];
+            }
+            atomicAdd(&box_tally[0], 1u);
+            atomicAdd(&box_tally[1], quads);
+        }
+    }
+    workgroupBarrier();
+
+    if lane < FAST_PAGES {
+        let wg_n = atomicLoad(&box_page_n[lane]);
+        if wg_n > 0u {
+            let r = region(lane);
+            let base = atomicAdd(&counts[page_count(lane, 1u)], wg_n);
+            box_page_base[lane] = base;
+            if base < r.y {
+                atomicAdd(&box_tally[2], min(wg_n, r.y - base));
+            }
+            if base + wg_n > r.y {
+                atomicMin(&counts[page_count(lane, 1u)], r.y);
+            }
+        }
+    }
+    workgroupBarrier();
+
+    if lane == 0u {
+        let h = atomicLoad(&box_tally[0]);
+        if h > 0u {
+            atomicAdd(&counts[HIDDEN], h);
+        }
+        let hq = atomicLoad(&box_tally[1]);
+        if hq > 0u {
+            atomicAdd(&counts[HIDDEN_QUADS], hq);
+        }
+        let d2 = atomicLoad(&box_tally[2]);
+        if d2 > 0u {
+            atomicAdd(&counts[DRAWS], d2);
+            atomicAdd(&counts[DRAWN2], d2);
+        }
+    }
+
+    if emit_n > 0u {
+        var slot = slow_slot;
+        if emit_page < FAST_PAGES {
+            slot = box_page_base[emit_page];
+            for (var other = 0u; other < lane; other++) {
+                let h = box_emit[other];
+                if h != 0u && (h >> PAGE_SHIFT) == emit_page {
+                    slot += h & 7u;
+                }
+            }
+        }
+        let r = region(emit_page);
+        let at = emit_id * RUN_WORDS;
+        let base_vertex = sections[emit_id].a.x;
+        for (var k = 0u; k < emit_n; k++) {
+            if slot + k >= r.y {
+                break;
+            }
+            let d = (r.x + slot + k) * 5u;
+            draws[d] = runs[at + 2u + 2u * k] * 6u;
+            draws[d + 1u] = 1u;
+            draws[d + 2u] = 0u;
+            draws[d + 3u] = base_vertex + runs[at + 1u + 2u * k] * 4u;
+            draws[d + 4u] = emit_id;
+        }
     }
 }
 
-var<workgroup> tally: array<atomic<u32>, 3>;
+var<workgroup> tally: array<atomic<u32>, 2>;
 
-// After the test, one workgroup per block of ids: the quads of the sections
-// with runs, the tested boxes not seen and their quads, and per (page, band)
-// each block's draws that phase 2 makes (`drawn_in`'s condition).
+// After the `Early` raster test, one workgroup per block of ids: the tested boxes
+// not seen and their quads (`QUADS` is already tallied in `cull`), and per
+// (page, band) each block's draws that phase 2 makes (`drawn_in`'s condition).
 @compute @workgroup_size(64)
 fn count2(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
-    if lane < 3u {
+    if lane < 2u {
         atomicStore(&tally[lane], 0u);
     }
     if lane < FAST_BUCKETS {
@@ -159,15 +262,14 @@ fn count2(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
         let w = runs[at];
         let n = w & 7u;
         if n > 0u {
-            var quads = 0u;
-            for (var k = 0u; k < n; k++) {
-                quads += runs[at + 2u + 2u * k];
-            }
-            atomicAdd(&tally[0], quads);
             let saw = runs[at + SEEN_WORD] == params.occl.x;
             if (w & TESTED) != 0u && !saw {
-                atomicAdd(&tally[1], 1u);
-                atomicAdd(&tally[2], quads);
+                var quads = 0u;
+                for (var k = 0u; k < n; k++) {
+                    quads += runs[at + 2u + 2u * k];
+                }
+                atomicAdd(&tally[0], 1u);
+                atomicAdd(&tally[1], quads);
             }
             if (w & PHASE2) != 0u && saw {
                 let page = w >> PAGE_SHIFT;
@@ -182,15 +284,11 @@ fn count2(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
     }
     workgroupBarrier();
     if lane == 0u {
-        let q = atomicLoad(&tally[0]);
-        if q > 0u {
-            atomicAdd(&counts[QUADS], q);
-        }
-        let h = atomicLoad(&tally[1]);
+        let h = atomicLoad(&tally[0]);
         if h > 0u {
             atomicAdd(&counts[HIDDEN], h);
         }
-        let hq = atomicLoad(&tally[2]);
+        let hq = atomicLoad(&tally[1]);
         if hq > 0u {
             atomicAdd(&counts[HIDDEN_QUADS], hq);
         }

@@ -153,9 +153,11 @@ const PHASE2: u32 = 8u;
 // Its stamps: the frames whose test last saw its box, and last tested it.
 const SEEN_WORD: u32 = 9u;
 const TESTED_WORD: u32 = 10u;
-// In `params.flags`: the frame occludes, and tests every box (cull.rs's probe).
+// In `params.flags`: the frame occludes, tests every box (cull.rs's probe),
+// and runs compute Hi-Z occlusion (writing indirect dispatch dims in `scan`).
 const OCCLUDE: u32 = 8u;
 const PROBE: u32 = 16u;
+const HIZ: u32 = 32u;
 // cull.rs `RETEST` and `BIG`.
 const RETEST: u32 = 8u;
 const BIG: f32 = 0.25;
@@ -377,6 +379,7 @@ fn apply(@builtin(global_invocation_id) gid: vec3<u32>) {
 // `block` exclusively, so its `block_count(block, ...)` slots have no cross-
 // workgroup contention and need at most one atomicStore per non-zero bucket).
 var<workgroup> wg_kept: atomic<u32>;
+var<workgroup> wg_quads: atomic<u32>;
 var<workgroup> wg_buckets: array<atomic<u32>, 32>;
 
 @compute @workgroup_size(64)
@@ -388,6 +391,7 @@ fn cull(
     let id = block * BLOCK + lane;
     if lane == 0u {
         atomicStore(&wg_kept, 0u);
+        atomicStore(&wg_quads, 0u);
         if block == 0u && (params.flags & OCCLUDE) != 0u {
             // The box draw's vertices: the cube's corners (gpu_occlusion.wgsl).
             atomicStore(&counts[BOX], 36u);
@@ -420,9 +424,11 @@ fn cull(
                 // gfx.rs `facing_runs`: the runs of its buckets that can face the eye, an
                 // empty bucket breaking none, a draw each; without an eye, its solid quads.
                 var n = 0u;
+                var quads = 0u;
                 if (params.flags & EYE) == 0u {
                     runs[at + 1u] = 0u;
                     runs[at + 2u] = s.a.y;
+                    quads = s.a.y;
                     n = 1u;
                 } else {
                     let e = params.eyes;
@@ -440,22 +446,27 @@ fn cull(
                             open = true;
                             first = start;
                         } else if !shown && open {
+                            let run_quads = start - first;
                             runs[at + 1u + 2u * n] = first;
-                            runs[at + 2u + 2u * n] = start - first;
+                            runs[at + 2u + 2u * n] = run_quads;
+                            quads += run_quads;
                             n += 1u;
                             open = false;
                         }
                         start = end;
                     }
                     if open {
+                        let run_quads = start - first;
                         runs[at + 1u + 2u * n] = first;
-                        runs[at + 2u + 2u * n] = start - first;
+                        runs[at + 2u + 2u * n] = run_quads;
+                        quads += run_quads;
                         n += 1u;
                     }
                 }
                 if n > 0u {
                     var flags = 0u;
                     if (params.flags & OCCLUDE) != 0u {
+                        atomicAdd(&wg_quads, quads);
                         flags = occlusion(id, at, bitcast<vec3<f32>>(origin.xyz), s.a.z);
                     }
                     let band = distance_band(s.key.x, s.key.z);
@@ -477,6 +488,12 @@ fn cull(
         let kept = atomicLoad(&wg_kept);
         if kept > 0u {
             atomicAdd(&counts[0], kept);
+        }
+        if (params.flags & OCCLUDE) != 0u {
+            let q = atomicLoad(&wg_quads);
+            if q > 0u {
+                atomicAdd(&counts[QUADS], q);
+            }
         }
     }
     if lane < FAST_BUCKETS {
@@ -655,6 +672,20 @@ fn scan_page(page: u32, lane: u32, phase: u32) {
 @compute @workgroup_size(256)
 fn scan(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
     scan_page(group.x, lane, 0u);
+    // For compute Hi-Z occlusion, precompute `test_boxes`'s indirect workgroup
+    // dimensions right after `cull` finished queueing boxes into `counts[BOX + 1u]`,
+    // eliminating the standalone `prepare_boxes` dispatch between world passes.
+    // Left untouched in `Early` raster mode where `counts[BOX + 2..4]` must stay 0
+    // (`first_vertex` / `first_instance` for `draw_indirect`).
+    if group.x == 0u && lane == 0u && (params.flags & HIZ) != 0u {
+        let n = atomicLoad(&counts[BOX + 1u]);
+        let wg = (n + BLOCK - 1u) / BLOCK;
+        let x = min(wg, ROW);
+        let y = select(0u, (wg + ROW - 1u) / ROW, wg > 0u);
+        atomicStore(&counts[BOX + 2u], x);
+        atomicStore(&counts[BOX + 3u], y);
+        atomicStore(&counts[BOX + 4u], select(0u, 1u, wg > 0u));
+    }
 }
 
 var<workgroup> held: array<u32, 64>;

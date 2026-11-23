@@ -151,12 +151,30 @@ pub enum DepthTest {
     Compute,
 }
 
-/// Workgroup edge for the 2D Hi-Z pyramid downsample pass.
+/// Workgroup edge for the 2D 1-mip and 4-mip Hi-Z pyramid downsample passes.
 const WORKGROUP_2D: u32 = 8;
+/// Workgroup edge for the 5-mip tiled Hi-Z pyramid downsample pass.
+const WORKGROUP_TILED5: u32 = 16;
 /// Workgroup width for the 1D compute box test pass.
 const WORKGROUP_1D: u32 = 64;
+/// Workgroup width for the single-workgroup odd-aware Hi-Z tail passes.
+const WORKGROUP_TAIL: u32 = 256;
 /// Maximum X workgroups before wrapping to Y (WebGPU's 65535 limit).
 const COMPUTE_ROW: u32 = 65535;
+/// Maximum `dst0` texel count handled by a single-workgroup Hi-Z tail dispatch.
+/// Ping-pong workgroup arrays hold `2048 + 1024` `f32` values = 12,288 bytes
+/// (well within WebGPU's 16 KiB `max_compute_workgroup_storage_size` floor).
+const HIZ_TAIL_MAX_TEXELS: u32 = 2048;
+/// Required `max_compute_workgroup_storage_size` for `hiz_downsample_4` (`(64 + 16 + 4) * 4`).
+const HIZ_TILED4_SHARED_BYTES: u32 = (64 + 16 + 4) * 4;
+/// Required `max_compute_workgroup_storage_size` for `hiz_tail_4` / `hiz_tail_8`.
+const HIZ_TAIL_SHARED_BYTES: u32 = (HIZ_TAIL_MAX_TEXELS + HIZ_TAIL_MAX_TEXELS / 2) * 4;
+/// Copy-source usage enabled only in unit tests for GPU mip readback verification.
+const HIZ_TEST_READ: wgpu::TextureUsages = if cfg!(test) {
+    wgpu::TextureUsages::COPY_SRC
+} else {
+    wgpu::TextureUsages::empty()
+};
 
 /// The Vulkan entry point: the depth test forced early, which naga cannot
 /// write for Metal (so it is not in `cull.wgsl`, which every backend takes).
@@ -169,26 +187,20 @@ fn fs_box_early(in: Box) -> @location(0) vec4<f32> {
 }
 ";
 
-/// Conservative reversed-Z min-depth Hi-Z pyramid downsample shader.
+/// Conservative reversed-Z min-depth Hi-Z source reduction helper shared by all
+/// Hi-Z pyramid downsample shaders.
 ///
 /// Each destination texel `(dx, dy)` covers UV `[dx/D, (dx+1)/D] x [dy/D, (dy+1)/D]`.
 /// When a source dimension `S > 1` is odd (`S = 2*D + 1`), source texel `2*d + 2`
 /// overlaps that UV interval too (`2*d/(2*D+1) <= d/D` and `(d+1)/D <= (2*d+3)/(2*D+1)`
 /// for every `0 <= d < D`), so every odd-axis texel takes the minimum over 3 source
 /// texels along that axis (3x2, 2x3, or 3x3).
-const HIZ_DOWNSAMPLE_SHADER: &str = "
+const HIZ_REDUCE_SRC: &str = "
 @group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var dst: texture_storage_2d<r32float, write>;
 
-@compute @workgroup_size(8, 8)
-fn hiz_downsample(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dst_size = textureDimensions(dst);
-    if gid.x >= dst_size.x || gid.y >= dst_size.y {
-        return;
-    }
-    let src_size = textureDimensions(src);
+fn reduce_src(src_size: vec2<u32>, dst_coord: vec2<i32>) -> f32 {
     let max_coord = vec2<i32>(src_size) - vec2<i32>(1);
-    let base = vec2<i32>(gid.xy) * 2;
+    let base = dst_coord * 2;
     let x0 = min(base.x, max_coord.x);
     let x1 = min(base.x + 1, max_coord.x);
     let y0 = min(base.y, max_coord.y);
@@ -233,9 +245,504 @@ fn hiz_downsample(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    return d;
+}
+";
+
+/// Single-mip conservative reversed-Z Hi-Z downsample entry point (fallback for
+/// constrained devices with < 4 storage textures and single odd-intermediate steps).
+const HIZ_DOWNSAMPLE_BODY: &str = "
+@group(0) @binding(1) var dst: texture_storage_2d<r32float, write>;
+
+@compute @workgroup_size(8, 8)
+fn hiz_downsample(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let src_size = textureDimensions(src);
+    let dst_size = max(src_size >> vec2<u32>(1u), vec2<u32>(1u));
+    if gid.x >= dst_size.x || gid.y >= dst_size.y {
+        return;
+    }
+    let d = reduce_src(src_size, vec2<i32>(gid.xy));
     textureStore(dst, vec2<i32>(gid.xy), vec4<f32>(d, 0.0, 0.0, 0.0));
 }
 ";
+
+/// Helper for even-chain multi-mip tiled passes: returns true when `size` has
+/// another mip level and neither axis > 1 is odd (so 2x2 reduction needs zero apron).
+const HIZ_TILED_COMMON: &str = "
+fn can_halve_even(size: vec2<u32>) -> bool {
+    return (size.x > 1u || size.y > 1u)
+        && (size.x == 1u || (size.x & 1u) == 0u)
+        && (size.y == 1u || (size.y & 1u) == 0u);
+}
+";
+
+/// 2..=4-mip shared-memory tiled Hi-Z downsampler (`@workgroup_size(8, 8)`):
+/// handles arbitrary odd `src` on `dst0`, then reduces in shared memory across
+/// consecutive even-or-1 intermediate mips without cross-workgroup halos or VRAM round-trips.
+const HIZ_TILED4_BODY: &str = "
+@group(0) @binding(1) var dst0: texture_storage_2d<r32float, write>;
+@group(0) @binding(2) var dst1: texture_storage_2d<r32float, write>;
+@group(0) @binding(3) var dst2: texture_storage_2d<r32float, write>;
+@group(0) @binding(4) var dst3: texture_storage_2d<r32float, write>;
+
+var<workgroup> tile0: array<f32, 64>;
+var<workgroup> tile1: array<f32, 16>;
+var<workgroup> tile2: array<f32, 4>;
+
+@compute @workgroup_size(8, 8)
+fn hiz_downsample_4(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(global_invocation_id) gid: vec3<u32>,
+) {
+    let src_size = textureDimensions(src);
+    let s0 = max(src_size >> vec2<u32>(1u), vec2<u32>(1u));
+    let lx = lid.x;
+    let ly = lid.y;
+    if gid.x < s0.x && gid.y < s0.y {
+        let d0 = reduce_src(src_size, vec2<i32>(gid.xy));
+        textureStore(dst0, vec2<i32>(gid.xy), vec4<f32>(d0, 0.0, 0.0, 0.0));
+        tile0[ly * 8u + lx] = d0;
+    }
+    workgroupBarrier();
+
+    let do1 = can_halve_even(s0);
+    let s1 = max(s0 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do1 && lx < 4u && ly < 4u {
+        let p = wg.xy * 4u + vec2<u32>(lx, ly);
+        if p.x < s1.x && p.y < s1.y {
+            let x0 = lx * 2u;
+            let x1 = select(x0 + 1u, x0, s0.x == 1u);
+            let y0 = ly * 2u;
+            let y1 = select(y0 + 1u, y0, s0.y == 1u);
+            let d1 = min(
+                min(tile0[y0 * 8u + x0], tile0[y0 * 8u + x1]),
+                min(tile0[y1 * 8u + x0], tile0[y1 * 8u + x1]),
+            );
+            textureStore(dst1, vec2<i32>(p), vec4<f32>(d1, 0.0, 0.0, 0.0));
+            tile1[ly * 4u + lx] = d1;
+        }
+    }
+    workgroupBarrier();
+
+    let do2 = do1 && can_halve_even(s1);
+    let s2 = max(s1 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do2 && lx < 2u && ly < 2u {
+        let p = wg.xy * 2u + vec2<u32>(lx, ly);
+        if p.x < s2.x && p.y < s2.y {
+            let x0 = lx * 2u;
+            let x1 = select(x0 + 1u, x0, s1.x == 1u);
+            let y0 = ly * 2u;
+            let y1 = select(y0 + 1u, y0, s1.y == 1u);
+            let d2 = min(
+                min(tile1[y0 * 4u + x0], tile1[y0 * 4u + x1]),
+                min(tile1[y1 * 4u + x0], tile1[y1 * 4u + x1]),
+            );
+            textureStore(dst2, vec2<i32>(p), vec4<f32>(d2, 0.0, 0.0, 0.0));
+            tile2[ly * 2u + lx] = d2;
+        }
+    }
+    workgroupBarrier();
+
+    let do3 = do2 && can_halve_even(s2);
+    let s3 = max(s2 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do3 && lx == 0u && ly == 0u {
+        let p = wg.xy;
+        if p.x < s3.x && p.y < s3.y {
+            let x1 = select(1u, 0u, s2.x == 1u);
+            let y1 = select(1u, 0u, s2.y == 1u);
+            let d3 = min(
+                min(tile2[0u], tile2[x1]),
+                min(tile2[y1 * 2u], tile2[y1 * 2u + x1]),
+            );
+            textureStore(dst3, vec2<i32>(p), vec4<f32>(d3, 0.0, 0.0, 0.0));
+        }
+    }
+}
+";
+
+/// 5-mip shared-memory tiled Hi-Z downsampler (`@workgroup_size(16, 16)`) for
+/// devices with >= 8 storage textures per stage (e.g. 2560x1440 -> 80x45 in 1 dispatch).
+const HIZ_TILED5_BODY: &str = "
+@group(0) @binding(1) var dst0: texture_storage_2d<r32float, write>;
+@group(0) @binding(2) var dst1: texture_storage_2d<r32float, write>;
+@group(0) @binding(3) var dst2: texture_storage_2d<r32float, write>;
+@group(0) @binding(4) var dst3: texture_storage_2d<r32float, write>;
+@group(0) @binding(5) var dst4: texture_storage_2d<r32float, write>;
+
+var<workgroup> tile0: array<f32, 256>;
+var<workgroup> tile1: array<f32, 64>;
+var<workgroup> tile2: array<f32, 16>;
+var<workgroup> tile3: array<f32, 4>;
+
+@compute @workgroup_size(16, 16)
+fn hiz_downsample_5(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(global_invocation_id) gid: vec3<u32>,
+) {
+    let src_size = textureDimensions(src);
+    let s0 = max(src_size >> vec2<u32>(1u), vec2<u32>(1u));
+    let lx = lid.x;
+    let ly = lid.y;
+    if gid.x < s0.x && gid.y < s0.y {
+        let d0 = reduce_src(src_size, vec2<i32>(gid.xy));
+        textureStore(dst0, vec2<i32>(gid.xy), vec4<f32>(d0, 0.0, 0.0, 0.0));
+        tile0[ly * 16u + lx] = d0;
+    }
+    workgroupBarrier();
+
+    let do1 = can_halve_even(s0);
+    let s1 = max(s0 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do1 && lx < 8u && ly < 8u {
+        let p = wg.xy * 8u + vec2<u32>(lx, ly);
+        if p.x < s1.x && p.y < s1.y {
+            let x0 = lx * 2u;
+            let x1 = select(x0 + 1u, x0, s0.x == 1u);
+            let y0 = ly * 2u;
+            let y1 = select(y0 + 1u, y0, s0.y == 1u);
+            let d1 = min(
+                min(tile0[y0 * 16u + x0], tile0[y0 * 16u + x1]),
+                min(tile0[y1 * 16u + x0], tile0[y1 * 16u + x1]),
+            );
+            textureStore(dst1, vec2<i32>(p), vec4<f32>(d1, 0.0, 0.0, 0.0));
+            tile1[ly * 8u + lx] = d1;
+        }
+    }
+    workgroupBarrier();
+
+    let do2 = do1 && can_halve_even(s1);
+    let s2 = max(s1 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do2 && lx < 4u && ly < 4u {
+        let p = wg.xy * 4u + vec2<u32>(lx, ly);
+        if p.x < s2.x && p.y < s2.y {
+            let x0 = lx * 2u;
+            let x1 = select(x0 + 1u, x0, s1.x == 1u);
+            let y0 = ly * 2u;
+            let y1 = select(y0 + 1u, y0, s1.y == 1u);
+            let d2 = min(
+                min(tile1[y0 * 8u + x0], tile1[y0 * 8u + x1]),
+                min(tile1[y1 * 8u + x0], tile1[y1 * 8u + x1]),
+            );
+            textureStore(dst2, vec2<i32>(p), vec4<f32>(d2, 0.0, 0.0, 0.0));
+            tile2[ly * 4u + lx] = d2;
+        }
+    }
+    workgroupBarrier();
+
+    let do3 = do2 && can_halve_even(s2);
+    let s3 = max(s2 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do3 && lx < 2u && ly < 2u {
+        let p = wg.xy * 2u + vec2<u32>(lx, ly);
+        if p.x < s3.x && p.y < s3.y {
+            let x0 = lx * 2u;
+            let x1 = select(x0 + 1u, x0, s2.x == 1u);
+            let y0 = ly * 2u;
+            let y1 = select(y0 + 1u, y0, s2.y == 1u);
+            let d3 = min(
+                min(tile2[y0 * 4u + x0], tile2[y0 * 4u + x1]),
+                min(tile2[y1 * 4u + x0], tile2[y1 * 4u + x1]),
+            );
+            textureStore(dst3, vec2<i32>(p), vec4<f32>(d3, 0.0, 0.0, 0.0));
+            tile3[ly * 2u + lx] = d3;
+        }
+    }
+    workgroupBarrier();
+
+    let do4 = do3 && can_halve_even(s3);
+    let s4 = max(s3 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do4 && lx == 0u && ly == 0u {
+        let p = wg.xy;
+        if p.x < s4.x && p.y < s4.y {
+            let x1 = select(1u, 0u, s3.x == 1u);
+            let y1 = select(1u, 0u, s3.y == 1u);
+            let d4 = min(
+                min(tile3[0u], tile3[x1]),
+                min(tile3[y1 * 2u], tile3[y1 * 2u + x1]),
+            );
+            textureStore(dst4, vec2<i32>(p), vec4<f32>(d4, 0.0, 0.0, 0.0));
+        }
+    }
+}
+";
+
+/// Ping-pong workgroup storage and exact odd-aware 3x3 reduction helpers for
+/// single-workgroup Hi-Z tail passes (`dst0.x * dst0.y <= 2048` => `dst1 <= 1024`).
+const HIZ_TAIL_COMMON: &str = "
+var<workgroup> tail_a: array<f32, 2048>;
+var<workgroup> tail_b: array<f32, 1024>;
+
+fn reduce_tail_a(prev_size: vec2<u32>, dx: u32, dy: u32) -> f32 {
+    let sw = prev_size.x;
+    let sh = prev_size.y;
+    let max_x = sw - 1u;
+    let max_y = sh - 1u;
+    let bx = dx * 2u;
+    let by = dy * 2u;
+    let x0 = min(bx, max_x);
+    let x1 = min(bx + 1u, max_x);
+    let y0 = min(by, max_y);
+    let y1 = min(by + 1u, max_y);
+    var d = min(
+        min(tail_a[y0 * sw + x0], tail_a[y0 * sw + x1]),
+        min(tail_a[y1 * sw + x0], tail_a[y1 * sw + x1]),
+    );
+    let odd_x = sw > 1u && (sw & 1u) != 0u;
+    let odd_y = sh > 1u && (sh & 1u) != 0u;
+    if odd_x {
+        let x2 = min(bx + 2u, max_x);
+        d = min(d, min(tail_a[y0 * sw + x2], tail_a[y1 * sw + x2]));
+    }
+    if odd_y {
+        let y2 = min(by + 2u, max_y);
+        d = min(d, min(tail_a[y2 * sw + x0], tail_a[y2 * sw + x1]));
+        if odd_x {
+            let x2 = min(bx + 2u, max_x);
+            d = min(d, tail_a[y2 * sw + x2]);
+        }
+    }
+    return d;
+}
+
+fn reduce_tail_b(prev_size: vec2<u32>, dx: u32, dy: u32) -> f32 {
+    let sw = prev_size.x;
+    let sh = prev_size.y;
+    let max_x = sw - 1u;
+    let max_y = sh - 1u;
+    let bx = dx * 2u;
+    let by = dy * 2u;
+    let x0 = min(bx, max_x);
+    let x1 = min(bx + 1u, max_x);
+    let y0 = min(by, max_y);
+    let y1 = min(by + 1u, max_y);
+    var d = min(
+        min(tail_b[y0 * sw + x0], tail_b[y0 * sw + x1]),
+        min(tail_b[y1 * sw + x0], tail_b[y1 * sw + x1]),
+    );
+    let odd_x = sw > 1u && (sw & 1u) != 0u;
+    let odd_y = sh > 1u && (sh & 1u) != 0u;
+    if odd_x {
+        let x2 = min(bx + 2u, max_x);
+        d = min(d, min(tail_b[y0 * sw + x2], tail_b[y1 * sw + x2]));
+    }
+    if odd_y {
+        let y2 = min(by + 2u, max_y);
+        d = min(d, min(tail_b[y2 * sw + x0], tail_b[y2 * sw + x1]));
+        if odd_x {
+            let x2 = min(bx + 2u, max_x);
+            d = min(d, tail_b[y2 * sw + x2]);
+        }
+    }
+    return d;
+}
+";
+
+/// Single-workgroup odd-aware Hi-Z tail pass writing up to 4 mips (`@workgroup_size(256)`).
+const HIZ_TAIL4_BODY: &str = "
+@group(0) @binding(1) var dst0: texture_storage_2d<r32float, write>;
+@group(0) @binding(2) var dst1: texture_storage_2d<r32float, write>;
+@group(0) @binding(3) var dst2: texture_storage_2d<r32float, write>;
+@group(0) @binding(4) var dst3: texture_storage_2d<r32float, write>;
+
+@compute @workgroup_size(256)
+fn hiz_tail_4(@builtin(local_invocation_index) lane: u32) {
+    let src_size = textureDimensions(src);
+    let s0 = max(src_size >> vec2<u32>(1u), vec2<u32>(1u));
+    let n0 = s0.x * s0.y;
+    for (var idx = lane; idx < n0; idx += 256u) {
+        let dx = idx % s0.x;
+        let dy = idx / s0.x;
+        let d = reduce_src(src_size, vec2<i32>(i32(dx), i32(dy)));
+        tail_a[idx] = d;
+        textureStore(dst0, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+    }
+    workgroupBarrier();
+
+    let do1 = s0.x > 1u || s0.y > 1u;
+    let s1 = max(s0 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do1 {
+        let n1 = s1.x * s1.y;
+        for (var idx = lane; idx < n1; idx += 256u) {
+            let dx = idx % s1.x;
+            let dy = idx / s1.x;
+            let d = reduce_tail_a(s0, dx, dy);
+            tail_b[idx] = d;
+            textureStore(dst1, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+    workgroupBarrier();
+
+    let do2 = do1 && (s1.x > 1u || s1.y > 1u);
+    let s2 = max(s1 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do2 {
+        let n2 = s2.x * s2.y;
+        for (var idx = lane; idx < n2; idx += 256u) {
+            let dx = idx % s2.x;
+            let dy = idx / s2.x;
+            let d = reduce_tail_b(s1, dx, dy);
+            tail_a[idx] = d;
+            textureStore(dst2, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+    workgroupBarrier();
+
+    let do3 = do2 && (s2.x > 1u || s2.y > 1u);
+    let s3 = max(s2 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do3 {
+        let n3 = s3.x * s3.y;
+        for (var idx = lane; idx < n3; idx += 256u) {
+            let dx = idx % s3.x;
+            let dy = idx / s3.x;
+            let d = reduce_tail_a(s2, dx, dy);
+            textureStore(dst3, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+}
+";
+
+/// Single-workgroup odd-aware Hi-Z tail pass writing up to 8 mips (`@workgroup_size(256)`),
+/// reducing the entire tail (e.g. `60x33 -> 1x1` or `40x22 -> 1x1`) in 1 dispatch with 0 barriers.
+const HIZ_TAIL8_BODY: &str = "
+@group(0) @binding(1) var dst0: texture_storage_2d<r32float, write>;
+@group(0) @binding(2) var dst1: texture_storage_2d<r32float, write>;
+@group(0) @binding(3) var dst2: texture_storage_2d<r32float, write>;
+@group(0) @binding(4) var dst3: texture_storage_2d<r32float, write>;
+@group(0) @binding(5) var dst4: texture_storage_2d<r32float, write>;
+@group(0) @binding(6) var dst5: texture_storage_2d<r32float, write>;
+@group(0) @binding(7) var dst6: texture_storage_2d<r32float, write>;
+@group(0) @binding(8) var dst7: texture_storage_2d<r32float, write>;
+
+@compute @workgroup_size(256)
+fn hiz_tail_8(@builtin(local_invocation_index) lane: u32) {
+    let src_size = textureDimensions(src);
+    let s0 = max(src_size >> vec2<u32>(1u), vec2<u32>(1u));
+    let n0 = s0.x * s0.y;
+    for (var idx = lane; idx < n0; idx += 256u) {
+        let dx = idx % s0.x;
+        let dy = idx / s0.x;
+        let d = reduce_src(src_size, vec2<i32>(i32(dx), i32(dy)));
+        tail_a[idx] = d;
+        textureStore(dst0, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+    }
+    workgroupBarrier();
+
+    let do1 = s0.x > 1u || s0.y > 1u;
+    let s1 = max(s0 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do1 {
+        let n1 = s1.x * s1.y;
+        for (var idx = lane; idx < n1; idx += 256u) {
+            let dx = idx % s1.x;
+            let dy = idx / s1.x;
+            let d = reduce_tail_a(s0, dx, dy);
+            tail_b[idx] = d;
+            textureStore(dst1, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+    workgroupBarrier();
+
+    let do2 = do1 && (s1.x > 1u || s1.y > 1u);
+    let s2 = max(s1 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do2 {
+        let n2 = s2.x * s2.y;
+        for (var idx = lane; idx < n2; idx += 256u) {
+            let dx = idx % s2.x;
+            let dy = idx / s2.x;
+            let d = reduce_tail_b(s1, dx, dy);
+            tail_a[idx] = d;
+            textureStore(dst2, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+    workgroupBarrier();
+
+    let do3 = do2 && (s2.x > 1u || s2.y > 1u);
+    let s3 = max(s2 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do3 {
+        let n3 = s3.x * s3.y;
+        for (var idx = lane; idx < n3; idx += 256u) {
+            let dx = idx % s3.x;
+            let dy = idx / s3.x;
+            let d = reduce_tail_a(s2, dx, dy);
+            tail_b[idx] = d;
+            textureStore(dst3, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+    workgroupBarrier();
+
+    let do4 = do3 && (s3.x > 1u || s3.y > 1u);
+    let s4 = max(s3 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do4 {
+        let n4 = s4.x * s4.y;
+        for (var idx = lane; idx < n4; idx += 256u) {
+            let dx = idx % s4.x;
+            let dy = idx / s4.x;
+            let d = reduce_tail_b(s3, dx, dy);
+            tail_a[idx] = d;
+            textureStore(dst4, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+    workgroupBarrier();
+
+    let do5 = do4 && (s4.x > 1u || s4.y > 1u);
+    let s5 = max(s4 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do5 {
+        let n5 = s5.x * s5.y;
+        for (var idx = lane; idx < n5; idx += 256u) {
+            let dx = idx % s5.x;
+            let dy = idx / s5.x;
+            let d = reduce_tail_a(s4, dx, dy);
+            tail_b[idx] = d;
+            textureStore(dst5, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+    workgroupBarrier();
+
+    let do6 = do5 && (s5.x > 1u || s5.y > 1u);
+    let s6 = max(s5 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do6 {
+        let n6 = s6.x * s6.y;
+        for (var idx = lane; idx < n6; idx += 256u) {
+            let dx = idx % s6.x;
+            let dy = idx / s6.x;
+            let d = reduce_tail_b(s5, dx, dy);
+            tail_a[idx] = d;
+            textureStore(dst6, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+    workgroupBarrier();
+
+    let do7 = do6 && (s6.x > 1u || s6.y > 1u);
+    let s7 = max(s6 >> vec2<u32>(1u), vec2<u32>(1u));
+    if do7 {
+        let n7 = s7.x * s7.y;
+        for (var idx = lane; idx < n7; idx += 256u) {
+            let dx = idx % s7.x;
+            let dy = idx / s7.x;
+            let d = reduce_tail_a(s6, dx, dy);
+            textureStore(dst7, vec2<i32>(i32(dx), i32(dy)), vec4<f32>(d, 0.0, 0.0, 0.0));
+        }
+    }
+}
+";
+
+fn hiz_downsample_source() -> String {
+    [HIZ_REDUCE_SRC, HIZ_DOWNSAMPLE_BODY].concat()
+}
+
+fn hiz_tiled4_source() -> String {
+    [HIZ_REDUCE_SRC, HIZ_TILED_COMMON, HIZ_TILED4_BODY].concat()
+}
+
+fn hiz_tiled5_source() -> String {
+    [HIZ_REDUCE_SRC, HIZ_TILED_COMMON, HIZ_TILED5_BODY].concat()
+}
+
+fn hiz_tail4_source() -> String {
+    [HIZ_REDUCE_SRC, HIZ_TAIL_COMMON, HIZ_TAIL4_BODY].concat()
+}
+
+fn hiz_tail8_source() -> String {
+    [HIZ_REDUCE_SRC, HIZ_TAIL_COMMON, HIZ_TAIL8_BODY].concat()
+}
 
 /// Compute Hi-Z box occlusion test appended to `cull.wgsl` when `DepthTest::Compute`
 /// is active: 1 thread per box (8 `mat4 * vec4` transforms instead of 324, zero
@@ -360,17 +867,213 @@ pub(crate) fn hiz_mip_dimensions(depth_size: [u32; 2]) -> Vec<[u32; 2]> {
     dims
 }
 
+/// Device capabilities controlling which multi-mip Hi-Z downsample kernels are enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HizCaps {
+    /// `max_storage_textures >= 4` and workgroup storage fits `hiz_downsample_4`.
+    pub(crate) tiled4: bool,
+    /// `tiled4` + 256-thread workgroups + 12 KiB LDS for `hiz_tail_4`.
+    pub(crate) tail4: bool,
+    /// `tail4` + `max_storage_textures >= 8` + 16x16 workgroups for `hiz_downsample_5` / `hiz_tail_8`.
+    pub(crate) wide8: bool,
+}
+
+impl HizCaps {
+    fn from_limits(limits: &wgpu::Limits) -> Self {
+        let tiled4 = limits.max_storage_textures_per_shader_stage >= 4
+            && limits.max_compute_workgroup_storage_size >= HIZ_TILED4_SHARED_BYTES;
+        let tail4 = tiled4
+            && limits.max_compute_workgroup_size_x >= WORKGROUP_TAIL
+            && limits.max_compute_invocations_per_workgroup >= WORKGROUP_TAIL
+            && limits.max_compute_workgroup_storage_size >= HIZ_TAIL_SHARED_BYTES;
+        let wide8 = tail4
+            && limits.max_storage_textures_per_shader_stage >= 8
+            && limits.max_compute_workgroup_size_y >= WORKGROUP_TILED5;
+        Self {
+            tiled4,
+            tail4,
+            wide8,
+        }
+    }
+}
+
+/// Which Hi-Z downsample compute pipeline a planned dispatch step invokes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HizStepKind {
+    /// 1-mip direct downsample (`hiz_downsample`, 8x8 workgroup).
+    Single,
+    /// 2..=4-mip shared-memory tiled downsample (`hiz_downsample_4`, 8x8 workgroup).
+    Tiled4,
+    /// 5-mip shared-memory tiled downsample (`hiz_downsample_5`, 16x16 workgroup).
+    Tiled5,
+    /// 2..=4-mip single-workgroup odd-aware tail (`hiz_tail_4`, 256-thread workgroup).
+    Tail4,
+    /// 5..=8-mip single-workgroup odd-aware tail (`hiz_tail_8`, 256-thread workgroup).
+    Tail8,
+}
+
+/// One planned Hi-Z downsample dispatch covering `first_mip..first_mip + mip_count`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HizStepSpec {
+    pub(crate) kind: HizStepKind,
+    pub(crate) first_mip: usize,
+    pub(crate) mip_count: usize,
+    pub(crate) workgroups: [u32; 2],
+}
+
+/// Plans the minimum-dispatch sequence of multi-mip shared-memory Hi-Z reductions
+/// for `mip_sizes` under `caps`, preserving exact conservative odd-dimension coverage.
+pub(crate) fn plan_hiz_steps(mip_sizes: &[[u32; 2]], caps: HizCaps) -> Vec<HizStepSpec> {
+    let mut steps = Vec::new();
+    let n = mip_sizes.len();
+    let mut i = 0;
+    while i < n {
+        let [nw, nh] = mip_sizes[i];
+        let texels = u64::from(nw) * u64::from(nh);
+        if caps.tail4 && (n - i) >= 2 && texels <= u64::from(HIZ_TAIL_MAX_TEXELS) {
+            let max_out = if caps.wide8 { 8 } else { 4 };
+            let take = (n - i).min(max_out);
+            let kind = if caps.wide8 && take > 4 {
+                HizStepKind::Tail8
+            } else {
+                HizStepKind::Tail4
+            };
+            steps.push(HizStepSpec {
+                kind,
+                first_mip: i,
+                mip_count: take,
+                workgroups: [1, 1],
+            });
+            i += take;
+            continue;
+        }
+        if caps.tiled4 {
+            let max_tiled = if caps.wide8 { 5 } else { 4 };
+            let mut take = 1;
+            while take < max_tiled && i + take < n {
+                let [pw, ph] = mip_sizes[i + take - 1];
+                let odd_x = pw > 1 && !pw.is_multiple_of(2);
+                let odd_y = ph > 1 && !ph.is_multiple_of(2);
+                if !odd_x && !odd_y {
+                    take += 1;
+                } else {
+                    break;
+                }
+            }
+            let (kind, edge) = match take {
+                5 => (HizStepKind::Tiled5, WORKGROUP_TILED5),
+                2..=4 => (HizStepKind::Tiled4, WORKGROUP_2D),
+                _ => (HizStepKind::Single, WORKGROUP_2D),
+            };
+            steps.push(HizStepSpec {
+                kind,
+                first_mip: i,
+                mip_count: take,
+                workgroups: [nw.div_ceil(edge), nh.div_ceil(edge)],
+            });
+            i += take;
+        } else {
+            steps.push(HizStepSpec {
+                kind: HizStepKind::Single,
+                first_mip: i,
+                mip_count: 1,
+                workgroups: [nw.div_ceil(WORKGROUP_2D), nh.div_ceil(WORKGROUP_2D)],
+            });
+            i += 1;
+        }
+    }
+    steps
+}
+
+struct HizStep {
+    spec: HizStepSpec,
+    group: wgpu::BindGroup,
+}
+
 /// One allocated reversed-Z min-depth Hi-Z pyramid matching a depth texture size.
 struct HizPyramid {
     depth_size: [u32; 2],
-    mip_sizes: Vec<[u32; 2]>,
     depth_view: wgpu::TextureView,
     level_views: Vec<wgpu::TextureView>,
-    downsample_groups: Vec<wgpu::BindGroup>,
+    steps: Vec<HizStep>,
     read_group: wgpu::BindGroup,
 }
 
-/// Compute downsample pipeline and cached Hi-Z pyramid shared by `Cull` and `GpuCulling`.
+/// Layouts, pipelines, and distinct 1x1 dummy storage targets for multi-mip Hi-Z passes.
+struct HizPipelines {
+    caps: HizCaps,
+    single_layout: wgpu::BindGroupLayout,
+    single_pipeline: wgpu::ComputePipeline,
+    multi4_layout: Option<wgpu::BindGroupLayout>,
+    tiled4_pipeline: Option<wgpu::ComputePipeline>,
+    tail4_pipeline: Option<wgpu::ComputePipeline>,
+    tiled5_layout: Option<wgpu::BindGroupLayout>,
+    tiled5_pipeline: Option<wgpu::ComputePipeline>,
+    tail8_layout: Option<wgpu::BindGroupLayout>,
+    tail8_pipeline: Option<wgpu::ComputePipeline>,
+    /// Distinct 1x1 `R32Float` storage views bound to unused `dst1..dst{M-1}` slots so
+    /// no two `WriteOnly` storage texture bindings ever alias the same subresource.
+    dummy_views: Vec<wgpu::TextureView>,
+}
+
+impl HizPipelines {
+    fn make_step_group(
+        &self,
+        device: &wgpu::Device,
+        spec: HizStepSpec,
+        src: &wgpu::TextureView,
+        level_views: &[wgpu::TextureView],
+    ) -> wgpu::BindGroup {
+        let (layout, slots) = match spec.kind {
+            HizStepKind::Single => (&self.single_layout, 1usize),
+            HizStepKind::Tiled4 | HizStepKind::Tail4 => (
+                self.multi4_layout.as_ref().expect("Hi-Z multi4 layout"),
+                4usize,
+            ),
+            HizStepKind::Tiled5 => (
+                self.tiled5_layout.as_ref().expect("Hi-Z tiled5 layout"),
+                5usize,
+            ),
+            HizStepKind::Tail8 => (
+                self.tail8_layout.as_ref().expect("Hi-Z tail8 layout"),
+                8usize,
+            ),
+        };
+        let mut entries = Vec::with_capacity(1 + slots);
+        entries.push(wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(src),
+        });
+        for slot in 0..slots {
+            let view = if slot < spec.mip_count {
+                &level_views[spec.first_mip + slot]
+            } else {
+                &self.dummy_views[slot - 1]
+            };
+            entries.push(wgpu::BindGroupEntry {
+                binding: (slot + 1) as u32,
+                resource: wgpu::BindingResource::TextureView(view),
+            });
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Hi-Z downsample"),
+            layout,
+            entries: &entries,
+        })
+    }
+
+    fn pipeline(&self, kind: HizStepKind) -> &wgpu::ComputePipeline {
+        match kind {
+            HizStepKind::Single => &self.single_pipeline,
+            HizStepKind::Tiled4 => self.tiled4_pipeline.as_ref().expect("Hi-Z tiled4 pipeline"),
+            HizStepKind::Tiled5 => self.tiled5_pipeline.as_ref().expect("Hi-Z tiled5 pipeline"),
+            HizStepKind::Tail4 => self.tail4_pipeline.as_ref().expect("Hi-Z tail4 pipeline"),
+            HizStepKind::Tail8 => self.tail8_pipeline.as_ref().expect("Hi-Z tail8 pipeline"),
+        }
+    }
+}
+
+/// Compute downsample pipelines and cached Hi-Z pyramid shared by `Cull` and `GpuCulling`.
 /// `bind_depth` calls to keep the 1x1 zeroed Hi-Z fallback active before
 /// retrying pyramid allocation at the same depth size after an out-of-memory
 /// failure (starting delay and cap).
@@ -386,8 +1089,7 @@ struct HizOomBackoff {
 }
 
 struct Hiz {
-    downsample_pipeline: wgpu::ComputePipeline,
-    downsample_layout: wgpu::BindGroupLayout,
+    pipelines: HizPipelines,
     read_layout: wgpu::BindGroupLayout,
     /// 1x1 zero-cleared `R32Float` fallback read group used if the full pyramid
     /// cannot be allocated under video-memory exhaustion (#13624): depth 0.0 is the
@@ -397,25 +1099,59 @@ struct Hiz {
     oom_backoff: Option<HizOomBackoff>,
 }
 
-fn make_downsample_group(
+fn make_hiz_layout(device: &wgpu::Device, label: &str, dst_count: u32) -> wgpu::BindGroupLayout {
+    let mut entries = Vec::with_capacity(1 + dst_count as usize);
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    });
+    for slot in 0..dst_count {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 1 + slot,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format: wgpu::TextureFormat::R32Float,
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+            count: None,
+        });
+    }
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &entries,
+    })
+}
+
+fn make_hiz_pipeline(
     device: &wgpu::Device,
+    label: &str,
     layout: &wgpu::BindGroupLayout,
-    src: &wgpu::TextureView,
-    dst: &wgpu::TextureView,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Hi-Z downsample"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(src),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(dst),
-            },
-        ],
+    source: &str,
+    entry_point: &str,
+) -> wgpu::ComputePipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(layout)],
+        ..Default::default()
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pipeline_layout),
+        module: &module,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
     })
 }
 
@@ -424,55 +1160,108 @@ impl Hiz {
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
         let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let compute = wgpu::ShaderStages::COMPUTE;
-        let tex_entry = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: compute,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
+        let caps = HizCaps::from_limits(&device.limits());
+        let single_layout = make_hiz_layout(device, "Hi-Z downsample", 1);
+        let single_pipeline = make_hiz_pipeline(
+            device,
+            "Hi-Z downsample",
+            &single_layout,
+            &hiz_downsample_source(),
+            "hiz_downsample",
+        );
+
+        let (multi4_layout, tiled4_pipeline, tail4_pipeline) = if caps.tiled4 {
+            let layout = make_hiz_layout(device, "Hi-Z multi4", 4);
+            let tiled4 = make_hiz_pipeline(
+                device,
+                "Hi-Z tiled4",
+                &layout,
+                &hiz_tiled4_source(),
+                "hiz_downsample_4",
+            );
+            let tail4 = caps.tail4.then(|| {
+                make_hiz_pipeline(
+                    device,
+                    "Hi-Z tail4",
+                    &layout,
+                    &hiz_tail4_source(),
+                    "hiz_tail_4",
+                )
+            });
+            (Some(layout), Some(tiled4), tail4)
+        } else {
+            (None, None, None)
         };
-        let downsample_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Hi-Z downsample"),
-            entries: &[
-                tex_entry,
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: compute,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
+
+        let (tiled5_layout, tiled5_pipeline, tail8_layout, tail8_pipeline) = if caps.wide8 {
+            let t5_layout = make_hiz_layout(device, "Hi-Z tiled5", 5);
+            let t5_pipe = make_hiz_pipeline(
+                device,
+                "Hi-Z tiled5",
+                &t5_layout,
+                &hiz_tiled5_source(),
+                "hiz_downsample_5",
+            );
+            let t8_layout = make_hiz_layout(device, "Hi-Z tail8", 8);
+            let t8_pipe = make_hiz_pipeline(
+                device,
+                "Hi-Z tail8",
+                &t8_layout,
+                &hiz_tail8_source(),
+                "hiz_tail_8",
+            );
+            (
+                Some(t5_layout),
+                Some(t5_pipe),
+                Some(t8_layout),
+                Some(t8_pipe),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+        let dummy_count = if caps.wide8 {
+            7
+        } else if caps.tiled4 {
+            3
+        } else {
+            0
+        };
+        let dummy_views: Vec<wgpu::TextureView> = (0..dummy_count)
+            .map(|_| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Hi-Z unused slot"),
+                        size: wgpu::Extent3d {
+                            width: 1,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
                         format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
-        });
+                        usage: wgpu::TextureUsages::STORAGE_BINDING,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default())
+            })
+            .collect();
+
         let read_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Hi-Z read"),
-            entries: &[tex_entry],
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
         });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Hi-Z downsample"),
-            source: wgpu::ShaderSource::Wgsl(HIZ_DOWNSAMPLE_SHADER.into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Hi-Z downsample"),
-            bind_group_layouts: &[Some(&downsample_layout)],
-            ..Default::default()
-        });
-        let downsample_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Hi-Z downsample"),
-                layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some("hiz_downsample"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+
         let fallback = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("Hi-Z fallback"),
@@ -497,6 +1286,7 @@ impl Hiz {
                 resource: wgpu::BindingResource::TextureView(&fallback),
             }],
         });
+
         let memory = pollster::block_on(memory.pop()).map(|e| e.to_string());
         let internal = pollster::block_on(internal.pop()).map(|e| e.to_string());
         let validation = pollster::block_on(validation.pop()).map(|e| e.to_string());
@@ -510,8 +1300,19 @@ impl Hiz {
             return Err(e);
         }
         Ok(Self {
-            downsample_pipeline,
-            downsample_layout,
+            pipelines: HizPipelines {
+                caps,
+                single_layout,
+                single_pipeline,
+                multi4_layout,
+                tiled4_pipeline,
+                tail4_pipeline,
+                tiled5_layout,
+                tiled5_pipeline,
+                tail8_layout,
+                tail8_pipeline,
+                dummy_views,
+            },
             read_layout,
             fallback_read_group,
             pyramid: None,
@@ -546,6 +1347,7 @@ impl Hiz {
         }
         let depth_size = [texture.width(), texture.height()];
         let mut rebind_failed = false;
+        let pipelines = &self.pipelines;
         if let Some(p) = &mut self.pyramid {
             if p.depth_view == *depth {
                 return;
@@ -556,15 +1358,10 @@ impl Hiz {
                 // subsequent frames never reuse a failed or stale binding.
                 if let Some(group) =
                     super::frame_targets::made(device, super::frame_targets::Kind::Buffers, || {
-                        make_downsample_group(
-                            device,
-                            &self.downsample_layout,
-                            depth,
-                            &p.level_views[0],
-                        )
+                        pipelines.make_step_group(device, p.steps[0].spec, depth, &p.level_views)
                     })
                 {
-                    p.downsample_groups[0] = group;
+                    p.steps[0].group = group;
                     p.depth_view = depth.clone();
                     return;
                 }
@@ -594,7 +1391,8 @@ impl Hiz {
         // video memory are never held together (#13624).
         self.pyramid = None;
         let mip_sizes = hiz_mip_dimensions(depth_size);
-        let downsample_layout = &self.downsample_layout;
+        let step_specs = plan_hiz_steps(&mip_sizes, self.pipelines.caps);
+        let pipelines = &self.pipelines;
         let read_layout = &self.read_layout;
         self.pyramid =
             super::frame_targets::made(device, super::frame_targets::Kind::Buffers, || {
@@ -610,7 +1408,8 @@ impl Hiz {
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::R32Float,
                     usage: wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | HIZ_TEST_READ,
                     view_formats: &[],
                 });
                 let all_view = pyramid_tex.create_view(&Default::default());
@@ -623,10 +1422,17 @@ impl Hiz {
                         })
                     })
                     .collect();
-                let downsample_groups: Vec<wgpu::BindGroup> = (0..level_views.len())
-                    .map(|i| {
-                        let src = if i == 0 { depth } else { &level_views[i - 1] };
-                        make_downsample_group(device, downsample_layout, src, &level_views[i])
+                let steps: Vec<HizStep> = step_specs
+                    .iter()
+                    .copied()
+                    .map(|spec| {
+                        let src = if spec.first_mip == 0 {
+                            depth
+                        } else {
+                            &level_views[spec.first_mip - 1]
+                        };
+                        let group = pipelines.make_step_group(device, spec, src, &level_views);
+                        HizStep { spec, group }
                     })
                     .collect();
                 let read_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -639,10 +1445,9 @@ impl Hiz {
                 });
                 HizPyramid {
                     depth_size,
-                    mip_sizes,
                     depth_view: depth.clone(),
                     level_views,
-                    downsample_groups,
+                    steps,
                     read_group,
                 }
             });
@@ -657,10 +1462,14 @@ impl Hiz {
         let Some(p) = &self.pyramid else {
             return;
         };
-        pass.set_pipeline(&self.downsample_pipeline);
-        for (group, &[w, h]) in p.downsample_groups.iter().zip(&p.mip_sizes) {
-            pass.set_bind_group(0, group, &[]);
-            pass.dispatch_workgroups(w.div_ceil(WORKGROUP_2D), h.div_ceil(WORKGROUP_2D), 1);
+        let mut active: Option<HizStepKind> = None;
+        for step in &p.steps {
+            if active != Some(step.spec.kind) {
+                pass.set_pipeline(self.pipelines.pipeline(step.spec.kind));
+                active = Some(step.spec.kind);
+            }
+            pass.set_bind_group(0, &step.group, &[]);
+            pass.dispatch_workgroups(step.spec.workgroups[0], step.spec.workgroups[1], 1);
         }
     }
 
@@ -927,8 +1736,17 @@ impl Cull {
     pub fn hiz_read_group(&self) -> Option<&wgpu::BindGroup> {
         self.hiz.as_ref().map(Hiz::read_group)
     }
+    /// Records the reversed-Z min-depth Hi-Z pyramid downsampling into an active
+    /// compute pass so callers can coalesce Hi-Z generation with box tests.
+    pub fn downsample_hiz(&self, pass: &mut wgpu::ComputePass<'_>) {
+        if let Some(hiz) = &self.hiz {
+            hiz.downsample(pass);
+        }
+    }
+
     /// Builds the reversed-Z min-depth Hi-Z pyramid from phase 1's depth, for GPU culling's
     /// compute occlusion test.
+    #[cfg(test)]
     pub fn build_hiz(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1638,11 +2456,15 @@ mod tests {
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{depth_test:?}: {e:?}"));
         }
-        translate_compute_entry(
-            HIZ_DOWNSAMPLE_SHADER,
-            "hiz_downsample",
-            naga::valid::Capabilities::empty(),
-        );
+        for (source, entry) in [
+            (hiz_downsample_source(), "hiz_downsample"),
+            (hiz_tiled4_source(), "hiz_downsample_4"),
+            (hiz_tiled5_source(), "hiz_downsample_5"),
+            (hiz_tail4_source(), "hiz_tail_4"),
+            (hiz_tail8_source(), "hiz_tail_8"),
+        ] {
+            translate_compute_entry(&source, entry, naga::valid::Capabilities::empty());
+        }
         translate_compute_entry(&source(DepthTest::Compute), "cs_box_test", no_early);
     }
 
@@ -2413,5 +3235,558 @@ struct Rect {
         .expect("Cull::pick(Compute) must succeed on qualifying adapter");
         assert_eq!(compute.depth_test, DepthTest::Compute);
         assert!(compute.hiz_read_layout().is_some());
+    }
+
+    /// Exact CPU simulation of `hiz_downsample_4` (`edge = 8, max_mips = 4`) and
+    /// `hiz_downsample_5` (`edge = 16, max_mips = 5`), poisoning shared tiles with
+    /// `f32::NAN` so any unwritten read panics immediately.
+    fn sim_tiled_step(
+        src: &[f32],
+        src_size: [usize; 2],
+        edge: usize,
+        max_mips: usize,
+        dsts: &mut [Vec<f32>],
+    ) {
+        let [sw, sh] = src_size;
+        let s0 = [(sw / 2).max(1), (sh / 2).max(1)];
+        let reduce = |dx: usize, dy: usize| -> f32 {
+            let mx = sw - 1;
+            let my = sh - 1;
+            let bx = dx * 2;
+            let by = dy * 2;
+            let x0 = bx.min(mx);
+            let x1 = (bx + 1).min(mx);
+            let y0 = by.min(my);
+            let y1 = (by + 1).min(my);
+            let mut d = src[y0 * sw + x0]
+                .min(src[y0 * sw + x1])
+                .min(src[y1 * sw + x0].min(src[y1 * sw + x1]));
+            let ox = sw > 1 && !sw.is_multiple_of(2);
+            let oy = sh > 1 && !sh.is_multiple_of(2);
+            if ox {
+                let x2 = (bx + 2).min(mx);
+                d = d.min(src[y0 * sw + x2].min(src[y1 * sw + x2]));
+            }
+            if oy {
+                let y2 = (by + 2).min(my);
+                d = d.min(src[y2 * sw + x0].min(src[y2 * sw + x1]));
+                if ox {
+                    let x2 = (bx + 2).min(mx);
+                    d = d.min(src[y2 * sw + x2]);
+                }
+            }
+            d
+        };
+        let gx_n = s0[0].div_ceil(edge);
+        let gy_n = s0[1].div_ceil(edge);
+        let can_even = |s: [usize; 2]| {
+            (s[0] > 1 || s[1] > 1)
+                && (s[0] == 1 || s[0].is_multiple_of(2))
+                && (s[1] == 1 || s[1].is_multiple_of(2))
+        };
+        for gy in 0..gy_n {
+            for gx in 0..gx_n {
+                let mut tiles: Vec<Vec<f32>> = (0..max_mips - 1)
+                    .map(|m| vec![f32::NAN; (edge >> m) * (edge >> m)])
+                    .collect();
+                for ly in 0..edge {
+                    for lx in 0..edge {
+                        let px = gx * edge + lx;
+                        let py = gy * edge + ly;
+                        if px < s0[0] && py < s0[1] {
+                            let d0 = reduce(px, py);
+                            dsts[0][py * s0[0] + px] = d0;
+                            tiles[0][ly * edge + lx] = d0;
+                        }
+                    }
+                }
+                let mut prev = s0;
+                let mut active = true;
+                for m in 1..max_mips {
+                    let do_m = active && can_even(prev);
+                    let cur = [(prev[0] / 2).max(1), (prev[1] / 2).max(1)];
+                    let cur_edge = edge >> m;
+                    let prev_edge = edge >> (m - 1);
+                    if do_m {
+                        for ly in 0..cur_edge {
+                            for lx in 0..cur_edge {
+                                let px = gx * cur_edge + lx;
+                                let py = gy * cur_edge + ly;
+                                if px < cur[0] && py < cur[1] {
+                                    let x0 = lx * 2;
+                                    let x1 = if prev[0] == 1 { x0 } else { x0 + 1 };
+                                    let y0 = ly * 2;
+                                    let y1 = if prev[1] == 1 { y0 } else { y0 + 1 };
+                                    let pt = &tiles[m - 1];
+                                    let vals = [
+                                        pt[y0 * prev_edge + x0],
+                                        pt[y0 * prev_edge + x1],
+                                        pt[y1 * prev_edge + x0],
+                                        pt[y1 * prev_edge + x1],
+                                    ];
+                                    assert!(vals.iter().all(|v| !v.is_nan()));
+                                    let dm = vals[0].min(vals[1]).min(vals[2].min(vals[3]));
+                                    dsts[m][py * cur[0] + px] = dm;
+                                    if m < max_mips - 1 {
+                                        tiles[m][ly * cur_edge + lx] = dm;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    active = do_m;
+                    prev = cur;
+                }
+            }
+        }
+    }
+
+    /// Exact CPU simulation of `hiz_tail_4` / `hiz_tail_8` ping-pong workgroup reduction.
+    fn sim_tail_step(src: &[f32], src_size: [usize; 2], max_mips: usize, dsts: &mut [Vec<f32>]) {
+        let mut tail_a = vec![f32::NAN; HIZ_TAIL_MAX_TEXELS as usize];
+        let mut tail_b = vec![f32::NAN; (HIZ_TAIL_MAX_TEXELS / 2) as usize];
+        let (first, s0) = cpu_hiz_downsample(src, src_size);
+        let n0 = s0[0] * s0[1];
+        assert!(n0 <= tail_a.len());
+        tail_a[..n0].copy_from_slice(&first);
+        dsts[0].copy_from_slice(&first);
+        let mut prev = s0;
+        let mut active = true;
+        for m in 1..max_mips {
+            let do_m = active && (prev[0] > 1 || prev[1] > 1);
+            let cur = [(prev[0] / 2).max(1), (prev[1] / 2).max(1)];
+            if do_m {
+                let (next, next_size) = if m.is_multiple_of(2) {
+                    cpu_hiz_downsample(&tail_b[..prev[0] * prev[1]], prev)
+                } else {
+                    cpu_hiz_downsample(&tail_a[..prev[0] * prev[1]], prev)
+                };
+                assert_eq!(next_size, cur);
+                assert!(next.iter().all(|v| !v.is_nan()));
+                let nm = cur[0] * cur[1];
+                if m.is_multiple_of(2) {
+                    tail_a[..nm].copy_from_slice(&next);
+                } else {
+                    tail_b[..nm].copy_from_slice(&next);
+                }
+                dsts[m].copy_from_slice(&next);
+            }
+            active = do_m;
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn hiz_multimip_plan_reduces_dispatches_and_matches_reference_bit_exact() {
+        let desktop = HizCaps {
+            tiled4: true,
+            tail4: true,
+            wide8: true,
+        };
+        let core4 = HizCaps {
+            tiled4: true,
+            tail4: true,
+            wide8: false,
+        };
+        let tiled_only = HizCaps {
+            tiled4: true,
+            tail4: false,
+            wide8: false,
+        };
+        let single_only = HizCaps {
+            tiled4: false,
+            tail4: false,
+            wide8: false,
+        };
+
+        // Concrete dispatch count reductions on standard resolutions.
+        assert_eq!(
+            plan_hiz_steps(&hiz_mip_dimensions([1920, 1080]), desktop).len(),
+            3
+        );
+        assert_eq!(
+            plan_hiz_steps(&hiz_mip_dimensions([2560, 1440]), desktop).len(),
+            2
+        );
+        assert_eq!(
+            plan_hiz_steps(&hiz_mip_dimensions([3840, 2160]), desktop).len(),
+            3
+        );
+        assert_eq!(
+            plan_hiz_steps(&hiz_mip_dimensions([1280, 720]), desktop).len(),
+            2
+        );
+        assert_eq!(
+            plan_hiz_steps(&hiz_mip_dimensions([1920, 1080]), core4).len(),
+            4
+        );
+        assert_eq!(
+            plan_hiz_steps(&hiz_mip_dimensions([2560, 1440]), core4).len(),
+            4
+        );
+        assert_eq!(
+            plan_hiz_steps(&hiz_mip_dimensions([67, 39]), desktop).len(),
+            1
+        );
+        assert_eq!(
+            plan_hiz_steps(&hiz_mip_dimensions([1, 1]), desktop).len(),
+            1
+        );
+
+        let all_caps = [single_only, tiled_only, core4, desktop];
+        // Structural plan invariants across every small size and large/odd/degenerate sizes.
+        for [w, h] in (1..=33u32)
+            .flat_map(|w| (1..=33u32).map(move |h| [w, h]))
+            .chain([
+                [64, 36],
+                [67, 39],
+                [129, 65],
+                [240, 135],
+                [320, 180],
+                [1366, 768],
+                [1919, 1079],
+                [1920, 1080],
+                [2560, 1440],
+                [3840, 2160],
+                [1, 2049],
+                [2049, 1],
+                [4097, 1],
+            ])
+        {
+            let mips = hiz_mip_dimensions([w, h]);
+            for caps in all_caps {
+                let steps = plan_hiz_steps(&mips, caps);
+                let mut cursor = 0usize;
+                for step in &steps {
+                    assert_eq!(step.first_mip, cursor, "{w}x{h} {caps:?}");
+                    assert!(step.mip_count >= 1, "{w}x{h} {caps:?}");
+                    assert!(step.workgroups[0] >= 1 && step.workgroups[1] >= 1);
+                    if matches!(step.kind, HizStepKind::Tail4 | HizStepKind::Tail8) {
+                        let [mw, mh] = mips[step.first_mip];
+                        assert!(u64::from(mw) * u64::from(mh) <= u64::from(HIZ_TAIL_MAX_TEXELS));
+                        assert_eq!(step.workgroups, [1, 1]);
+                    }
+                    cursor += step.mip_count;
+                }
+                assert_eq!(cursor, mips.len(), "{w}x{h} {caps:?}");
+            }
+        }
+
+        // Bit-exact equivalence of simulated multi-mip reductions against cpu_build_hiz.
+        for [w, h] in [
+            [1usize, 1],
+            [2, 3],
+            [3, 5],
+            [5, 7],
+            [7, 9],
+            [15, 13],
+            [17, 19],
+            [33, 25],
+            [64, 36],
+            [67, 39],
+            [129, 65],
+            [130, 67],
+            [240, 135],
+            [320, 180],
+            [1, 2049],
+            [2049, 1],
+        ] {
+            let mut seed = ((w as u64) << 32) ^ (h as u64) ^ 0x9e37_79b9_7f4a_7c15;
+            let depth: Vec<f32> = (0..w * h)
+                .map(|_| {
+                    seed ^= seed >> 12;
+                    seed ^= seed << 25;
+                    seed ^= seed >> 27;
+                    ((seed.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 40) as f32) / 16_777_216.0
+                })
+                .collect();
+            let reference = cpu_build_hiz(&depth, [w, h]);
+            let mips = hiz_mip_dimensions([w as u32, h as u32]);
+            for caps in all_caps {
+                let steps = plan_hiz_steps(&mips, caps);
+                let mut produced: Vec<Vec<f32>> = mips
+                    .iter()
+                    .map(|&[mw, mh]| vec![f32::NAN; mw as usize * mh as usize])
+                    .collect();
+                for step in steps {
+                    let (src_slice, src_size) = if step.first_mip == 0 {
+                        (depth.as_slice(), [w, h])
+                    } else {
+                        let [pw, ph] = mips[step.first_mip - 1];
+                        (
+                            produced[step.first_mip - 1].as_slice(),
+                            [pw as usize, ph as usize],
+                        )
+                    };
+                    let src_copy = src_slice.to_vec();
+                    let out_slice = &mut produced[step.first_mip..step.first_mip + step.mip_count];
+                    match step.kind {
+                        HizStepKind::Single => {
+                            let (next, _) = cpu_hiz_downsample(&src_copy, src_size);
+                            out_slice[0].copy_from_slice(&next);
+                        }
+                        HizStepKind::Tiled4 => {
+                            sim_tiled_step(&src_copy, src_size, 8, 4, out_slice);
+                        }
+                        HizStepKind::Tiled5 => {
+                            sim_tiled_step(&src_copy, src_size, 16, 5, out_slice);
+                        }
+                        HizStepKind::Tail4 => {
+                            sim_tail_step(&src_copy, src_size, 4, out_slice);
+                        }
+                        HizStepKind::Tail8 => {
+                            sim_tail_step(&src_copy, src_size, 8, out_slice);
+                        }
+                    }
+                }
+                for (mip, (got, (expected, _))) in produced.iter().zip(&reference).enumerate() {
+                    let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+                    let exp_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(got_bits, exp_bits, "{w}x{h} {caps:?} mip {mip}");
+                }
+            }
+        }
+    }
+
+    /// Read back every mip of `HizPyramid`'s `R32Float` texture and compare bit-for-bit
+    /// against `cpu_build_hiz`.
+    fn read_hiz_mip(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+        mip: u32,
+        size: [u32; 2],
+    ) -> Vec<f32> {
+        let row_bytes = size[0] * 4;
+        let padded_row = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let total_bytes = u64::from(padded_row) * u64::from(size[1]);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Hi-Z mip readback"),
+            size: total_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: mip,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(size[1]),
+                },
+            },
+            wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |res| res.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range().unwrap();
+        let mut out = Vec::with_capacity((size[0] * size[1]) as usize);
+        for y in 0..size[1] as usize {
+            let start = y * padded_row as usize;
+            let row: &[f32] = bytemuck::cast_slice(&data[start..start + row_bytes as usize]);
+            out.extend_from_slice(row);
+        }
+        drop(data);
+        staging.unmap();
+        out
+    }
+
+    #[test]
+    fn compute_hiz_multimip_gpu_pyramid_matches_cpu_reference_on_odd_and_even_sizes() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(adapter) = crate::gfx::test_gpu::adapter() else {
+            return;
+        };
+        if !crate::gfx::test_gpu::supports_depth_load(&adapter) {
+            return;
+        }
+        // Run against both WebGPU default limits (4 storage textures -> Tiled4 + Tail4)
+        // and the adapter's full limits (8+ storage textures -> Tiled5 + Tail8).
+        let mut descriptors = vec![("default-4tex", wgpu::DeviceDescriptor::default())];
+        if adapter.limits().max_storage_textures_per_shader_stage >= 8 {
+            descriptors.push((
+                "adapter-8tex",
+                wgpu::DeviceDescriptor {
+                    required_limits: adapter.limits(),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        for (tier, desc) in descriptors {
+            let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else {
+                continue;
+            };
+            if !compute_hiz_supported(&adapter, &device) {
+                continue;
+            }
+            let Some(mut cull) =
+                Cull::new(&device, wgpu::TextureFormat::Rgba8Unorm, DepthTest::Compute)
+            else {
+                continue;
+            };
+            let rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Hi-Z multimip test rect"),
+                source: wgpu::ShaderSource::Wgsl(DEPTH_RECT_SHADER.into()),
+            });
+            let rect_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+            let rect_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&rect_layout)],
+                ..Default::default()
+            });
+            let rect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Hi-Z multimip test rect"),
+                layout: Some(&rect_pl),
+                vertex: wgpu::VertexState {
+                    module: &rect_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: None,
+            });
+            let rect_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: std::mem::size_of::<DepthRect>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let rect_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &rect_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: rect_buf.as_entire_binding(),
+                }],
+            });
+
+            // Cases: (width, height, single-pixel sky hole coordinate (x, y)).
+            let cases = [
+                (67u32, 39u32, 66u32, 38u32), // odd x odd corner hole (Tail4/Tail8)
+                (67, 39, 66, 19),             // odd right edge hole
+                (67, 39, 33, 38),             // odd bottom edge hole
+                (135, 79, 134, 78),           // odd -> odd intermediates + tail
+                (257, 135, 256, 134),         // odd src -> even/odd intermediates + tail
+                (320, 180, 161, 91),          // even top mips (Tiled4/Tiled5) -> odd mip -> tail
+                (320, 180, 319, 179),         // bottom-right pixel in multi-mip tiled pass
+            ];
+            for (w, h, hx, hy) in cases {
+                let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Hi-Z multimip depth"),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let depth_view = depth_tex.create_view(&Default::default());
+                // Tight 0.5-pixel quad centered on (hx + 0.5, hy + 0.5) so exactly
+                // pixel (hx, hy) is rasterized with zero boundary tie ambiguity.
+                let x0 = ((hx as f32 + 0.25) / w as f32) * 2.0 - 1.0;
+                let x1 = ((hx as f32 + 0.75) / w as f32) * 2.0 - 1.0;
+                let y1 = 1.0 - ((hy as f32 + 0.25) / h as f32) * 2.0;
+                let y0 = 1.0 - ((hy as f32 + 0.75) / h as f32) * 2.0;
+                let hole = DepthRect {
+                    bounds: [x0, y0, x1, y1],
+                    depth: 0.0,
+                    pad: [0.0; 3],
+                };
+                queue.write_buffer(&rect_buf, 0, bytemuck::bytes_of(&hole));
+                cull.bind_depth(&device, &depth_view);
+
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("clear + single-pixel hole"),
+                        color_attachments: &[],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(0.875),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                    rp.set_pipeline(&rect_pipeline);
+                    rp.set_bind_group(0, &rect_group, &[]);
+                    rp.draw(0..6, 0..1);
+                }
+                cull.build_hiz(&mut encoder, None);
+                queue.submit([encoder.finish()]);
+
+                let mut expected_depth = vec![0.875f32; (w * h) as usize];
+                expected_depth[(hy * w + hx) as usize] = 0.0;
+                let expected_pyr = cpu_build_hiz(&expected_depth, [w as usize, h as usize]);
+                let mip_sizes = hiz_mip_dimensions([w, h]);
+                let p = cull
+                    .hiz
+                    .as_ref()
+                    .and_then(|hiz| hiz.pyramid.as_ref())
+                    .expect("Hi-Z pyramid allocated");
+                assert!(
+                    p.steps.len() < mip_sizes.len(),
+                    "{tier} {w}x{h} should reduce dispatch count: {} vs {}",
+                    p.steps.len(),
+                    mip_sizes.len()
+                );
+                let pyramid_tex = p.level_views[0].texture();
+                for (mip, (&size, (expected, _))) in mip_sizes.iter().zip(&expected_pyr).enumerate()
+                {
+                    let got = read_hiz_mip(&device, &queue, pyramid_tex, mip as u32, size);
+                    let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+                    let exp_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(
+                        got_bits, exp_bits,
+                        "{tier} {w}x{h} hole ({hx},{hy}) mip {mip} ({size:?})"
+                    );
+                }
+            }
+        }
     }
 }

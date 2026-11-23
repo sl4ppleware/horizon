@@ -11219,14 +11219,24 @@ impl Renderer {
                                 if gpu.uses_hiz() {
                                     drop(pass);
                                     if let Some(cull) = self.cull.as_ref() {
-                                        cull.build_hiz(&mut encoder, self.own_timing.as_mut());
-                                        if let Some(hiz) = cull.hiz_read_group() {
-                                            gpu.test_hiz(
-                                                &mut encoder,
-                                                hiz,
-                                                self.own_timing.as_mut(),
-                                            );
-                                        }
+                                        let hiz = cull.hiz_read_group();
+                                        let mut build = |pass: &mut wgpu::ComputePass<'_>| {
+                                            cull.downsample_hiz(pass);
+                                        };
+                                        let mut boxes = |pass: &mut wgpu::ComputePass<'_>| {
+                                            if let Some(hiz) = hiz {
+                                                gpu.test_hiz_into(pass, hiz);
+                                            }
+                                        };
+                                        pack_timing::compute_parts(
+                                            &mut encoder,
+                                            self.own_timing.as_mut(),
+                                            "GPU occlusion",
+                                            &mut [
+                                                ("hiz pyramid", &mut build),
+                                                ("occlusion boxes", &mut boxes),
+                                            ],
+                                        );
                                     }
                                 } else {
                                     if surface.is_some() {
@@ -11237,8 +11247,8 @@ impl Renderer {
                                     pass.stage(self.own_timing.as_mut(), "occlusion boxes");
                                     gpu.test(&mut pass);
                                     drop(pass);
+                                    gpu.compact(&mut encoder, self.own_timing.as_mut());
                                 }
-                                gpu.compact(&mut encoder, self.own_timing.as_mut());
                                 pass = match &surface {
                                     Some(surface) => terrain_pass(&mut encoder, surface, false),
                                     None => world_pass_after_culling(
