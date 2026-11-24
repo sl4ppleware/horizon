@@ -76,7 +76,7 @@ impl Game<'_> {
     /// `NbtPredicate.getEntityTagToCompare`: the entity as saved. An entity
     /// in another level is read in the level that holds it.
     pub(in crate::game) fn command_target_nbt(&mut self, t: Target) -> Option<Tag> {
-        self.in_target_level(t, |g| {
+        self.in_read_target_level(t, |g| {
             let mut body = g.entity_nbt_in_level(t)?;
             if !matches!(
                 t,
@@ -805,11 +805,13 @@ impl Game<'_> {
             Target::Trident(id) => {
                 let loaded = entity_nbt::trident_from_nbt(&tag).ok_or_else(stale)?;
                 let uuid = self.uuid_for(id);
-                self.tridents
+                let trident = self
+                    .tridents
                     .iter_mut()
                     .find(|trident| trident.id == id)
-                    .ok_or_else(stale)?
-                    .load_nbt(loaded, &tag, self.pack.assets.registry);
+                    .ok_or_else(stale)?;
+                trident.load_nbt(loaded, &tag, self.pack.assets.registry);
+                trident.read_loyalty(&world_stations!(self).enchantments, &mut self.world.random);
                 set_key(&mut tag, "UUID", Tag::IntArray(uuid.to_vec()));
             }
             Target::Rocket(id) => {
@@ -1468,7 +1470,7 @@ impl Game<'_> {
         if let DataRef::Entity(t) = &target {
             let t = *t;
             let target = target.clone();
-            return match self.in_target_level(t, |g| g.cmd_data_in(id, ctx, target)) {
+            return match self.in_read_target_level(t, |g| g.cmd_data_in(id, ctx, target)) {
                 Some(r) => r,
                 None => Err(err("argument.entity.notfound.entity", &[])),
             };
