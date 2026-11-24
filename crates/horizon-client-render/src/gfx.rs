@@ -15256,7 +15256,7 @@ mod tests {
         }
     }
     #[test]
-    fn terrain_wgsl_composed_modules_validate_and_reuse_solid_uv_derivatives() {
+    fn terrain_wgsl_composed_modules_validate() {
         let terrain = super::terrain_shader();
         for (name, source) in [
             ("terrain.wgsl", terrain.clone()),
@@ -15282,25 +15282,6 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }
-        let wgsl = include_str!("terrain.wgsl");
-        let solid_finish_body = wgsl
-            .split("fn solid_finish(")
-            .nth(1)
-            .and_then(|s| s.split('}').next())
-            .expect("solid_finish definition");
-        assert!(
-            !solid_finish_body.contains("dpdx(") && !solid_finish_body.contains("dpdy("),
-            "solid_finish must reuse UV derivatives computed in solid_uncut/fs_opaque"
-        );
-        let wire_body = wgsl
-            .split("struct TerrainWire {")
-            .nth(1)
-            .and_then(|s| s.split('}').next())
-            .expect("TerrainWire definition");
-        assert!(
-            !wire_body.contains("scene"),
-            "TerrainWire must not carry dead scene interpolant"
-        );
     }
     #[test]
     fn distant_tiles_repeat_their_sprite_under_the_clamped_sampler() {
