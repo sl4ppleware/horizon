@@ -52,3 +52,5 @@ horizon_client::game::banners::layer_textures  #20193
 horizon_client_render::font::Font::glyph_non_fishy  kind=method  #19533
 horizon_client_render::font::Font::line_break  kind=method  #19533
 horizon_client_render::font::split_at  kind=fn  #19533
+horizon_client::game::native_shaders::manifest_refused  #20601
+horizon_client::game::shader_packs::block_id_table  #20601
