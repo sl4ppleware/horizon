@@ -879,6 +879,9 @@ impl Game<'_> {
         alpha: f64,
         out: &mut Vec<Vertex>,
     ) {
+        if self.dropped.is_empty() {
+            return;
+        }
         let live = self.dropped.iter().map(|item| {
             let (p, q) = (item.previous, item.position);
             let at = [
@@ -902,6 +905,9 @@ impl Game<'_> {
         alpha: f64,
         out: &mut Vec<Vertex>,
     ) {
+        if self.pickups.live.is_empty() {
+            return;
+        }
         // ItemPickupParticle: the render state extracted at partial tick 1.
         let taken = self.pickups.live.iter().filter_map(|p| match &p.taken {
             super::pickups::Taken::Item(item) => Some(ItemEntityDraw {
