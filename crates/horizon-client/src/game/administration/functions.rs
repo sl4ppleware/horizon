@@ -4,6 +4,9 @@
 mod loading;
 #[path = "functions/registry_graph.rs"]
 mod registry_graph;
+#[path = "functions/slot_sources.rs"]
+mod slot_sources;
+
 use super::{
     Game,
     commands::{
@@ -488,7 +491,15 @@ impl Game<'_> {
         // `ServerFunctionLibrary` compiles its functions: an item or block
         // argument's `#tag` resolves against them.
         self.sync_pack_tag_ids();
-        let mut registries = self.ui.registries.clone();
+        // The same candidate the prepare step checked: on a world's first open its item tags
+        // are not in the live tables yet.
+        let mut registries = match self.candidate_slot_source_registries(&store) {
+            Ok(registries) => registries,
+            Err(error) => {
+                log::error!("Horizon: slot sources changed after their check: {error}");
+                return;
+            }
+        };
         registries.permission = self.fns.command_level();
         registries.functions = store.functions.keys().cloned().collect();
         registries.function_tags = store.function_tags.keys().cloned().collect();
@@ -504,17 +515,6 @@ impl Game<'_> {
             .extend(pack_tables.map(str::to_owned));
         registries.loot_tables.sort();
         registries.loot_tables.dedup();
-        let sources = registries
-            .by_registry
-            .entry("minecraft:slot_source".into())
-            .or_default();
-        sources.ids = store.slot_sources.keys().cloned().collect();
-        sources.tags = store
-            .slot_source_tags
-            .keys()
-            .filter(|id| store.slot_source_tag(id).is_ok())
-            .cloned()
-            .collect();
         for (id, ids) in [
             ("minecraft:predicate", &registries.predicates),
             ("minecraft:item_modifier", &registries.item_modifiers),
@@ -563,6 +563,12 @@ impl Game<'_> {
         };
         let item_tags = tags(&self.items().item_tags);
         let block_tags = tags(&self.items().block_tags);
+        if self.world_adopted
+            && self.remote.is_none()
+            && let Some(tables) = self.save.tables.get()
+        {
+            tables.install_component_item_tags(&item_tags);
+        }
         let reg = &mut self.ui.registries;
         reg.item_tags.clone_from(&item_tags);
         reg.block_tags.clone_from(&block_tags);
@@ -843,7 +849,19 @@ impl Game<'_> {
         if let Err((key, a)) = self.parse_macro_lines(f, &lines) {
             return Err(failure(&key, &a));
         }
-        if self.exec.functions.len() >= 128 {
+        // `CallFunction.execute` queues the body one frame deeper with no depth
+        // limit; vanilla only stops it at the command quota
+        // (`ExecutionContext.runCommandQueue`). Here each call is a native
+        // frame, so `max_command_sequence_length` (up to `i32::MAX`) alone
+        // could overflow the guest stack. One level (`run_function`,
+        // `execute_line`, `run_chain` and the `function` command) measured
+        // about 9.7 KiB in a debug build; at a 16 KiB budget the guest stack
+        // holds 8192 levels. A deeper call returns `NoReturn` and its body does
+        // not run.
+        const FUNCTION_CALL_STACK_BYTES: usize = 16 * 1024;
+        const MAX_FUNCTION_DEPTH: usize =
+            horizon_guest_stack::GUEST_STACK_BYTES / FUNCTION_CALL_STACK_BYTES;
+        if self.exec.functions.len() >= MAX_FUNCTION_DEPTH {
             return Ok(Outcome::NoReturn);
         }
         self.exec.functions.push(f.id.clone());
@@ -949,11 +967,19 @@ impl Game<'_> {
         let source = self.command_source.unwrap_or_else(|| self.player_source());
         let mut out = Vec::new();
         for f in functions {
-            out.push(match self.run_function(&f, args, source)? {
+            let result = match self.run_function(&f, args, source)? {
                 Outcome::NoReturn => None,
                 Outcome::Value(v) => Some(v),
                 Outcome::Fail => Some(0),
-            });
+            };
+            out.push(result);
+            // `ExecuteCommand.addIsolatedCall` queues the tag's functions with
+            // `returnParentFrame`: a `return` (value or fail) runs
+            // `Frame.discard` on the isolated frame, so the tag's remaining
+            // functions never start.
+            if result.is_some() {
+                break;
+            }
         }
         Ok(out)
     }
@@ -3942,3 +3968,7 @@ mod schedule_reload_tests;
 #[cfg(test)]
 #[path = "functions/loading_tests.rs"]
 mod loading_tests;
+
+#[cfg(test)]
+#[path = "functions/recursion_tests.rs"]
+mod recursion_tests;

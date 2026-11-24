@@ -644,7 +644,7 @@ pub(super) struct Remote {
     pub(super) passenger_index: usize,
     /// Item entities waiting for their item data: where they are and their motion.
     pub(super) pending_items: HashMap<i32, ([f64; 3], Vec3)>,
-    health: (f32, i32, f32),
+    pub(super) health: (f32, i32, f32),
     /// `LocalPlayer.flashOnSetHealth`: set by the first health the server
     /// sends; from then on a drop starts the hurt animation.
     flash_on_set_health: bool,
@@ -732,6 +732,10 @@ pub(super) struct Remote {
     pub(super) own_stingers: i32,
     /// `Player.DATA_SHOULDER_PARROT_LEFT` and `_RIGHT` of the own player.
     pub(super) own_shoulders: [Option<i32>; 2],
+    /// `Entity.DATA_POSE` of the own player as the server last sent it (a pose a plugin
+    /// shows only this viewer included), with the local pose it arrived over: the third-person
+    /// body draws it until the local pose changes.
+    pub(super) own_pose: Option<(crate::pose::Pose, crate::pose::Pose)>,
     /// The local player's profile UUID (always in the level).
     pub(super) profile: u128,
     /// The local player's profile name: its score holder and team member.
@@ -773,12 +777,12 @@ pub(super) struct Remote {
     synced: Vec<Option<ItemStack>>,
     decode_errors: u32,
     /// Connection-owned `ClientClockManager` state, retained across dimensions.
-    clocks: HashMap<i32, play::ClockState>,
+    pub(super) clocks: HashMap<i32, play::ClockState>,
     default_clock: Option<i32>,
     overworld_clock: Option<i32>,
     clock_game_time: i64,
     /// `ClientChunkCache.Storage`'s view centre (ClientboundSetChunkCacheCenterPacket).
-    chunk_center: (i32, i32),
+    pub(in crate::game) chunk_center: (i32, i32),
     /// Received events a frame left for the next one, in order, with each
     /// item's arrival time so `BACKLOG_LIMIT` tracks the front item's age
     /// instead of staying overdue for an entire continuous chunk stream.
@@ -961,7 +965,7 @@ impl Game<'_> {
     pub(super) fn to_stack(&self, s: &Option<Stack>) -> Option<ItemStack> {
         self.to_stack_body(s)
     }
-    fn to_network(&self, s: &Option<ItemStack>) -> Option<Stack> {
+    pub(super) fn to_network(&self, s: &Option<ItemStack>) -> Option<Stack> {
         self.to_network_body(s)
     }
     fn hashed_stack(&self, s: &Option<ItemStack>) -> Option<Hashed> {
@@ -1365,7 +1369,7 @@ impl Game<'_> {
     fn remote_break_restricted(&self, pos: [i32; 3]) -> bool {
         self.remote_break_restricted_body(pos)
     }
-    fn remote_use_block(&mut self, hand: Hand) -> bool {
+    pub(in crate::game) fn remote_use_block(&mut self, hand: Hand) -> bool {
         self.remote_use_block_body(hand)
     }
     pub(in crate::game) fn predict_item_on_block(
@@ -2459,6 +2463,9 @@ mod interaction_event_tests;
 
 #[cfg(test)]
 mod native_entity_tests;
+
+#[cfg(test)]
+mod dimension_transition_tests;
 
 #[cfg(test)]
 mod effect_blend_tests;
