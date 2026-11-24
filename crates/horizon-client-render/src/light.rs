@@ -14,7 +14,7 @@
 //! most 15 blocks, so the 48-wide region determines the centre exactly.
 //! `relight_block` applies vanilla's incremental decrease/increase passes
 //! directly to resident chunks after a block change.
-use crate::fast_hash::FxHashMap;
+use crate::fast_hash::{FxHashMap, FxHashSet};
 use crate::{
     blocks::BlockFacts,
     chunk::{Chunk, ColumnLayout, Light, Section, index},
@@ -1347,12 +1347,14 @@ impl<'w, 's> Region<'w, 's> {
         }
     }
     /// Store back the light of every section whose values changed and record
-    /// the exact changed cell classes in `changed`.
+    /// the exact changed cell classes in `changed`, and every column the flood
+    /// fill wrote, net change or not (`LightChanges::touched`).
     fn finish(self, changed: &mut LightChanges) {
         for slot in self.slots.drain(..) {
             let Some(light) = slot.light else {
                 continue;
             };
+            changed.touched.insert((slot.key.0, slot.key.2));
             let classes = classes_differing_light(&slot.section.light, &light);
             if classes == 0 {
                 continue;
@@ -1373,11 +1375,21 @@ type Pos = (i32, i32, i32);
 /// cells take in it, `3 * 3 * 3` classes for the low face, the inside and the
 /// high face of each axis. Meshes sample light one block across a face, so the
 /// class says which neighbouring sections a change dirties too.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct LightChanges {
     sections: FxHashMap<Pos, u32>,
     /// The column the section indexes count in.
     layout: ColumnLayout,
+    /// Columns (x, z) a relight wrote light in, also where a cell went dark and came back to
+    /// the same level: `beside_unlit` needs them, as the light an unlit neighbour sends in can
+    /// differ from what the edit restored.
+    touched: FxHashSet<(i32, i32)>,
+}
+/// The changed cells only: `touched` is a relight's working set, not a change.
+impl PartialEq for LightChanges {
+    fn eq(&self, other: &Self) -> bool {
+        self.sections == other.sections && self.layout == other.layout
+    }
 }
 impl LightChanges {
     /// Changes in chunks of `layout`: what the relighter or a light job adds
@@ -1641,7 +1653,11 @@ pub fn relight(
 /// lighting see each other. These columns need a full light job, which
 /// lights them from the blocks of their whole 3x3, that neighbour's included.
 pub fn beside_unlit(changed: &LightChanges, unlit: impl Fn(i32, i32) -> bool) -> Vec<(i32, i32)> {
-    let mut columns: Vec<(i32, i32)> = changed.sections().map(|(x, _, z)| (x, z)).collect();
+    let mut columns: Vec<(i32, i32)> = changed
+        .sections()
+        .map(|(x, _, z)| (x, z))
+        .chain(changed.touched.iter().copied())
+        .collect();
     columns.sort_unstable();
     columns.dedup();
     columns.retain(|&(x, z)| {
@@ -4103,6 +4119,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn net_zero_relight_still_reports_its_column_beside_unlit() {
+        let mut w = world(|c| {
+            c.set(8, 0, 8, TORCH);
+        });
+        // Relighting a lit air cell with no block change: it goes dark and comes back to
+        // the same level, so no stored light changes.
+        assert!(block(&w, 9, 0, 8) > 0);
+        let mut changed = LightChanges::default();
+        relight(&mut w, &tables(), false, &[(9, 0, 8)], false, &mut changed);
+        assert!(changed.is_empty());
+        assert!(beside_unlit(&changed, |x, z| (x, z) == (1, 0)).contains(&(0, 0)));
+    }
+
+    #[test]
     fn light_from_layers_avoids_cow_clones_on_matching_sections() {
         let mut chunk = Chunk::empty(0, 0);
         let initial_ptrs: Vec<_> = chunk.sections.iter().map(Arc::as_ptr).collect();
@@ -4139,13 +4169,17 @@ pub(crate) mod tests {
         }
 
         // Re-applying the exact same layers must perform zero COW clones across ALL 24 sections.
-        let after_first: Vec<_> = chunk.sections.iter().map(Arc::as_ptr).collect();
+        // (the sections held shared, so a write through `Arc::make_mut` would copy them
+        // instead of updating them in place)
+        let held: Vec<Arc<Section>> = chunk.sections.clone();
+        let after_first: Vec<_> = held.iter().map(Arc::as_ptr).collect();
         light_from_layers(&mut chunk, &layers, [15; 256], true);
         let after_second: Vec<_> = chunk.sections.iter().map(Arc::as_ptr).collect();
         assert_eq!(
             after_first, after_second,
             "re-applying identical layers must clone zero sections"
         );
+        drop(held);
 
         // A section with matching light but non-minimal uniform blocks must still be compacted.
         chunk.set(0, MIN_Y + 12 * 16, 0, STONE);
