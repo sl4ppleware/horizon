@@ -9075,9 +9075,16 @@ mod tests {
         assert_eq!(water_source(&weird_kinds), None);
         assert_summarize_matches_reference(&fluid_chunk, &weird_kinds, "state 0 kept, no water");
 
-        // No AIR bit at all in kinds table.
-        let no_air_kinds = [0, KEPT | FLUID, KEPT | FLUID | WATERY];
+        // No AIR bit at all in kinds table: the fluid-only surface falls back to state 0.
+        let mut no_air_kinds = kinds;
+        no_air_kinds[0] = 0;
         assert_summarize_matches_reference(&fluid_chunk, &no_air_kinds, "fluid-only no AIR bit");
+        let surface = summarize(&fluid_chunk, &no_air_kinds)[0].surface;
+        assert_eq!(
+            surface.map(|s| (s.height, s.state, s.water)),
+            Some((0, BlockStateId(0), Some((21, BlockStateId(4))))),
+            "a fluid-only column keeps its water surface without an AIR state"
+        );
 
         // Empty kinds table.
         assert_summarize_matches_reference(&chunk, &[], "empty kinds table");
@@ -9224,124 +9231,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    #[ignore = "benchmark"]
-    fn summarize_realistic_overworld_benchmark() {
-        use crate::chunk::{BIOME_STRATEGY, ColumnLayout, Light, Section, block_strategy};
-        use horizon_core::paletted::PalettedContainer;
-
-        let kinds = [
-            AIR,
-            0,
-            KEPT,
-            KEPT,
-            KEPT | FLUID,
-            KEPT | FLUID | WATERY,
-            KEPT | (15 << 4),
-            KEPT | FLUID | (15 << 4),
-        ];
-        let mut sections = Vec::with_capacity(24);
-        // 3 uniform deep stone/deepslate sections (Light::Uniform(0x00)).
-        for _ in 0..3 {
-            sections.push(Section {
-                blocks: PalettedContainer::new(block_strategy(), 3),
-                biomes: PalettedContainer::new(BIOME_STRATEGY, 1),
-                light: Light::Uniform(0x00),
-            });
-        }
-        // 3 mixed underground stone/ore/cave sections.
-        for sy in 0..3usize {
-            let vals: [u32; 4096] = std::array::from_fn(|i| {
-                if (i * 7 + sy).is_multiple_of(13) {
-                    0
-                } else if (i * 3 + sy).is_multiple_of(19) {
-                    7
-                } else {
-                    2
-                }
-            });
-            let light = if sy == 2 {
-                let arr: [u8; 4096] = std::array::from_fn(|i| ((i * 5) & 15) as u8);
-                Light::from_slice(&arr)
-            } else {
-                Light::Uniform(0x00)
-            };
-            sections.push(Section {
-                blocks: Section::from_blocks(&vals),
-                biomes: PalettedContainer::new(BIOME_STRATEGY, 1),
-                light,
-            });
-        }
-        // 2 mixed surface/ocean/kelp sections (Light::Sky & Light::Full).
-        for sy in 0..2usize {
-            let vals: [u32; 4096] = std::array::from_fn(|i| {
-                let y = i >> 8;
-                let x = i & 15;
-                if y < 6 {
-                    2
-                } else if y < 12 {
-                    if x < 8 { 4 } else { 5 }
-                } else if (i * 11 + sy).is_multiple_of(9) {
-                    2
-                } else {
-                    0
-                }
-            });
-            let arr: [u8; 4096] = std::array::from_fn(|i| {
-                let sky = ((i >> 8) as u8) << 4;
-                let blk = if sy == 1 { ((i * 3) & 15) as u8 } else { 0 };
-                sky | blk
-            });
-            sections.push(Section {
-                blocks: Section::from_blocks(&vals),
-                biomes: PalettedContainer::from_values(
-                    BIOME_STRATEGY,
-                    &std::array::from_fn::<u32, 64, _>(|i| (i & 3) as u32),
-                ),
-                light: Light::from_slice(&arr),
-            });
-        }
-        // 2 sparse treetop/canopy sections (Light::Sky).
-        for sy in 0..2usize {
-            let vals: [u32; 4096] = std::array::from_fn(|i| {
-                if (i + sy * 17).is_multiple_of(23) {
-                    2
-                } else {
-                    0
-                }
-            });
-            let arr: [u8; 4096] = std::array::from_fn(|i| ((15 - (i & 3)) as u8) << 4);
-            sections.push(Section {
-                blocks: Section::from_blocks(&vals),
-                biomes: PalettedContainer::new(BIOME_STRATEGY, 2),
-                light: Light::from_slice(&arr),
-            });
-        }
-        // 14 empty uniform air sections.
-        for _ in 0..14 {
-            sections.push(Section::default());
-        }
-        let chunk = Chunk::from_sections(0, 0, ColumnLayout::VANILLA, &mut sections);
-        assert_summarize_matches_reference(&chunk, &kinds, "realistic Overworld chunk");
-
-        let iters = 500;
-        let t0 = std::time::Instant::now();
-        for _ in 0..iters {
-            std::hint::black_box(reference_summarize(&chunk, &kinds));
-        }
-        let ref_dt = t0.elapsed();
-
-        let t1 = std::time::Instant::now();
-        for _ in 0..iters {
-            std::hint::black_box(summarize(&chunk, &kinds));
-        }
-        let bulk_dt = t1.elapsed();
-
-        eprintln!(
-            "lod::summarize ({iters}x realistic 24-section Overworld chunk): ref={ref_dt:?}, bulk={bulk_dt:?}, speedup={:.2}x",
-            ref_dt.as_secs_f64() / bulk_dt.as_secs_f64().max(1e-9),
-        );
     }
 }
