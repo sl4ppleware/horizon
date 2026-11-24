@@ -3102,7 +3102,12 @@ mod tests {
     fn static_cache_concurrent_cold_and_warm_reads_are_consistent() {
         use horizon_assets::item_model::NoEnv;
         let dir = tempfile::tempdir().unwrap();
-        let renderer = Arc::new(build_static_cache_pack(dir.path(), "test:item/a", false, false));
+        let renderer = Arc::new(build_static_cache_pack(
+            dir.path(),
+            "test:item/a",
+            false,
+            false,
+        ));
         drop(dir);
 
         let handles: Vec<_> = (0..8)
